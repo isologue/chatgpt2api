@@ -35,17 +35,21 @@ services:
         # 是否安装 Git 存储相关依赖。
         ENABLE_GIT_STORAGE: ${ENABLE_GIT_STORAGE:-0}
 
-        # 是否安装 PostgreSQL 存储相关依赖。
-        # 只有在 STORAGE_BACKEND=postgres 时才需要改为 1。
-        ENABLE_POSTGRES_STORAGE: ${ENABLE_POSTGRES_STORAGE:-0}
+        # 独立 PostgreSQL 栈固定安装 PostgreSQL 依赖。
+        ENABLE_POSTGRES_STORAGE: 1
 
     # 本地构建后的镜像名称。
-    image: chatgpt2api:local
+    image: chatgpt2api:postgres
 
     # 容器名称。
-    container_name: chatgpt2api-local
+    container_name: chatgpt2api-postgres-app
 
-    # 端口映射。
+    # 等待 PostgreSQL 健康后再启动应用。
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # 应用端口映射。
     ports:
       - "9000:80"
 
@@ -54,15 +58,13 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json
 
-    # 容器运行时环境变量。
+    # 应用运行时环境变量。
     environment:
-      # 存储后端类型。
-      # 可选值：json、sqlite、postgres、git
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-sqlite}
+      # PostgreSQL 模式下固定使用 postgres 存储。
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
 
-      # 数据库连接地址。
-      # sqlite/postgres 模式使用；默认是本地 SQLite。
-      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/accounts.db}
+      # 应用连接内置 postgres 服务的地址。
+      DATABASE_URL: ${DATABASE_URL:-postgresql://chatgpt2api:chatgpt2api@postgres:5432/chatgpt2api}
 
       # Git 仓库地址。
       GIT_REPO_URL: ${GIT_REPO_URL:-}
@@ -84,3 +86,46 @@ services:
 
       # 对外访问基础 URL。
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+
+  postgres:
+    # PostgreSQL 官方镜像。
+    image: postgres:17-alpine
+
+    # 容器名称。
+    container_name: chatgpt2api-postgres
+
+    # 重启策略。
+    restart: unless-stopped
+
+    # 端口映射。
+    # 左边是宿主机端口，右边是容器内 PostgreSQL 端口。
+    # 如果本机 5432 已被占用，可以改左边的 POSTGRES_PORT，例如 5433。
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+
+    # Postgres 初始化环境变量。
+    environment:
+      # 数据库名。
+      POSTGRES_DB: ${POSTGRES_DB:-chatgpt2api}
+
+      # 数据库用户名。
+      POSTGRES_USER: ${POSTGRES_USER:-chatgpt2api}
+
+      # 数据库密码。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatgpt2api}
+
+    # 数据持久化卷。
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # 健康检查。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatgpt2api} -d ${POSTGRES_DB:-chatgpt2api}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    # Postgres 数据卷。
