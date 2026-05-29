@@ -32,6 +32,7 @@ RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi 
 COPY VERSION /app/VERSION
 
 # 复制前端源码。
+COPY CHANGELOG.md /app/CHANGELOG.md
 COPY web ./
 
 # 构建前端静态站点，并注入版本号环境变量。

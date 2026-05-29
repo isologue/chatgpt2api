@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEve
 import { ImageLightbox } from "@/components/image-lightbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageModel } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,7 @@ type ImageComposerProps = {
   imageHeight: string;
   imageQuality: string;
   imageModel: ImageModel;
+  imageModels: ImageModel[];
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
@@ -61,11 +63,6 @@ const qualityOptions = [
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
 ];
-const modelOptions: Array<{ value: ImageModel; label: string }> = [
-  { value: "gpt-image-2", label: "gpt-image-2" },
-  { value: "codex-gpt-image-2", label: "codex-gpt-image-2" },
-];
-
 const aspectOptions = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
   { ratio: "2:3", tier: "1k", width: "1024", height: "1536", label: "2:3", icon: RectangleVertical },
@@ -92,6 +89,7 @@ export function ImageComposer({
   imageHeight,
   imageQuality,
   imageModel,
+  imageModels,
   availableQuota,
   activeTaskCount,
   referenceImages,
@@ -121,16 +119,29 @@ export function ImageComposer({
     () => referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
     [referenceImages],
   );
+  const modelOptions = useMemo(
+    () => imageModels.map((model) => ({ value: model, label: model })),
+    [imageModels],
+  );
   const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
+  const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
+  const isCodexModel = imageModel.toLowerCase().includes("codex");
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
       return;
     }
     const handlePointerDown = (event: MouseEvent) => {
-      if (!sizeMenuRef.current?.contains(event.target as Node)) {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest('[data-slot="select-content"], [data-slot="select-trigger"]')
+      ) {
+        return;
+      }
+      if (!sizeMenuRef.current?.contains(target as Node)) {
         setIsSizeMenuOpen(false);
       }
     };
@@ -346,24 +357,41 @@ export function ImageComposer({
                         <h3 className="mb-3 text-base font-semibold text-stone-950">图像设置</h3>
                         <div className="mb-3">
                           <div className="mb-2 text-sm font-medium text-stone-900">模型</div>
-                          <div className="grid grid-cols-2 gap-2">
-                            {modelOptions.map((option) => {
-                              const active = option.value === imageModel;
-                              return (
-                                <button
+                          <Select
+                            value={imageModel}
+                            onValueChange={(value) => {
+                              onImageModelChange(value as ImageModel);
+                            }}
+                          >
+                            <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white text-sm shadow-none">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <img
+                                  src="/openai.svg"
+                                  alt=""
+                                  aria-hidden="true"
+                                  className="size-4 shrink-0 text-stone-700"
+                                />
+                                <span className="truncate">{selectedModelLabel}</span>
+                              </div>
+                            </SelectTrigger>
+                            <SelectContent className="z-[120]">
+                              {modelOptions.map((option) => (
+                                <SelectItem
                                   key={option.value}
-                                  type="button"
-                                  className={cn(
-                                    "h-9 cursor-pointer rounded-full border border-stone-200 bg-white px-3 text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50",
-                                    active && "border-stone-950 bg-white font-medium text-stone-950",
-                                  )}
-                                  onClick={() => onImageModelChange(option.value)}
+                                  value={option.value}
+                                  className="pl-10"
+                                  style={{
+                                    backgroundImage: "url('/openai.svg')",
+                                    backgroundRepeat: "no-repeat",
+                                    backgroundPosition: "12px center",
+                                    backgroundSize: "16px 16px",
+                                  }}
                                 >
                                   {option.label}
-                                </button>
-                              );
-                            })}
-                          </div>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
                         </div>
                         <div className="mb-3">
                           <div className="mb-2 text-sm font-medium text-stone-900">质量</div>
@@ -424,15 +452,21 @@ export function ImageComposer({
                             {aspectOptions.map((option) => {
                               const active = option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight;
                               const Icon = option.icon;
+                              const disabled = !isCodexModel && (option.tier === "2k" || option.tier === "4k");
                               return (
                                 <button
                                   key={`${option.ratio}-${option.tier}-${option.label}`}
                                   type="button"
+                                  disabled={disabled}
                                   className={cn(
                                     "flex h-[64px] cursor-pointer flex-col items-center justify-center gap-1 rounded-2xl border border-stone-200 bg-white text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50",
                                     active && "border-stone-950",
+                                    disabled && "cursor-not-allowed border-stone-100 bg-stone-50 text-stone-300 hover:border-stone-100 hover:bg-stone-50",
                                   )}
                                   onClick={() => {
+                                    if (disabled) {
+                                      return;
+                                    }
                                     onImageRatioChange(option.ratio);
                                     onImageTierChange(option.tier);
                                     onImageWidthChange(option.width);

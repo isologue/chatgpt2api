@@ -74,6 +74,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     }
     if task.get("data") is not None:
         item["data"] = task.get("data")
+    if task.get("usage") is not None:
+        item["usage"] = task.get("usage")
     if task.get("error"):
         item["error"] = task.get("error")
     return item
@@ -235,14 +237,19 @@ class ImageTaskService:
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
+            account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
                 if upstream:
                     message = upstream
                 else:
                     message = "号池中没有可用账号或所有账号均被限流，请检查号池状态（账号额度、是否被封禁、是否到达生图上限）"
-                raise RuntimeError(message)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="")
+                error = RuntimeError(message)
+                if account_email:
+                    setattr(error, "account_email", account_email)
+                raise error
+            usage = result.get("usage")
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="")
             self._log_call(
                 identity,
                 mode,
@@ -251,9 +258,11 @@ class ImageTaskService:
                 "调用完成",
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
+                account_email=account_email,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
+            account_email = _clean(getattr(exc, "account_email", ""))
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[])
             self._log_call(
                 identity,
@@ -264,6 +273,7 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 status="failed",
                 error=error_message,
+                account_email=account_email,
             )
 
     def _log_call(
@@ -278,6 +288,7 @@ class ImageTaskService:
         status: str = "success",
         error: str = "",
         urls: list[str] | None = None,
+        account_email: str = "",
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -296,6 +307,8 @@ class ImageTaskService:
             detail["request_text"] = request_preview
         if error:
             detail["error"] = error
+        if account_email:
+            detail["account_email"] = account_email
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
@@ -347,6 +360,9 @@ class ImageTaskService:
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
+            usage = item.get("usage")
+            if isinstance(usage, dict):
+                task["usage"] = usage
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error

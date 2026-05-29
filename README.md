@@ -13,12 +13,7 @@
 > - 严禁将本项目用于生成、传播或协助生成违法、暴力、色情、未成年人相关内容，或用于诈骗、欺诈、骚扰等非法或不当用途。
 > - 使用者应自行承担全部风险，包括但不限于账号被限制、临时封禁或永久封禁以及因违规使用等所导致的法律责任。
 > - 使用本项目即视为你已充分理解并同意本免责声明全部内容；如因滥用、违规或违法使用造成任何后果，均由使用者自行承担。
-
-> [!IMPORTANT]
-> 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
-
-> [!CAUTION]
-> 旧版本存在已知漏洞，请尽快升级到最新版本。公网部署时请尽量不要放置敏感信息，并自行做好访问控制与隔离。
+> - 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
 
 ## 快速开始
 
@@ -122,27 +117,21 @@ environment:
 - `/v1/complete` 文本补全与流式输出已实现，但仍在测试，目前会出现对话重复的问题，请谨慎测试使用
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
 
-## Screenshots
+## 效果展示
 
-文生图界面：
-
-![image](assets/image.png)
-
-编辑图：
-
-![image](assets/image_edit.png)
-
-Cherry Studio 中使用，支持作为绘图接口接入：
-
-![image](assets/chery_studio.png)
-
-号池管理：
-
-![image](assets/account_pool.png)
-
-New Api 接入：
-
-![image](assets/new_api.png)
+<table width="100%">
+  <tr>
+    <td width="50%"><img src="https://i.ibb.co/Jj8nfwwP/image.png" alt="image" border="0"></td>
+    <td width="50%"><img src="https://i.ibb.co/pqf235v/image-edit.png" alt="image edit" border="0"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://i.ibb.co/tPcqtVfd/chery-studio.png" alt="chery studio" border="0"></td>
+    <td width="50%"><img src="https://i.ibb.co/PsT9YHBV/account-pool.png" alt="account pool" border="0"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://i.ibb.co/rRWLG08q/new-api.png" alt="new api" border="0"></td>
+  </tr>
+</table>
 
 ## API
 
