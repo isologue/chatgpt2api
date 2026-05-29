@@ -1,18 +1,15 @@
 # 构建平台，由 Docker BuildKit 注入。
-ARG BUILDPLATFORM
 
 # 目标运行平台，由 Docker BuildKit 注入。
-ARG TARGETPLATFORM
 
 # 目标 CPU 架构，由 Docker BuildKit 注入。
-ARG TARGETARCH
 
 # ============================================
 # 前端构建阶段
 # 用于编译 web 管理页面静态资源。
 # 只有最终目标为 app-with-web 时，产物才会被复制进运行镜像。
 # ============================================
-FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
+FROM node:22-alpine AS web-build
 
 # npm 镜像源地址。
 # 国内环境可使用 npmmirror 提升依赖下载速度。
@@ -44,13 +41,11 @@ RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" npm run build
 # 安装 Python 运行环境和按需依赖。
 # 这个阶段既可作为纯 API 镜像，也可作为带前端镜像的基础层。
 # ============================================
-FROM --platform=$TARGETPLATFORM python:3.13-slim AS app-base
+FROM python:3.13-slim AS app-base
 
 # 目标运行平台参数。
-ARG TARGETPLATFORM
 
 # 目标 CPU 架构参数。
-ARG TARGETARCH
 
 # 是否启用国内镜像源优化。
 # 1 表示启用，0 表示关闭。
