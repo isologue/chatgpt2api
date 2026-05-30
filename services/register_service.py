@@ -34,6 +34,8 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    if isinstance(cfg.get("mail"), dict):
+        cfg["mail"] = {**cfg["mail"], "proxy": cfg["proxy"]}
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -68,7 +70,7 @@ class RegisterService:
 
     def _inject_proxy_to_mail(self) -> None:
         proxy = str(self._config.get("proxy") or "").strip()
-        if proxy and isinstance(self._config.get("mail"), dict):
+        if isinstance(self._config.get("mail"), dict):
             self._config["mail"]["proxy"] = proxy
 
     def update(self, updates: dict) -> dict:
