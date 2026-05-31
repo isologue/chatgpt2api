@@ -189,10 +189,20 @@ def _is_cloudflare_challenge(resp) -> bool:
     text = str(getattr(resp, "text", "") or "").lower()
     headers = getattr(resp, "headers", {}) or {}
     server = str(headers.get("server") or "").lower()
+    content_type = str(headers.get("content-type") or "").lower()
+    status = int(getattr(resp, "status_code", 0) or 0)
+    html_like = "text/html" in content_type or "<html" in text
     return (
-        "cloudflare" in server
-        or "challenges.cloudflare.com" in text
-        or "<title>just a moment" in text
+        status in {403, 429, 503}
+        and html_like
+        and (
+            "cloudflare" in server
+            or "cf-mitigated" in headers
+            or "challenges.cloudflare.com" in text
+            or "/cdn-cgi/challenge-platform/" in text
+            or "<title>just a moment" in text
+            or "<title>attention required!" in text
+        )
     )
 
 
@@ -386,13 +396,24 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
-        self.session = create_session(proxy)
+        self.proxy = str(proxy or "").strip()
+        self.session = create_session(self.proxy)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
 
     def close(self) -> None:
         self.session.close()
+
+    def _reset_authorize_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = create_session(self.proxy)
+        self.device_id = str(uuid.uuid4())
+        self.code_verifier = ""
+        self.platform_auth_code = ""
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
@@ -407,39 +428,91 @@ class PlatformRegistrar:
         headers.update(_make_trace_headers())
         return headers
 
-    def _platform_authorize(self, email: str, index: int) -> None:
-        step(index, "开始 platform authorize")
+    def _prime_authorize_session(self, email: str) -> tuple[object | None, str]:
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-        self.code_verifier, code_challenge = _generate_pkce()
-        params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": self.device_id,
-            "screen_hint": "login_or_signup",
-            "max_age": "0",
-            "login_hint": email,
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": secrets.token_urlsafe(32),
-            "nonce": secrets.token_urlsafe(32),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
-        }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code != 200:
+        warmups = (
+            (platform_base, self._navigate_headers()),
+            (auth_base, self._navigate_headers(platform_base)),
+            (f"{auth_base}/?login_hint={urlencode({'value': email})[6:]}", self._navigate_headers(platform_base)),
+        )
+        last_resp = None
+        last_error = ""
+        for url, headers in warmups:
+            resp, error = request_with_local_retry(
+                self.session,
+                "get",
+                url,
+                headers=headers,
+                allow_redirects=True,
+                verify=False,
+            )
+            last_resp, last_error = resp, error
+            if resp is None:
+                break
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400 or _is_cloudflare_challenge(resp):
+                return resp, error
+        return last_resp, last_error
+
+    def _platform_authorize(self, email: str, index: int) -> None:
+        step(index, "开始 platform authorize")
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            warmup_resp, warmup_error = self._prime_authorize_session(email)
+            if _is_cloudflare_challenge(warmup_resp):
+                debug = _response_debug_detail(warmup_resp, 300)
+                if attempt < attempts:
+                    step(index, f"platform 会话预热遇到 Cloudflare challenge，重试 {attempt}/{attempts - 1}，刷新 device_id 后继续", "yellow")
+                    self._reset_authorize_session()
+                    time.sleep(attempt + 1)
+                    continue
+                raise RuntimeError(f"被 Cloudflare 拦截，请更换 IP 重试, {debug}")
+            if warmup_resp is None:
+                raise RuntimeError(warmup_error or "platform_authorize_warmup_failed")
+            self.code_verifier, code_challenge = _generate_pkce()
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": platform_oauth_audience,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "device_id": self.device_id,
+                "screen_hint": "login_or_signup",
+                "max_age": "0",
+                "login_hint": email,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": secrets.token_urlsafe(32),
+                "nonce": secrets.token_urlsafe(32),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+            }
+            resp, error = request_with_local_retry(
+                self.session,
+                "get",
+                f"{auth_base}/api/accounts/authorize?{urlencode(params)}",
+                headers=self._navigate_headers(f"{platform_base}/"),
+                allow_redirects=True,
+                verify=False,
+            )
+            if resp is not None and resp.status_code == 200:
+                step(index, "platform authorize 完成")
+                return
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
+                debug = _response_debug_detail(resp, 300)
+                if attempt < attempts:
+                    step(index, f"platform authorize 遇到 Cloudflare challenge，重试 {attempt}/{attempts - 1}，刷新 device_id 后继续", "yellow")
+                    self._reset_authorize_session()
+                    time.sleep(attempt + 1)
+                    continue
+                raise RuntimeError(f"被 Cloudflare 拦截，请更换 IP 重试, {debug}")
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
-        step(index, "platform authorize 完成")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
