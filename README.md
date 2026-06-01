@@ -89,6 +89,8 @@ environment:
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
   `gpt-5-mini`
 - 支持通过 `n` 返回多张生成结果
+- 支持生成可编辑 PPT 文件
+- 支持生成可编辑 PSD 文件
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
@@ -115,6 +117,7 @@ environment:
 ### 实验性 / 规划中
 
 - `/v1/complete` 文本补全与流式输出已实现，但仍在测试，目前会出现对话重复的问题，请谨慎测试使用
+- `/v1/chat/completions` 文本链路支持短 TTL 缓存、重复请求合并与相邻重复消息清理，可通过 `chat_completion_cache` 配置调整
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
 
 ## 效果展示

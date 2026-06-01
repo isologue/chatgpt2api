@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import base64
 import time
 import uuid
 from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
+from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
+    count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
     encode_images,
+    normalize_messages,
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
@@ -25,9 +27,27 @@ from utils.image_tokens import (
     token_usage,
 )
 
+TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
+    "This compatibility backend cannot execute local tools, shell commands, web searches, "
+    "or file operations. Do not claim to have run tools or inspected external resources. "
+    "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
+)
+
+RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
+
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
     return not has_response_image_generation_tool(body)
+
+
+def has_non_image_tools(body: dict[str, Any]) -> bool:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    return any(
+        isinstance(tool, dict) and str(tool.get("type") or "").strip() != "image_generation"
+        for tool in tools
+    )
 
 
 def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
@@ -39,18 +59,19 @@ def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
 
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
     if isinstance(input_value, dict):
+        if str(input_value.get("type") or "").strip() == "input_image":
+            images = extract_image_from_message_content([input_value])
+            return images[0] if images else None
         images = extract_image_from_message_content(input_value.get("content"))
         return images[0] if images else None
     if not isinstance(input_value, list):
         return None
     for item in reversed(input_value):
-        if isinstance(item, dict) and str(item.get("type") or "").strip() == "input_image":
-            image_url = str(item.get("image_url") or "")
-            if image_url.startswith("data:"):
-                header, _, data = image_url.partition(",")
-                mime = header.split(";")[0].removeprefix("data:")
-                return base64.b64decode(data), mime or "image/png"
         if isinstance(item, dict):
+            if str(item.get("type") or "").strip() == "input_image":
+                images = extract_image_from_message_content([item])
+                if images:
+                    return images[0]
             images = extract_image_from_message_content(item.get("content"))
             if images:
                 return images[0]
@@ -76,6 +97,31 @@ def _input_image_parts(input_value: object) -> list[dict[str, Any]]:
     return parts
 
 
+def _is_response_content_part(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    part_type = str(value.get("type") or "").strip()
+    return part_type in RESPONSE_CONTENT_PART_TYPES or ("image_url" in value and part_type != "message")
+
+
+def _message_content_from_response_item(item: dict[str, Any]) -> object:
+    content = item.get("content")
+    if isinstance(content, list):
+        return [dict(part) if isinstance(part, dict) else part for part in content]
+    if isinstance(content, str):
+        return content
+    return extract_response_prompt([item]) or content or ""
+
+
+def _append_response_message(messages: list[dict[str, Any]], role: object, content: object) -> None:
+    if isinstance(content, str):
+        if content.strip():
+            messages.append({"role": str(role or "user"), "content": content.strip()})
+        return
+    if isinstance(content, list) and content:
+        messages.append({"role": str(role or "user"), "content": content})
+
+
 def messages_from_input(input_value: object, instructions: object = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     system_text = str(instructions or "").strip()
@@ -86,23 +132,36 @@ def messages_from_input(input_value: object, instructions: object = None) -> lis
             messages.append({"role": "user", "content": input_value.strip()})
         return messages
     if isinstance(input_value, dict):
-        messages.append({
-            "role": str(input_value.get("role") or "user"),
-            "content": extract_response_prompt([input_value]) or input_value.get("content") or "",
-        })
+        if _is_response_content_part(input_value):
+            _append_response_message(messages, "user", [dict(input_value)])
+            return messages
+        _append_response_message(
+            messages,
+            input_value.get("role") or "user",
+            _message_content_from_response_item(input_value),
+        )
         return messages
     if isinstance(input_value, list):
-        if all(isinstance(item, dict) and item.get("type") for item in input_value):
-            text = extract_response_prompt(input_value)
-            if text:
-                messages.append({"role": "user", "content": text})
+        if all(_is_response_content_part(item) for item in input_value):
+            _append_response_message(messages, "user", [dict(item) for item in input_value if isinstance(item, dict)])
             return messages
+        pending_parts: list[dict[str, Any]] = []
         for item in input_value:
-            if isinstance(item, dict):
-                messages.append({
-                    "role": str(item.get("role") or "user"),
-                    "content": extract_response_prompt([item]) or item.get("content") or "",
-                })
+            if _is_response_content_part(item):
+                pending_parts.append(dict(item))
+                continue
+            if pending_parts:
+                _append_response_message(messages, "user", pending_parts)
+                pending_parts = []
+            if not isinstance(item, dict):
+                continue
+            _append_response_message(
+                messages,
+                item.get("role") or "user",
+                _message_content_from_response_item(item),
+            )
+        if pending_parts:
+            _append_response_message(messages, "user", pending_parts)
     return messages
 
 
@@ -174,9 +233,17 @@ def response_completed(
     return response
 
 
-def stream_text_response(backend, body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = messages_from_input(body.get("input"), body.get("instructions"))
+    messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
+    if has_non_image_tools(body):
+        messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
+    return model, messages
+
+
+def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
+    model = str(body.get("model") or "auto").strip() or "auto"
+    messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
     response_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -192,6 +259,7 @@ def stream_text_response(backend, body: dict[str, Any]) -> Iterator[dict[str, An
     yield {"type": "response.output_item.done", "output_index": 0, "item": item}
     usage = token_usage(
         input_text_tokens=count_message_text_tokens(messages, model),
+        input_image_tokens=count_message_image_tokens(messages, model),
         output_text_tokens=count_text_tokens(full_text, model),
     )
     yield response_completed(response_id, model, created, [item], usage)
@@ -226,14 +294,14 @@ def stream_image_response(
             continue
         items = image_output_items(prompt, output.data)
         if items:
-            item = items[0]
             usage = image_usage(
                 input_text_tokens=count_text_tokens(prompt, model),
                 input_image_tokens=input_image_tokens,
                 output_tokens=count_image_output_items_tokens(output.data, size, quality),
             )
-            yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-            yield response_completed(response_id, model, created, [item], usage)
+            for output_index, item in enumerate(items):
+                yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
+            yield response_completed(response_id, model, created, items, usage)
             return
     raise RuntimeError("image generation failed")
 
@@ -250,7 +318,12 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
-        yield from stream_text_response(text_backend(), body)
+        model, messages = text_response_parts(body)
+        key = cache_key(body, messages, stream=bool(body.get("stream")))
+        yield from chat_completion_cache.get_or_compute_stream(
+            key,
+            lambda: stream_text_response(text_backend(), body, messages),
+        )
         return
 
     prompt = extract_response_prompt(body.get("input"))

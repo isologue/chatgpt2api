@@ -124,7 +124,7 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
                         if not isinstance(part, dict) or part.get("type") != "image":
                             continue
                         data = part.get("data")
-                        if isinstance(data, (bytes, bytearray)):
+                        if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
                             images.append((bytes(data), str(part.get("mime") or "image/png")))
             if images:
                 parts: list[Any] = []
@@ -246,6 +246,7 @@ class ConversationRequest:
 @dataclass
 class ConversationState:
     text: str = ""
+    raw_text: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
@@ -312,7 +313,52 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
-def assistant_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
+def sanitize_output_text(text: str) -> str:
+    text = str(text or "")
+
+    def is_internal_annotation_part(part: str) -> bool:
+        value = part.strip()
+        if not value:
+            return True
+        lower = value.lower()
+        return bool(
+            re.fullmatch(r"turn\d+[a-z]*\d*", lower)
+            or re.fullmatch(r"turn\d+\w*", lower)
+            or lower.startswith(("turn", "source", "sources"))
+        )
+
+    def readable_annotation_part(parts: list[str]) -> str:
+        for part in parts:
+            value = part.strip()
+            if value and not is_internal_annotation_part(value):
+                return value
+        return ""
+
+    def replace_annotation(match: re.Match[str]) -> str:
+        payload = match.group(1)
+        parts = [part.strip() for part in payload.split("\ue202")]
+        kind = (parts[0] if parts else "").lower()
+        data = parts[1:]
+        if kind == "url":
+            label = data[0] if data else ""
+            url = data[1] if len(data) > 1 else ""
+            if label and url.startswith(("http://", "https://")):
+                return f"{label} ({url})"
+            return label or url
+        if kind == "cite":
+            return readable_annotation_part(data)
+        return readable_annotation_part(data)
+
+    # ChatGPT web sometimes returns rich annotation markers using private-use
+    # characters. API clients cannot render those. Preserve readable labels
+    # from entity/link annotations, while removing internal citation pointers.
+    text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
+    text = re.sub(r"\ue200[^\ue201]*$", "", text)
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    return text
+
+
+def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
     for candidate in (event, event.get("v")):
         if not isinstance(candidate, dict):
             continue
@@ -326,6 +372,10 @@ def assistant_text(event: dict[str, Any], current_text: str = "", history_text: 
         if text:
             return strip_history(text, history_text)
     return apply_text_patch(event, current_text, history_text)
+
+
+def assistant_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
+    return sanitize_output_text(assistant_raw_text(event, current_text, history_text))
 
 
 def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
@@ -379,12 +429,19 @@ def add_unique(values: list[str], candidates: list[str]) -> None:
             values.append(candidate)
 
 
+FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
+FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
+SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
+
+
 def extract_conversation_ids(payload: str) -> tuple[str, list[str], list[str]]:
     conversation_match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
     conversation_id = conversation_match.group(1) if conversation_match else ""
+    file_ids: list[str] = []
     # Negative lookahead excludes "file-service" (URI prefix, not a real id).
-    file_ids = re.findall(r"(file[-_](?!service\b)[A-Za-z0-9]+)", payload)
-    sediment_ids = re.findall(r"sediment://([A-Za-z0-9_-]+)", payload)
+    add_unique(file_ids, FILE_SERVICE_ID_RE.findall(payload))
+    add_unique(file_ids, FILE_ID_RE.findall(payload))
+    sediment_ids = SEDIMENT_ID_RE.findall(payload)
     return conversation_id, file_ids, sediment_ids
 
 
@@ -486,9 +543,12 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         update_conversation_state(state, payload, event)
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
+            state.raw_text = ""
             state.text = ""
             continue
-        next_text = assistant_text(event, state.text, history_text)
+        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        next_text = sanitize_output_text(next_raw_text)
+        state.raw_text = next_raw_text
         if next_text != state.text:
             delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
             state.text = next_text

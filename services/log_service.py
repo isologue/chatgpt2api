@@ -208,6 +208,7 @@ class LoggedCall:
     summary: str
     started: float = field(default_factory=time.time)
     request_text: str = ""
+    request_shape: dict[str, int] | None = None
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
@@ -294,6 +295,8 @@ class LoggedCall:
         request_excerpt = _request_excerpt(self.request_text)
         if request_excerpt:
             detail["request_text"] = request_excerpt
+        if self.request_shape:
+            detail["request_shape"] = self.request_shape
         if error:
             detail["error"] = error
         email = str(account_email or "").strip()
@@ -303,6 +306,6 @@ class LoggedCall:
         if email:
             detail["account_email"] = email
         collected_urls = [*(urls or []), *_collect_urls(result)]
-        if collected_urls:
+        if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
