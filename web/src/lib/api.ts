@@ -47,6 +47,8 @@ export type AccountImportPayload = {
   [key: string]: unknown;
 };
 
+export type AccountExportFormat = "json" | "zip";
+
 export type Model = {
   id: string;
   object: string;
@@ -337,6 +339,32 @@ export async function refreshAccounts(accessTokens: string[]) {
     method: "POST",
     body: { access_tokens: accessTokens },
   });
+}
+
+function getFilenameFromDisposition(value: unknown, fallback: string) {
+  const disposition = typeof value === "string" ? value : "";
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+  }
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || fallback;
+}
+
+export async function exportAccounts(format: AccountExportFormat, accessTokens: string[] = []) {
+  const response = await request.request<Blob>({
+    url: "/api/accounts/export",
+    method: "POST",
+    data: {
+      format,
+      access_tokens: accessTokens,
+    },
+    responseType: "blob",
+  });
+  return {
+    blob: response.data,
+    filename: getFilenameFromDisposition(response.headers["content-disposition"], `codex-accounts.${format}`),
+  };
 }
 
 export async function updateAccount(
