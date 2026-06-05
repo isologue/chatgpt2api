@@ -20,7 +20,7 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email"}
+INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
@@ -143,6 +143,20 @@ def _collect_account_emails(value: object) -> list[str]:
     return emails
 
 
+def _collect_conversation_ids(value: object) -> list[str]:
+    ids: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "_conversation_id" and isinstance(item, str) and item.strip():
+                ids.append(item.strip())
+            else:
+                ids.extend(_collect_conversation_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            ids.extend(_collect_conversation_ids(item))
+    return ids
+
+
 def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -216,7 +230,8 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
@@ -237,7 +252,8 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
@@ -255,11 +271,13 @@ class LoggedCall:
     def stream(self, items):
         urls: list[str] = []
         account_emails: list[str] = []
+        conversation_ids: list[str] = []
         failed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
+                conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
@@ -269,6 +287,7 @@ class LoggedCall:
                 error=str(exc),
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
+                conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -277,10 +296,11 @@ class LoggedCall:
             raise
         finally:
             if not failed:
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "")
+                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                         conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -305,6 +325,12 @@ class LoggedCall:
             email = emails[0] if emails else ""
         if email:
             detail["account_email"] = email
+        conv_id = str(conversation_id or "").strip()
+        if not conv_id:
+            conv_ids = _collect_conversation_ids(result)
+            conv_id = conv_ids[0] if conv_ids else ""
+        if conv_id:
+            detail["conversation_id"] = conv_id
         collected_urls = [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))

@@ -12,8 +12,6 @@
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import secrets
 import threading
 import time
@@ -54,11 +52,8 @@ class OAuthLoginService:
     @staticmethod
     def _generate_pkce() -> tuple[str, str]:
         """生成 PKCE code_verifier 与对应的 code_challenge（S256）。"""
-        verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
-        challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode("ascii")).digest()
-        ).rstrip(b"=").decode("ascii")
-        return verifier, challenge
+        from utils.pkce import generate_pkce
+        return generate_pkce()
 
     def _purge_expired_locked(self) -> None:
         """清理过期或溢出容量的会话，必须在持锁状态下调用。"""

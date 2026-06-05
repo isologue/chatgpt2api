@@ -16,10 +16,16 @@ export type StoredImage = {
   id: string;
   taskId?: string;
   status?: "loading" | "success" | "error";
+  taskStatus?: "queued" | "running";
+  progress?: string;
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
   error?: string;
+  startTime?: number;
+  elapsedSecs?: number;
+  elapsedUpdatedAt?: number;
+  durationMs?: number;
 };
 
 export type ImageTurnStatus = "queued" | "generating" | "success" | "error";
@@ -68,8 +74,13 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   const normalized = {
     ...image,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
+    taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    startTime: typeof image.startTime === "number" ? image.startTime : undefined,
+    elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
+    elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
+    durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
     return normalized;

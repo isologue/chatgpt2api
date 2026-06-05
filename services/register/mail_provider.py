@@ -283,6 +283,15 @@ class CloudflareTempMailProvider(BaseMailProvider):
             raise RuntimeError("CloudflareTempMail 缺少 address 或 jwt")
         return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
 
+    def get_existing_mailbox(self, email: str) -> dict[str, Any]:
+        """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
+        data = self._request("POST", "/admin/get_address", headers={"x-admin-auth": self.admin_password}, payload={"address": email})
+        address = str(data.get("address") or "").strip()
+        token = str(data.get("jwt") or "").strip()
+        if not address or not token:
+            raise RuntimeError(f"CloudflareTempMail 无法获取已有邮箱 {email} 的 JWT")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/api/mails", headers={"Authorization": f"Bearer {mailbox['token']}"}, params={"limit": 10, "offset": 0})
         raw = list(data.get("results") or []) if isinstance(data, dict) else data if isinstance(data, list) else []
@@ -988,3 +997,29 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()
+
+
+def get_existing_mailbox(mail_config: dict, email: str) -> dict:
+    """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
+    enabled = _enabled_entries(mail_config)
+    tried: set[str] = set()
+    last_error = ""
+    for _ in range(len(enabled)):
+        provider = _create_provider(mail_config)
+        provider_key = f"{provider.name}#{provider.provider_ref}"
+        try:
+            if provider_key in tried:
+                continue
+            tried.add(provider_key)
+            if hasattr(provider, "get_existing_mailbox"):
+                mailbox = provider.get_existing_mailbox(email)
+                return mailbox
+            else:
+                raise RuntimeError(f"邮箱提供商 {provider.name} 不支持查询已有邮箱")
+        except RuntimeError as error:
+            last_error = str(error)
+            if "DDG日上限已达" not in last_error:
+                raise
+        finally:
+            provider.close()
+    raise RuntimeError(last_error or "所有启用的邮箱提供商均无法查询已有邮箱")

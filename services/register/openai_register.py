@@ -59,11 +59,15 @@ register_log_sink = None
 
 common_headers = {
     "accept": "application/json",
+    "accept-encoding": "gzip, deflate, br",
     "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    "connection": "keep-alive",
     "content-type": "application/json",
+    "dnt": "1",
     "origin": auth_base,
     "priority": "u=1, i",
-    "user-agent": user_agent,
+    "sec-gpc": "1",
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
@@ -75,12 +79,17 @@ common_headers = {
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
+    "user-agent": user_agent,
 }
 
 navigate_headers = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-encoding": "gzip, deflate, br",
     "accept-language": "en-US,en;q=0.9",
-    "user-agent": user_agent,
+    "cache-control": "max-age=0",
+    "connection": "keep-alive",
+    "dnt": "1",
+    "sec-gpc": "1",
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
@@ -94,6 +103,7 @@ navigate_headers = {
     "sec-fetch-site": "same-origin",
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
+    "user-agent": user_agent,
 }
 
 
@@ -127,10 +137,7 @@ def _make_trace_headers() -> dict[str, str]:
     }
 
 
-def _generate_pkce() -> tuple[str, str]:
-    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
-    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
-    return code_verifier, code_challenge
+from utils.pkce import generate_pkce as _generate_pkce  # noqa: F401
 
 
 def _random_password(length: int = 16) -> str:
@@ -214,102 +221,13 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code(config["mail"], mailbox)
 
 
-class SentinelTokenGenerator:
-    MAX_ATTEMPTS = 500000
-    ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
-
-    def __init__(self, device_id: str, ua: str):
-        self.device_id = device_id
-        self.user_agent = ua
-        self.sid = str(uuid.uuid4())
-
-    @staticmethod
-    def _fnv1a_32(text: str) -> str:
-        h = 2166136261
-        for ch in text:
-            h ^= ord(ch)
-            h = (h * 16777619) & 0xFFFFFFFF
-        h ^= h >> 16
-        h = (h * 2246822507) & 0xFFFFFFFF
-        h ^= h >> 13
-        h = (h * 3266489909) & 0xFFFFFFFF
-        h ^= h >> 16
-        return format(h & 0xFFFFFFFF, "08x")
-
-    def _get_config(self) -> list:
-        perf_now = random.uniform(1000, 50000)
-        return [
-            "1920x1080",
-            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
-            4294705152,
-            random.random(),
-            self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
-            None,
-            None,
-            "en-US",
-            random.random(),
-            random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
-            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
-            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
-            perf_now,
-            self.sid,
-            "",
-            random.choice([4, 8, 12, 16]),
-            time.time() * 1000 - perf_now,
-        ]
-
-    @staticmethod
-    def _b64(data) -> str:
-        return base64.b64encode(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).decode("ascii")
-
-    def generate_requirements_token(self) -> str:
-        data = self._get_config()
-        data[3] = 1
-        data[9] = round(random.uniform(5, 50))
-        return "gAAAAAC" + self._b64(data)
-
-    def generate_token(self, seed: str, difficulty: str) -> str:
-        start = time.time()
-        data = self._get_config()
-        difficulty = str(difficulty or "0")
-        for i in range(self.MAX_ATTEMPTS):
-            data[3] = i
-            data[9] = round((time.time() - start) * 1000)
-            payload = self._b64(data)
-            if self._fnv1a_32(seed + payload)[: len(difficulty)] <= difficulty:
-                return "gAAAAAB" + payload + "~S"
-        return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
+from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    generator = SentinelTokenGenerator(device_id, user_agent)
-    resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": user_agent,
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
-    )
-    data = _response_json(resp)
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-    pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
-    )
-    return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
+    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+    return sentinel_val
 
 
 def create_session(proxy: str = "") -> Any:

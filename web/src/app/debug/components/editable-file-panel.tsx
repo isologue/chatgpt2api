@@ -37,6 +37,7 @@ const statusText = (status: string) => ({ queued: "排队中", running: "生成�
 const statusClass = (status: string) => status === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/20 dark:text-emerald-300" : status === "error" ? "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/20 dark:text-rose-300" : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/20 dark:text-amber-300";
 const formatElapsed = (seconds: number) => `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 const titleOfPrompt = (prompt: string, fallback: string) => prompt.trim().replace(/\s+/g, " ").slice(0, 24) || fallback;
+const createClientTaskId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const readFile = (file: File) => new Promise<string>((resolve, reject) => {
   const reader = new FileReader();
@@ -234,7 +235,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     try {
       const base64_images = images;
       if (imageRequired && !base64_images.length) throw new Error("base64_images is empty");
-      const task = await httpRequest<EditableFileTask>(endpoint, { method: "POST", body: { client_task_id: crypto.randomUUID(), prompt, base64_images } });
+      const task = await httpRequest<EditableFileTask>(endpoint, { method: "POST", body: { client_task_id: createClientTaskId(), prompt, base64_images } });
       const polledAt = Date.now();
       const id = taskIdOf(task);
       const draft = { prompt: prompt.trim(), images: base64_images, title: titleOfPrompt(prompt, title) };

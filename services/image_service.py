@@ -51,9 +51,14 @@ def _safe_image_path(relative_path: str) -> Path:
 
 
 def get_image_response(relative_path: str) -> FileResponse | Response:
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
     if image_storage_service.has_local(relative_path):
-        return FileResponse(_safe_image_path(relative_path))
-    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png")
+        return FileResponse(_safe_image_path(relative_path), headers=headers)
+    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png", headers=headers)
 
 
 def _thumbnail_path(relative_path: str) -> Path:
@@ -100,18 +105,33 @@ def ensure_thumbnail(relative_path: str) -> Path:
 
 
 def get_thumbnail_response(relative_path: str) -> FileResponse:
-    return FileResponse(ensure_thumbnail(relative_path))
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
+    return FileResponse(ensure_thumbnail(relative_path), headers=headers)
 
 
 def get_image_download_response(relative_path: str) -> FileResponse:
+    cors_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
     if image_storage_service.has_local(relative_path):
         path = _safe_image_path(relative_path)
-        return FileResponse(path, filename=path.name)
+        headers = {**cors_headers, "Content-Disposition": f'attachment; filename="{path.name}"'}
+        return FileResponse(path, filename=path.name, headers=headers)
     rel = _safe_relative_path(relative_path)
+    headers = {
+        **cors_headers,
+        "Content-Disposition": f'attachment; filename="{Path(rel).name}"',
+    }
     return Response(
         content=image_storage_service.get_bytes(rel),
         media_type="image/png",
-        headers={"Content-Disposition": f'attachment; filename="{Path(rel).name}"'},
+        headers=headers,
     )
 
 

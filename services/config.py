@@ -299,6 +299,37 @@ class ConfigStore:
             return 3
 
     @property
+    def image_parallel_generation(self) -> bool:
+        value = self.data.get("image_parallel_generation", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_settle_enabled(self) -> bool:
+        """图片二次确认机制：找到 file_ids 后等待一段时间再次确认。"""
+        value = self.data.get("image_settle_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_check_before_hit_enabled(self) -> bool:
+        """先check再hit：通过轮询确认 file_ids 存在后再返回，而非仅依赖 SSE 事件。"""
+        value = self.data.get("image_check_before_hit_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_settle_secs(self) -> float:
+        """二次确认等待时间（秒）。"""
+        try:
+            return max(0.5, float(self.data.get("image_settle_secs", 2.0)))
+        except (TypeError, ValueError):
+            return 2.0
+
+    @property
     def auto_remove_invalid_accounts(self) -> bool:
         value = self.data.get("auto_remove_invalid_accounts", False)
         if isinstance(value, str):
@@ -308,6 +339,13 @@ class ConfigStore:
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def auto_relogin_after_refresh(self) -> bool:
+        value = self.data.get("auto_relogin_after_refresh", False)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -384,8 +422,10 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
+        data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review

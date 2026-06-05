@@ -4,11 +4,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
+from services.config import config
+from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -93,6 +96,55 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([{"access_token": "invalid-token", "status": "正常"}])
+
+                with patch(
+                    "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                    side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
+                ):
+                    result = service.refresh_accounts(["invalid-token"], defer_invalid_removal=False)
+
+                self.assertEqual(result["refreshed"], 0)
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertEqual(result["items"], [])
+                self.assertIsNone(service.get_account("invalid-token"))
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_refresh_accounts_defers_invalid_token_removal_by_default(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([{"access_token": "invalid-token", "status": "正常"}])
+
+                with patch(
+                    "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                    side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
+                ):
+                    result = service.refresh_accounts(["invalid-token"])
+
+                account = service.get_account("invalid-token")
+                self.assertEqual(result["refreshed"], 0)
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIsNotNone(account)
+                self.assertEqual(account["invalid_count"], 1)
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
 
 
 class TokenLogTests(unittest.TestCase):
