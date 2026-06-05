@@ -54,6 +54,7 @@ import {
   testProxy,
   updateAccount,
   type Account,
+  type AccountExportFormat,
   type AccountRefreshResponse,
   type AccountStatus,
   type Model,
@@ -209,6 +210,7 @@ function AccountsPageContent() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
   const [progress, setProgress] = useState<{

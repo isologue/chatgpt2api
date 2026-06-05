@@ -49,6 +49,11 @@ export type AccountImportPayload = {
 
 export type AccountExportFormat = "json" | "zip";
 
+type ExportAccountsResult = {
+  blob: Blob;
+  filename: string;
+};
+
 export type Model = {
   id: string;
   object: string;
@@ -355,6 +360,28 @@ export async function deleteAccounts(tokens: string[]) {
     method: "DELETE",
     body: { tokens },
   });
+}
+
+export async function exportAccounts(
+  format: AccountExportFormat,
+  accessTokens: string[],
+): Promise<ExportAccountsResult> {
+  const response = await request.post("/api/accounts/export", {
+    access_tokens: accessTokens,
+    format,
+  }, {
+    responseType: "blob",
+  });
+
+  const blob = response.data as Blob;
+  const dispositionHeader = response.headers["content-disposition"];
+  const encodedFilenameMatch = dispositionHeader?.match(/filename\*=UTF-8''([^;]+)/i);
+  const plainFilenameMatch = dispositionHeader?.match(/filename="?([^"]+)"?/i);
+  const filename = encodedFilenameMatch
+    ? decodeURIComponent(encodedFilenameMatch[1])
+    : plainFilenameMatch?.[1] || `accounts.${format}`;
+
+  return { blob, filename };
 }
 
 export async function refreshAccounts(accessTokens: string[]) {
