@@ -12,6 +12,11 @@ FROM node:22-alpine AS web-build
 # 国内环境可传入镜像源
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 
+ENV HOME=/tmp \
+    NEXT_TELEMETRY_DISABLED=1 \
+    npm_config_cache=/tmp/.npm \
+    BUN_INSTALL_CACHE_DIR=/tmp/.bun
+
 WORKDIR /app/web
 
 # 先复制依赖清单，便于利用 Docker 层缓存
