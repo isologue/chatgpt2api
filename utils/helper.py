@@ -30,6 +30,7 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+STANDARD_MODEL_RE = re.compile(r"^(gpt-\d+)-(\d+)(.*)$", re.IGNORECASE)
 
 
 def _image_extension(mime_type: str) -> str:
@@ -106,8 +107,38 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def standardize_model_name(model: object) -> str:
+    value = str(model or "").strip()
+    if not value:
+        return ""
+    match = STANDARD_MODEL_RE.match(value)
+    if match:
+        return f"{match.group(1)}.{match.group(2)}{match.group(3)}"
+    return value
+
+
+def upstream_text_model_name(model: object) -> str:
+    value = standardize_model_name(model)
+    if "." not in value:
+        return value
+    prefix, rest = value.split(".", 1)
+    minor = ""
+    suffix = ""
+    for idx, ch in enumerate(rest):
+        if ch.isdigit():
+            minor += ch
+            continue
+        suffix = rest[idx:]
+        break
+    else:
+        suffix = ""
+    if prefix.lower().startswith("gpt-") and minor:
+        return f"{prefix}-{minor}{suffix}"
+    return value
+
+
 def split_image_model(model: object) -> tuple[str | None, str | None]:
-    normalized = str(model or "").strip().lower()
+    normalized = standardize_model_name(model).lower()
     if not normalized:
         return None, None
     if normalized in BASE_IMAGE_MODELS:

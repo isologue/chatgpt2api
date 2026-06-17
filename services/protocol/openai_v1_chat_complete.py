@@ -21,7 +21,15 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import (
+    build_chat_image_markdown_content,
+    extract_chat_image,
+    extract_chat_prompt,
+    is_image_chat_request,
+    parse_image_count,
+    standardize_model_name,
+    upstream_text_model_name,
+)
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -88,7 +96,7 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=upstream_text_model_name(model), messages=messages)
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -135,7 +143,7 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    model = str(body.get("model") or "auto").strip() or "auto"
+    model = standardize_model_name(body.get("model") or "auto") or "auto"
     messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
@@ -225,7 +233,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         key,
         lambda: completion_response(
             model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
+            collect_text(text_backend(), ConversationRequest(model=upstream_text_model_name(model), messages=messages)),
             messages=messages,
         ),
     )

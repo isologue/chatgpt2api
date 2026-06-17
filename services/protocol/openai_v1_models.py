@@ -4,7 +4,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, standardize_model_name
 
 
 def list_models() -> dict[str, Any]:
@@ -12,7 +12,22 @@ def list_models() -> dict[str, Any]:
     data = result.get("data")
     if not isinstance(data, list):
         return result
-    seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
+    normalized_data: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        normalized = dict(item)
+        model_id = standardize_model_name(normalized.get("id"))
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        normalized["id"] = model_id
+        normalized["root"] = standardize_model_name(normalized.get("root")) or model_id
+        parent = standardize_model_name(normalized.get("parent"))
+        normalized["parent"] = parent or None
+        normalized_data.append(normalized)
+    data[:] = normalized_data
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()
     web_image_accounts = [
@@ -40,14 +55,17 @@ def list_models() -> dict[str, Any]:
         dynamic_models.add(f"pro-{CODEX_IMAGE_MODEL}")
 
     for model in sorted(dynamic_models):
-        if model not in seen:
-            data.append({
-                "id": model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "chatgpt2api",
-                "permission": [],
-                "root": model,
-                "parent": None,
-            })
+        normalized_model = standardize_model_name(model)
+        if normalized_model in seen:
+            continue
+        seen.add(normalized_model)
+        data.append({
+            "id": normalized_model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "chatgpt2api",
+            "permission": [],
+            "root": normalized_model,
+            "parent": None,
+        })
     return result

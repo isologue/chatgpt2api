@@ -19,7 +19,13 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import (
+    extract_image_from_message_content,
+    extract_response_prompt,
+    has_response_image_generation_tool,
+    standardize_model_name,
+    upstream_text_model_name,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -234,7 +240,7 @@ def response_completed(
 
 
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    model = str(body.get("model") or "auto").strip() or "auto"
+    model = standardize_model_name(body.get("model") or "auto") or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
     if has_non_image_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
@@ -242,7 +248,7 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
 
 
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
-    model = str(body.get("model") or "auto").strip() or "auto"
+    model = standardize_model_name(body.get("model") or "auto") or "auto"
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
     response_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
@@ -250,7 +256,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     full_text = ""
     yield response_created(response_id, model, created)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=upstream_text_model_name(model), messages=messages)
     for delta in stream_text_deltas(backend, request):
         full_text += delta
         yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
