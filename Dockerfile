@@ -7,7 +7,7 @@ ARG TARGETARCH
 # 前端构建阶段
 # 仅在最终目标为 app-with-web 时使用
 # ============================================
-FROM oven/bun:1-alpine AS web-build
+FROM node:22-alpine AS web-build
 
 # 国内环境可传入镜像源
 ARG NPM_REGISTRY=https://registry.npmmirror.com
@@ -17,15 +17,16 @@ WORKDIR /app/web
 # 先复制依赖清单，便于利用 Docker 层缓存
 COPY web/package.json web/bun.lock ./
 
-# web 使用 bun.lock，容器内保持与仓库一致的 Bun 安装链路
-RUN if [ -n "$NPM_REGISTRY" ]; then export NPM_CONFIG_REGISTRY="$NPM_REGISTRY"; fi \
+# web 使用 bun.lock，但 Next 16 在容器内用 Node 执行构建更稳
+RUN npm install -g bun \
+    && if [ -n "$NPM_REGISTRY" ]; then export NPM_CONFIG_REGISTRY="$NPM_REGISTRY"; fi \
     && bun install --frozen-lockfile
 
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
 COPY web ./
 
-RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" bun run build
+RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" node node_modules/next/dist/bin/next build
 
 
 # ============================================
