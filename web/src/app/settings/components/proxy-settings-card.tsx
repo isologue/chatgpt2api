@@ -1,5 +1,13 @@
 "use client";
 
+/**
+ * ⚠️ 已废弃 / 未使用（DEAD CODE）— 请勿使用
+ *
+ * 此组件未被任何页面 import，不会被渲染。
+ * 实际生效的全局代理 UI 已合并进 `config-card.tsx`（读写 config.proxy + saveConfig）。
+ * 保留此文件仅作历史参考，新增功能请勿基于它开发。
+ */
+
 import { useState } from "react";
 import { Link2, LoaderCircle, PlugZap, Save } from "lucide-react";
 import { toast } from "sonner";

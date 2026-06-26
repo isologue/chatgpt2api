@@ -1,5 +1,16 @@
 "use client";
 
+/**
+ * ⚠️ 已废弃 / 未使用（DEAD CODE）— 请勿使用
+ *
+ * 此组件未被任何页面 import，不会被渲染。
+ * 它依赖的 `{ enabled, url }` 数据结构和 `GET/POST /api/proxy` 端点在后端并不存在
+ * （后端只有单字符串 `config.proxy` 字段和 `/api/proxy/test`）。
+ *
+ * 实际生效的全局代理 UI 在 `config-card.tsx` 里（走 config.proxy + saveConfig）。
+ * 保留此文件仅作历史参考，新增功能请勿基于它开发。
+ */
+
 import { useEffect, useRef, useState } from "react";
 import {
   LoaderCircle,
