@@ -271,6 +271,11 @@ export type UserKey = {
 
 export type RegisterConfig = {
   enabled: boolean;
+  schedule_enabled: boolean;
+  schedule_interval_minutes: number;
+  schedule_started_at?: string | null;
+  last_scheduled_at?: string | null;
+  next_scheduled_at?: string | null;
   mail: {
     request_timeout: number;
     wait_timeout: number;
