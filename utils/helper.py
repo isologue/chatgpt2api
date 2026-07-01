@@ -257,8 +257,23 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def iter_sse_payloads(
+    response: requests.Response,
+    deadline_ts: float | None = None,
+    timeout_error: Exception | None = None,
+) -> Iterator[str]:
+    def _raise_timeout() -> None:
+        try:
+            response.close()
+        except Exception:
+            pass
+        if timeout_error is not None:
+            raise timeout_error
+        raise TimeoutError("SSE stream exceeded configured deadline")
+
     for raw_line in response.iter_lines():
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            _raise_timeout()
         if not raw_line:
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
@@ -267,6 +282,8 @@ def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
         payload = line[5:].strip()
         if payload:
             yield payload
+            if deadline_ts is not None and time.time() >= deadline_ts:
+                _raise_timeout()
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:

@@ -719,6 +719,7 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            timeout_secs: float | None = None,
     ) -> Iterator[Dict[str, Any]]:
         if not self.access_token:
             raise RuntimeError("access_token is required for codex image endpoints")
@@ -755,7 +756,7 @@ class OpenAIBackendAPI:
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
             "transport": "urllib.request",
-            "timeout_secs": 1200,
+            "timeout_secs": float(timeout_secs) if timeout_secs is not None else 1200.0,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -787,8 +788,9 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
+        request_timeout = max(1.0, float(timeout_secs)) if timeout_secs is not None else 1200.0
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
+            with urllib.request.urlopen(request, timeout=request_timeout) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
             body_text = error.read().decode("utf-8", "replace")
@@ -907,8 +909,15 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+    def _start_image_generation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            timeout_secs: float = 300.0,
+    ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -974,7 +983,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=max(1.0, float(timeout_secs)),
             stream=True,
         )
         ensure_ok(response, path)
@@ -2479,27 +2488,36 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            timeout_secs: float | None = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(prompt, model, images or [], timeout_secs=timeout_secs)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
+        deadline_ts = time.time() + max(0.0, float(timeout_secs)) if timeout_secs is not None else None
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone)
+        request_timeout = max(1.0, deadline_ts - time.time()) if deadline_ts is not None else 300.0
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
-            timeout=300,
+            timeout=request_timeout,
             stream=True,
         )
         ensure_ok(response, path)
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(
+                response,
+                deadline_ts=deadline_ts,
+                timeout_error=TimeoutError(
+                    f"conversation stream exceeded {round(request_timeout, 1)} seconds"
+                ) if deadline_ts is not None else None,
+            )
         finally:
             response.close()
 
@@ -2516,9 +2534,11 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            timeout_secs: float | None = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        deadline_ts = time.time() + max(0.0, float(timeout_secs)) if timeout_secs is not None else None
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
@@ -2528,10 +2548,24 @@ class OpenAIBackendAPI:
         self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        request_timeout = max(1.0, deadline_ts - time.time()) if deadline_ts is not None else 300.0
+        response = self._start_image_generation(
+            prompt,
+            requirements,
+            conduit_token,
+            model,
+            references,
+            timeout_secs=request_timeout,
+        )
         self._report_progress("generating")
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(
+                response,
+                deadline_ts=deadline_ts,
+                timeout_error=ImagePollTimeoutError(
+                    f"ChatGPT image stream timed out after {int(request_timeout)} seconds."
+                ) if deadline_ts is not None else None,
+            )
         finally:
             response.close()
 

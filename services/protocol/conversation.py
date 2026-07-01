@@ -656,6 +656,7 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    timeout_secs: float | None = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -668,6 +669,7 @@ def conversation_events(
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
+        timeout_secs=timeout_secs,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -776,6 +778,7 @@ def stream_image_outputs(
         return max(min_floor, remaining)
 
     last: dict[str, Any] = {}
+    stream_timeout = max(1.0, _remaining_budget(0.0))
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -783,6 +786,7 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            timeout_secs=stream_timeout,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1207,11 +1211,17 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    timeout_secs = (
+        max(1.0, request.image_deadline_ts - time.time())
+        if request.image_deadline_ts > 0
+        else float(config.image_poll_timeout_secs)
+    )
     images = _codex_response_images(list(backend.iter_codex_image_response_events(
         prompt=request.prompt,
         images=request.images or [],
         size=request.size,
         quality=request.quality,
+        timeout_secs=timeout_secs,
     )))
     if not images:
         raise ImageGenerationError("No image result found in response")
@@ -1252,6 +1262,11 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
+
+    def _remaining_total_budget() -> float:
+        if request.image_deadline_ts <= 0:
+            return float(config.image_poll_timeout_secs)
+        return max(0.0, request.image_deadline_ts - time.time())
 
     while True:
         if request.image_deadline_ts > 0 and time.time() >= request.image_deadline_ts:
@@ -1446,7 +1461,9 @@ def _generate_single_image(
                         "index": index,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    sleep_for = min(min(2.0 * tls_retry_count, 10.0), _remaining_total_budget())
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
@@ -1462,7 +1479,9 @@ def _generate_single_image(
                         "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
+                    sleep_for = min(wait_secs, _remaining_total_budget())
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
 
