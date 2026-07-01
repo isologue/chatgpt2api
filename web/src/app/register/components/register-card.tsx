@@ -11,25 +11,6 @@ import { Textarea } from "@/components/ui/textarea";
 
 import { useSettingsStore } from "../../settings/store";
 
-function formatDateTime(value?: string | null) {
-  if (!value) {
-    return "未设置";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "未设置";
-  }
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-}
-
 export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
@@ -41,8 +22,6 @@ export function RegisterCard() {
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
-  const setScheduleEnabled = useSettingsStore((state) => state.setRegisterScheduleEnabled);
-  const setScheduleIntervalMinutes = useSettingsStore((state) => state.setRegisterScheduleIntervalMinutes);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
@@ -136,42 +115,6 @@ export function RegisterCard() {
           <div className="space-y-2">
             <label className="text-sm text-stone-700">检查间隔（秒）</label>
             <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode === "total"} />
-          </div>
-        </div>
-
-        <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/80 p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-stone-800">定时启动</h3>
-              <p className="mt-1 text-xs text-stone-500">从当前保存时刻开始计时，每隔 n 分钟自动启动一次；如果上一次还没结束，本轮会自动跳过。</p>
-            </div>
-            <label className="flex items-center gap-3 text-sm text-stone-700">
-              <Checkbox checked={Boolean(config.schedule_enabled)} onCheckedChange={(checked) => setScheduleEnabled(Boolean(checked))} disabled={config.enabled} />
-              启用定时
-            </label>
-          </div>
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">间隔分钟</label>
-              <Input
-                value={String(config.schedule_interval_minutes || "")}
-                onChange={(event) => setScheduleIntervalMinutes(event.target.value)}
-                className="h-10 rounded-xl border-stone-200 bg-white"
-                disabled={config.enabled || !config.schedule_enabled}
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">下次触发</label>
-              <div className="flex h-10 items-center rounded-xl border border-stone-200 bg-white px-3 text-sm text-stone-700">
-                {formatDateTime(config.next_scheduled_at)}
-              </div>
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">最近触发</label>
-              <div className="flex h-10 items-center rounded-xl border border-stone-200 bg-white px-3 text-sm text-stone-700">
-                {formatDateTime(config.last_scheduled_at)}
-              </div>
-            </div>
           </div>
         </div>
 
@@ -400,7 +343,7 @@ export function RegisterCard() {
           </div>
           <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
             <AlertTriangle className="size-4 shrink-0" />
-            启动前请先保存配置。启用定时后，也需要先保存一次才会开始计时。
+            启动之前注意先保存配置。
           </div>
         </div>
 
@@ -408,7 +351,7 @@ export function RegisterCard() {
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-sm font-semibold text-stone-900">实时日志</h3>
-              <p className="mt-1 text-xs text-amber-700">如果遇到邮箱被封、HTTP 400 等异常，先看这里的最新日志，通常能直接定位到是哪一轮触发、哪个 provider 出错。</p>
+              <p className="mt-1 text-xs text-amber-700">遇到 HTTP 状态码 400 等错误，基本是邮箱滥用被封，需要更换新的域名邮箱。</p>
             </div>
             <Badge variant="secondary" className="rounded-md">
               {logs.length}

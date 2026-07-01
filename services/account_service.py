@@ -221,6 +221,8 @@ class AccountService:
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
+        if not normalized["image_quota_unknown"] and normalized["quota"] <= 0 and normalized["status"] == "正常":
+            normalized["status"] = "限流"
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -1064,6 +1066,26 @@ class AccountService:
                 if item.get("status") == "限流"
                    and (token := item.get("access_token") or "")
             ]
+
+
+    def list_probe_candidate_tokens(self, limit: int = 5, excluded_tokens: set[str] | None = None) -> list[str]:
+        excluded = set(excluded_tokens or set())
+        with self._lock:
+            candidates = []
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if not token or token in excluded:
+                    continue
+                if item.get("status") != "正常":
+                    continue
+                if self._token_needs_refresh(token):
+                    continue
+                quota_rank = 10**9 if bool(item.get("image_quota_unknown")) else max(0, int(item.get("quota") or 0))
+                success_rank = int(item.get("success") or 0)
+                zero_success_rank = 0 if success_rank == 0 else 1
+                candidates.append((quota_rank, zero_success_rank, success_rank, token))
+            candidates.sort(key=lambda entry: (-entry[0], entry[1], entry[2], entry[3]))
+            return [token for _, _, _, token in candidates[: max(0, int(limit))]]
 
     @staticmethod
     def _account_payload_token(item: dict) -> str:

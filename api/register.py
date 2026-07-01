@@ -20,8 +20,6 @@ class RegisterConfigRequest(BaseModel):
     target_quota: int | None = None
     target_available: int | None = None
     check_interval: int | None = None
-    schedule_enabled: bool | None = None
-    schedule_interval_minutes: int | None = None
 
 
 def create_router() -> APIRouter:

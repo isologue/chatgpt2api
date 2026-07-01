@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
@@ -20,20 +20,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _after_minutes(minutes: int) -> str:
-    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
-
-
-def _parse_time(value: object) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw)
-    except Exception:
-        return None
-
-
 def _default_config() -> dict:
     return {
         **openai_register.config,
@@ -42,11 +28,6 @@ def _default_config() -> dict:
         "target_available": 10,
         "check_interval": 5,
         "enabled": False,
-        "schedule_enabled": False,
-        "schedule_interval_minutes": 60,
-        "schedule_started_at": None,
-        "last_scheduled_at": None,
-        "next_scheduled_at": None,
         "stats": {
             "success": 0,
             "fail": 0,
@@ -75,11 +56,6 @@ def _normalize(raw: dict) -> dict:
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"] = {**cfg["mail"], "proxy": cfg["proxy"]}
     cfg["enabled"] = bool(cfg.get("enabled"))
-    cfg["schedule_enabled"] = bool(cfg.get("schedule_enabled"))
-    cfg["schedule_interval_minutes"] = max(1, int(cfg.get("schedule_interval_minutes") or 60))
-    cfg["schedule_started_at"] = str(cfg.get("schedule_started_at") or "").strip() or None
-    cfg["last_scheduled_at"] = str(cfg.get("last_scheduled_at") or "").strip() or None
-    cfg["next_scheduled_at"] = str(cfg.get("next_scheduled_at") or "").strip() or None
     stats = {
         **_default_config()["stats"],
         **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
@@ -94,16 +70,9 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
-        self._scheduler: threading.Thread | None = None
-        self._scheduler_wakeup = threading.Event()
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
-        if self._config["schedule_enabled"]:
-            with self._lock:
-                self._reset_schedule_anchor_locked()
-                self._save()
-            self._ensure_scheduler()
         if self._config["enabled"]:
             self.start()
 
@@ -126,45 +95,15 @@ class RegisterService:
         if isinstance(self._config.get("mail"), dict):
             self._config["mail"]["proxy"] = proxy
 
-    def _reset_schedule_anchor_locked(self) -> None:
-        self._config["schedule_started_at"] = _now()
-        self._config["next_scheduled_at"] = _after_minutes(int(self._config.get("schedule_interval_minutes") or 60))
-
-    def _ensure_scheduler(self) -> None:
-        if self._scheduler and self._scheduler.is_alive():
-            return
-        self._scheduler = threading.Thread(target=self._schedule_loop, daemon=True, name="openai-register-scheduler")
-        self._scheduler.start()
-
     def update(self, updates: dict) -> dict:
-        schedule_message = ""
         with self._lock:
-            previous = self._config
             self._config = _normalize({**self._config, **updates})
             self._inject_proxy_to_mail()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
-            schedule_enabled_changed = bool(previous.get("schedule_enabled")) != bool(self._config.get("schedule_enabled"))
-            schedule_interval_changed = int(previous.get("schedule_interval_minutes") or 60) != int(self._config.get("schedule_interval_minutes") or 60)
-            if self._config["schedule_enabled"]:
-                self._reset_schedule_anchor_locked()
-                if schedule_enabled_changed:
-                    schedule_message = f"Register scheduler enabled. First run in {self._config['schedule_interval_minutes']} minute(s)."
-                elif schedule_interval_changed:
-                    schedule_message = f"Register scheduler interval updated to {self._config['schedule_interval_minutes']} minute(s). Countdown restarted."
-            else:
-                self._config["next_scheduled_at"] = None
-                if schedule_enabled_changed:
-                    schedule_message = "Register scheduler disabled."
             self._save()
-            result = self.get()
-        if self._config["schedule_enabled"]:
-            self._ensure_scheduler()
-        self._scheduler_wakeup.set()
-        if schedule_message:
-            self._append_log(schedule_message, "yellow")
-        return result
+            return self.get()
 
-    def start(self, trigger: str = "manual") -> dict:
+    def start(self) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
@@ -172,8 +111,7 @@ class RegisterService:
                 return self.get()
             self._config["enabled"] = True
             self._inject_proxy_to_mail()
-            if trigger != "schedule":
-                self._logs = []
+            self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {
                 "job_id": uuid.uuid4().hex,
@@ -192,7 +130,7 @@ class RegisterService:
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
-            self._append_log(f"Register job started ({trigger}), mode={self._config['mode']}, threads={self._config['threads']}", "yellow")
+            self._append_log(f"Register job started, mode={self._config['mode']}, threads={self._config['threads']}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
@@ -304,45 +242,6 @@ class RegisterService:
             self._config["enabled"] = False
             self._save()
         self._append_log(f"Register job finished, success={success}, fail={fail}", "yellow")
-
-    def _schedule_loop(self) -> None:
-        while True:
-            timeout = 60.0
-            with self._lock:
-                if self._config["schedule_enabled"]:
-                    next_run = _parse_time(self._config.get("next_scheduled_at"))
-                    if next_run is None:
-                        self._reset_schedule_anchor_locked()
-                        self._save()
-                    else:
-                        timeout = max(0.5, min(60.0, (next_run - datetime.now(timezone.utc)).total_seconds()))
-            if self._scheduler_wakeup.wait(timeout=max(0.5, timeout)):
-                self._scheduler_wakeup.clear()
-                continue
-            self._scheduler_wakeup.clear()
-
-            should_start = False
-            log_message = ""
-            with self._lock:
-                if not self._config["schedule_enabled"]:
-                    continue
-                next_run = _parse_time(self._config.get("next_scheduled_at"))
-                if next_run is None or next_run > datetime.now(timezone.utc):
-                    continue
-                interval = int(self._config.get("schedule_interval_minutes") or 60)
-                self._config["next_scheduled_at"] = _after_minutes(interval)
-                if self._runner and self._runner.is_alive():
-                    self._save()
-                    log_message = f"Scheduled trigger skipped because a register job is still running. Next run in {interval} minute(s)."
-                else:
-                    self._config["last_scheduled_at"] = _now()
-                    self._save()
-                    should_start = True
-                    log_message = f"Scheduled trigger fired. Next run in {interval} minute(s)."
-            if log_message:
-                self._append_log(log_message, "yellow")
-            if should_start:
-                self.start(trigger="schedule")
 
 
 register_service = RegisterService(REGISTER_FILE)

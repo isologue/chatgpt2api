@@ -305,6 +305,7 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    image_deadline_ts: float = 0.0
 
 
 @dataclass
@@ -768,6 +769,12 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    def _remaining_budget(min_floor: float = 0.0) -> float:
+        if request.image_deadline_ts <= 0:
+            return float(config.image_poll_timeout_secs)
+        remaining = request.image_deadline_ts - time.time()
+        return max(min_floor, remaining)
+
     last: dict[str, Any] = {}
     for event in conversation_events(
             backend,
@@ -884,10 +891,10 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    poll_timeout = max(1.0, _remaining_budget(0.0))
     if is_text_reply and conversation_id:
         # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
+        poll_timeout = max(1.0, _remaining_budget(0.0))
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -972,7 +979,7 @@ def stream_image_outputs(
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
             # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+            retry_poll_timeout = max(1.0, _remaining_budget(0.0))
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
                 try:
@@ -1011,7 +1018,10 @@ def stream_image_outputs(
                             "poll_attempt": poll_attempt,
                             "backoff_secs": backoff,
                         })
-                        time.sleep(backoff)
+                        sleep_for = min(backoff, _remaining_budget(0.0))
+                        if sleep_for <= 0:
+                            break
+                        time.sleep(sleep_for)
                         continue
                     # 超时错误或重试次数用尽，停止重试
                     break
@@ -1076,7 +1086,7 @@ def stream_image_outputs(
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+        retry_poll_timeout = max(1.0, _remaining_budget(0.0))
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1086,6 +1096,9 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
+            retry_wait_secs = min(retry_wait_secs, _remaining_budget(0.0))
+            if retry_wait_secs <= 0:
+                break
             time.sleep(retry_wait_secs)
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
@@ -1123,7 +1136,10 @@ def stream_image_outputs(
                         "poll_attempt": poll_attempt,
                         "backoff_secs": backoff,
                     })
-                    time.sleep(backoff)
+                    sleep_for = min(backoff, _remaining_budget(0.0))
+                    if sleep_for <= 0:
+                        break
+                    time.sleep(sleep_for)
                     continue
                 # 超时错误或重试次数用尽，停止重试
                 break
@@ -1238,6 +1254,19 @@ def _generate_single_image(
     account_email = ""
 
     while True:
+        if request.image_deadline_ts > 0 and time.time() >= request.image_deadline_ts:
+            logger.warning({
+                "event": "image_total_timeout_exhausted",
+                "configured_timeout_secs": config.image_poll_timeout_secs,
+                "deadline_ts": request.image_deadline_ts,
+                "index": index,
+                "account_email": account_email,
+            })
+            raise ImageGenerationError(
+                f"ChatGPT 生图总超时（已超过 {int(config.image_poll_timeout_secs)} 秒上限）。",
+                account_email=account_email,
+                conversation_id="",
+            )
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1442,6 +1471,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+    if request.image_deadline_ts <= 0:
+        request.image_deadline_ts = time.time() + float(config.image_poll_timeout_secs)
+
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

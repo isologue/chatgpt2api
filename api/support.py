@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
 
@@ -79,12 +81,30 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
-def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
+def _watcher_now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
+def _watcher_elapsed(start_perf: float) -> str:
+    return f"{time.perf_counter() - start_perf:.2f}s"
+
+
+def _watcher_tokens_preview(tokens: list[str], limit: int = 5) -> str:
+    items = [str(token or "").strip()[:12] for token in tokens if str(token or "").strip()]
+    if not items:
+        return "-"
+    preview = items[:limit]
+    suffix = f" ...(+{len(items) - limit})" if len(items) > limit else ""
+    return ", ".join(preview) + suffix
+
+
+def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
+            interval_seconds = config.refresh_account_interval_minute * 60
+            cycle_perf = time.perf_counter()
             try:
+                print(f"[account-watcher] cycle start at {_watcher_now()}, interval={interval_seconds}s")
                 limited_tokens = account_service.list_limited_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
@@ -92,19 +112,72 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
+                    check_perf = time.perf_counter()
                     print(
-                        "[account-watcher] checking "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
+                        "[account-watcher] checking start "
+                        f"at {_watcher_now()}, "
+                        f"limited={len(limited_tokens)}, expiring={len(expiring_tokens)}, "
+                        f"tokens={_watcher_tokens_preview(tokens)}"
                     )
                     account_service.refresh_accounts(tokens)
+                    print(f"[account-watcher] checking end at {_watcher_now()}, elapsed={_watcher_elapsed(check_perf)}")
+                probe_seen = set(tokens)
+                probe_round = 0
+                while True:
+                    probe_tokens = account_service.list_probe_candidate_tokens(limit=5, excluded_tokens=probe_seen)
+                    if not probe_tokens:
+                        break
+                    probe_round += 1
+                    probe_seen.update(probe_tokens)
+                    probe_perf = time.perf_counter()
+                    print(
+                        "[account-watcher] probe start "
+                        f"at {_watcher_now()}, round={probe_round}, count={len(probe_tokens)}, "
+                        f"tokens={_watcher_tokens_preview(probe_tokens)}"
+                    )
+                    before = {token: account_service.get_account(token) for token in probe_tokens}
+                    account_service.refresh_accounts(probe_tokens, defer_invalid_removal=False)
+                    dead_found = False
+                    removed_tokens = []
+                    changed_tokens = []
+                    for token in probe_tokens:
+                        after = account_service.get_account(token)
+                        after_status = str((after or {}).get("status") or "").strip()
+                        before_status = str((before.get(token) or {}).get("status") or "").strip()
+                        if after is None:
+                            removed_tokens.append(token)
+                        elif after_status != before_status:
+                            changed_tokens.append(f"{token[:12]}:{before_status}->{after_status}")
+                        if after is None or after_status in {"\u5f02\u5e38", "\u7981\u7528", "\u9650\u6d41"} or (before_status == "\u6b63\u5e38" and after_status != "\u6b63\u5e38"):
+                            dead_found = True
+                    print(
+                        "[account-watcher] probe end "
+                        f"at {_watcher_now()}, round={probe_round}, elapsed={_watcher_elapsed(probe_perf)}, "
+                        f"removed={_watcher_tokens_preview(removed_tokens)}, "
+                        f"changed={'; '.join(changed_tokens) if changed_tokens else '-'}, "
+                        f"continue={'yes' if dead_found else 'no'}"
+                    )
+                    if not dead_found:
+                        break
                 if keepalive_tokens:
-                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
+                    keepalive_perf = time.perf_counter()
+                    print(
+                        "[account-watcher] keepalive start "
+                        f"at {_watcher_now()}, count={len(keepalive_tokens)}, "
+                        f"tokens={_watcher_tokens_preview(keepalive_tokens)}"
+                    )
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)
                     if result.get("errors"):
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
+                    print(
+                        "[account-watcher] keepalive end "
+                        f"at {_watcher_now()}, elapsed={_watcher_elapsed(keepalive_perf)}, "
+                        f"refreshed={result.get('refreshed', 0)}, errors={len(result.get('errors') or [])}"
+                    )
             except Exception as exc:
-                print(f"[account-watcher] fail {exc}")
+                print(f"[account-watcher] fail at {_watcher_now()}: {exc}")
+            finally:
+                print(f"[account-watcher] cycle end at {_watcher_now()}, elapsed={_watcher_elapsed(cycle_perf)}")
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)

@@ -17,6 +17,20 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_normalize_account_marks_known_zero_quota_as_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            account = service._normalize_account(
+                {
+                    "access_token": "token-known-zero",
+                    "status": "正常",
+                    "quota": 0,
+                    "image_quota_unknown": False,
+                }
+            )
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "限流")
+
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
