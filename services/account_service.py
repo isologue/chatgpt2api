@@ -963,6 +963,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -970,7 +971,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = set(excluded_tokens or set())
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,

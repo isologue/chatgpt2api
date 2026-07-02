@@ -1,6 +1,6 @@
 "use client";
 
-import { Cloud, LoaderCircle, PlugZap, RefreshCw, Save } from "lucide-react";
+import { Cloud, Info, LoaderCircle, PlugZap, RefreshCw, Save } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageStorageMode } from "@/lib/api";
@@ -25,6 +26,7 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageUpstreamErrorRetryCount = useSettingsStore((state) => state.setImageUpstreamErrorRetryCount);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
@@ -154,14 +156,46 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片轮询超时</label>
+            <label className="text-sm text-stone-700">Image poll timeout</label>
             <Input
               value={String(config?.image_poll_timeout_secs || "")}
               onChange={(event) => setImagePollTimeoutSecs(event.target.value)}
               placeholder="120"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
+            <p className="text-xs text-stone-500">Seconds to wait for the upstream image result.</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-stone-700">Upstream error auto retry count</label>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="inline-flex size-5 items-center justify-center rounded-full text-amber-500 transition hover:bg-amber-50 hover:text-amber-600"
+                    aria-label="Show retry rules"
+                  >
+                    <Info className="size-4" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent className="w-80 text-xs leading-6 text-stone-600" align="start">
+                  <div className="space-y-2">
+                    <p className="font-medium text-stone-900">Retry rules</p>
+                    <p>Applies only to image requests. Does not include the first request. 0 disables it.</p>
+                    <p>502/503/504, curl 92, HTTP/2 INTERNAL_ERROR: retry once with the same account, then switch account.</p>
+                    <p>no available image quota / insufficient_quota: switch account directly.</p>
+                    <p>429, content policy, token invalid, and parameter errors are not retried here.</p>
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
+            <Input
+              value={String(config?.image_upstream_error_retry_count ?? 2)}
+              onChange={(event) => setImageUpstreamErrorRetryCount(event.target.value)}
+              placeholder="2"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">Extra retry attempts; default 2 means at most 2 retries after the first failure.</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>

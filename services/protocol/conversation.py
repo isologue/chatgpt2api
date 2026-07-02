@@ -16,6 +16,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -35,6 +36,10 @@ class ImageGenerationError(Exception):
         param: str | None = None,
         account_email: str = "",
         conversation_id: str = "",
+        had_error_retry: bool = False,
+        error_retry_count: int = 0,
+        error_retry_reason: str = "",
+        error_retry_trace: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -43,6 +48,10 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.had_error_retry = had_error_retry
+        self.error_retry_count = error_retry_count
+        self.error_retry_reason = error_retry_reason
+        self.error_retry_trace = [dict(item) for item in (error_retry_trace or [])]
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -332,6 +341,10 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    had_error_retry: bool = False
+    error_retry_count: int = 0
+    error_retry_reason: str = ""
+    error_retry_trace: list[dict[str, Any]] = field(default_factory=list)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -348,6 +361,13 @@ class ImageOutput:
             chunk["_account_email"] = self.account_email
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
+        if self.had_error_retry:
+            chunk["_had_error_retry"] = True
+            chunk["_error_retry_count"] = int(self.error_retry_count)
+            if self.error_retry_reason:
+                chunk["_error_retry_reason"] = self.error_retry_reason
+            if self.error_retry_trace:
+                chunk["_error_retry_trace"] = [dict(item) for item in self.error_retry_trace]
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -672,6 +692,34 @@ def conversation_events(
         timeout_secs=timeout_secs,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
+
+
+def is_no_available_image_quota_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        "no available image quota" in text
+        or "insufficient_quota" in text
+    )
+
+
+def is_retryable_upstream_image_error(exc: Exception | None = None, message: str = "") -> bool:
+    text = str(message or exc or "").lower()
+    if isinstance(exc, UpstreamHTTPError) and exc.status_code in {502, 503, 504}:
+        return True
+    return any(pattern in text for pattern in (
+        "status=502",
+        "status=503",
+        "status=504",
+        "status_code=502",
+        "status_code=503",
+        "status_code=504",
+        "http 502",
+        "http 503",
+        "http 504",
+        "curl: (92)",
+        "http/2 stream",
+        "internal_error",
+    ))
 
 
 def text_backend() -> OpenAIBackendAPI:
@@ -1238,6 +1286,38 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+def _retry_reason_summary(retry_trace: list[dict[str, Any]]) -> str:
+    reasons = [str(item.get("reason") or "").strip() for item in retry_trace if str(item.get("reason") or "").strip()]
+    unique_reasons = list(dict.fromkeys(reasons))
+    if not unique_reasons:
+        return ""
+    return unique_reasons[0] if len(unique_reasons) == 1 else "multiple"
+
+
+def _apply_retry_metadata_to_outputs(outputs: list[ImageOutput], retry_trace: list[dict[str, Any]]) -> list[ImageOutput]:
+    if not retry_trace:
+        return outputs
+    retry_count = len(retry_trace)
+    retry_reason = _retry_reason_summary(retry_trace)
+    retry_trace_copy = [dict(item) for item in retry_trace]
+    for output in outputs:
+        output.had_error_retry = True
+        output.error_retry_count = retry_count
+        output.error_retry_reason = retry_reason
+        output.error_retry_trace = retry_trace_copy
+    return outputs
+
+
+def _apply_retry_metadata_to_exception(exc: Exception, retry_trace: list[dict[str, Any]]) -> Exception:
+    if not retry_trace:
+        return exc
+    setattr(exc, "had_error_retry", True)
+    setattr(exc, "error_retry_count", len(retry_trace))
+    setattr(exc, "error_retry_reason", _retry_reason_summary(retry_trace))
+    setattr(exc, "error_retry_trace", [dict(item) for item in retry_trace])
+    return exc
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -1256,17 +1336,61 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    MAX_UPSTREAM_ERROR_RETRIES = max(0, int(config.image_upstream_error_retry_count))
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    upstream_error_retry_count = 0
+    retry_trace: list[dict[str, Any]] = []
+    switch_retry_excluded_tokens: set[str] = set()
+    forced_retry_token = ""
+    same_account_upstream_retry_used = False
     account_email = ""
 
     def _remaining_total_budget() -> float:
         if request.image_deadline_ts <= 0:
             return float(config.image_poll_timeout_secs)
         return max(0.0, request.image_deadline_ts - time.time())
+
+    def _retry_upstream_error(current_token: str, error_text: str, reason: str, retry_mode: str) -> bool:
+        nonlocal upstream_error_retry_count, forced_retry_token, same_account_upstream_retry_used
+        if upstream_error_retry_count >= MAX_UPSTREAM_ERROR_RETRIES:
+            return False
+        upstream_error_retry_count += 1
+        wait_secs = min(
+            1.0 if retry_mode == "same_account" else min(float(upstream_error_retry_count), 3.0),
+            _remaining_total_budget(),
+        )
+        retry_trace.append({
+            "attempt": upstream_error_retry_count,
+            "mode": retry_mode,
+            "reason": reason,
+            "account_email": account_email,
+            "wait_secs": round(wait_secs, 2),
+            "error": error_text[:200],
+        })
+        logger.warning({
+            "event": "image_upstream_error_retry",
+            "request_token": current_token,
+            "account_email": account_email,
+            "retry_count": upstream_error_retry_count,
+            "retry_limit": MAX_UPSTREAM_ERROR_RETRIES,
+            "mode": retry_mode,
+            "reason": reason,
+            "wait_secs": round(wait_secs, 2),
+            "index": index,
+            "error": error_text[:200],
+        })
+        if wait_secs > 0:
+            time.sleep(wait_secs)
+        if retry_mode == "same_account":
+            same_account_upstream_retry_used = True
+            forced_retry_token = current_token
+        else:
+            switch_retry_excluded_tokens.add(current_token)
+        return True
 
     while True:
         if request.image_deadline_ts > 0 and time.time() >= request.image_deadline_ts:
@@ -1277,23 +1401,29 @@ def _generate_single_image(
                 "index": index,
                 "account_email": account_email,
             })
-            raise ImageGenerationError(
+            raise _apply_retry_metadata_to_exception(ImageGenerationError(
                 f"ChatGPT 生图总超时（已超过 {int(config.image_poll_timeout_secs)} 秒上限）。",
                 account_email=account_email,
                 conversation_id="",
-            )
+            ), retry_trace)
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-            )
+            if forced_retry_token:
+                token = forced_retry_token
+                forced_retry_token = ""
+            else:
+                token = account_service.get_available_access_token(
+                    plan_type=plan_type,
+                    source_type="codex" if codex_model else None,
+                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                    excluded_tokens=switch_retry_excluded_tokens,
+                )
         except RuntimeError as exc:
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+            error = ImageGenerationError(str(exc) or "image generation failed", account_email=account_email)
+            raise _apply_retry_metadata_to_exception(error, retry_trace) from exc
 
         emitted_for_token = False
         returned_message = False
@@ -1331,22 +1461,22 @@ def _generate_single_image(
                 outputs.append(output)
             if returned_message:
                 account_service.mark_image_result(token, False)
-                return outputs
+                return _apply_retry_metadata_to_outputs(outputs, retry_trace)
             if not returned_result:
                 account_service.mark_image_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
-                    raise ImageGenerationError(
+                    raise _apply_retry_metadata_to_exception(ImageGenerationError(
                         "upstream completed without generating images",
                         status_code=400,
                         error_type="invalid_request_error",
                         code="no_image_generated",
                         account_email=account_email,
                         conversation_id=conv_id,
-                    )
-                return outputs
+                    ), retry_trace)
+                return _apply_retry_metadata_to_outputs(outputs, retry_trace)
             account_service.mark_image_result(token, True)
-            return outputs
+            return _apply_retry_metadata_to_outputs(outputs, retry_trace)
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False)
             if account_email:
@@ -1371,8 +1501,8 @@ def _generate_single_image(
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
                 })
-                raise
-            raise
+                raise _apply_retry_metadata_to_exception(exc, retry_trace)
+            raise _apply_retry_metadata_to_exception(exc, retry_trace)
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
             logger.warning({
@@ -1382,19 +1512,27 @@ def _generate_single_image(
                 "error": str(exc),
                 "index": index,
             })
-            raise ImageGenerationError(
+            raise _apply_retry_metadata_to_exception(ImageGenerationError(
                 str(exc) or "Image generation was rejected by upstream policy.",
                 status_code=400,
                 error_type="invalid_request_error",
                 code="content_policy_violation",
                 account_email=account_email,
                 conversation_id=getattr(exc, "conversation_id", ""),
-            ) from exc
+            ), retry_trace) from exc
         except ImageGenerationError as exc:
             account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            if not emitted_for_token:
+                if is_no_available_image_quota_error(error_text):
+                    if _retry_upstream_error(token, error_text, "image_quota_exhausted", "switch_account"):
+                        continue
+                elif is_retryable_upstream_image_error(exc, error_text):
+                    retry_mode = "same_account" if not same_account_upstream_retry_used else "switch_account"
+                    if _retry_upstream_error(token, error_text, "upstream_502", retry_mode):
+                        continue
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
@@ -1415,7 +1553,7 @@ def _generate_single_image(
                     "retry_count": text_reply_retry_count,
                     "index": index,
                 })
-                raise ImageGenerationError(
+                raise _apply_retry_metadata_to_exception(ImageGenerationError(
                     "Image generation failed: the upstream model returned a text description "
                     "instead of generating an image. Please try again later.",
                     status_code=502,
@@ -1423,7 +1561,7 @@ def _generate_single_image(
                     code="upstream_text_reply",
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
-                ) from exc
+                ), retry_trace) from exc
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1431,7 +1569,7 @@ def _generate_single_image(
                 "error": error_text,
                 "index": index,
             })
-            raise
+            raise _apply_retry_metadata_to_exception(exc, retry_trace)
         except Exception as exc:
             account_service.mark_image_result(token, False)
             last_error = str(exc)
@@ -1442,6 +1580,14 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token:
+                if is_no_available_image_quota_error(last_error):
+                    if _retry_upstream_error(token, last_error, "image_quota_exhausted", "switch_account"):
+                        continue
+                elif is_retryable_upstream_image_error(exc, last_error):
+                    retry_mode = "same_account" if not same_account_upstream_retry_used else "switch_account"
+                    if _retry_upstream_error(token, last_error, "upstream_502", retry_mode):
+                        continue
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
@@ -1483,7 +1629,10 @@ def _generate_single_image(
                     if sleep_for > 0:
                         time.sleep(sleep_for)
                     continue
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise _apply_retry_metadata_to_exception(
+                ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id=""),
+                retry_trace,
+            ) from exc
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -1586,10 +1735,21 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    had_error_retry = False
+    error_retry_count = 0
+    error_retry_reason = ""
+    error_retry_trace: list[dict[str, Any]] = []
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.had_error_retry:
+            had_error_retry = True
+            error_retry_count = max(error_retry_count, int(output.error_retry_count or 0))
+            if output.error_retry_reason and not error_retry_reason:
+                error_retry_reason = output.error_retry_reason
+            if output.error_retry_trace and not error_retry_trace:
+                error_retry_trace = [dict(item) for item in output.error_retry_trace]
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1604,4 +1764,11 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if had_error_retry:
+        result["_had_error_retry"] = True
+        result["_error_retry_count"] = error_retry_count
+        if error_retry_reason:
+            result["_error_retry_reason"] = error_retry_reason
+        if error_retry_trace:
+            result["_error_retry_trace"] = error_retry_trace
     return result

@@ -36,7 +36,6 @@ function formatDuration(item: SystemLog) {
   const value = item.detail?.duration_ms;
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
 }
-
 function getUrls(item: SystemLog | null) {
   const urls = item?.detail?.urls;
   return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
@@ -44,9 +43,18 @@ function getUrls(item: SystemLog | null) {
 
 function getStatus(item: SystemLog) {
   const status = item.detail?.status;
-  if (status === "success") return "成功";
-  if (status === "failed") return "失败";
+  if (status === "success") return "Success";
+  if (status === "failed") return "Failed";
   return "-";
+}
+
+function getRetryStatus(item: SystemLog) {
+  return item.detail?.had_error_retry ? "Yes" : "No";
+}
+
+function getRetryCount(item: SystemLog) {
+  const value = item.detail?.error_retry_count;
+  return typeof value === "number" ? String(value) : "0";
 }
 
 function LogsContent() {
@@ -193,14 +201,16 @@ function LogsContent() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-12"></TableHead>
-                  <TableHead>时间</TableHead>
-                  <TableHead>类型</TableHead>
-                  {isCallLog ? <TableHead>令牌名称</TableHead> : null}
-                  {isCallLog ? <TableHead>调用耗时</TableHead> : null}
-                  {isCallLog ? <TableHead>状态</TableHead> : null}
-                  {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
-                  <TableHead>简述</TableHead>
-                  <TableHead className="w-40">操作</TableHead>
+                  <TableHead>Time</TableHead>
+                  <TableHead>Type</TableHead>
+                  {isCallLog ? <TableHead>Key name</TableHead> : null}
+                  {isCallLog ? <TableHead>Duration</TableHead> : null}
+                  {isCallLog ? <TableHead>Status</TableHead> : null}
+                  {isCallLog ? <TableHead className="w-36">Images</TableHead> : null}
+                  {isCallLog ? <TableHead>Error retry</TableHead> : null}
+                  {isCallLog ? <TableHead>Retry count</TableHead> : null}
+                  <TableHead>Summary</TableHead>
+                  <TableHead className="w-40">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -247,6 +257,8 @@ function LogsContent() {
                           )}
                         </TableCell>
                       ) : null}
+                      {isCallLog ? <TableCell>{getRetryStatus(item)}</TableCell> : null}
+                      {isCallLog ? <TableCell>{getRetryCount(item)}</TableCell> : null}
                       <TableCell className="max-w-[420px] truncate text-stone-500">{item.summary || "-"}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">

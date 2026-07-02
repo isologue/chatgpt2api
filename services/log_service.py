@@ -20,7 +20,14 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+INTERNAL_RESPONSE_KEYS = {
+    "_account_email",
+    "_conversation_id",
+    "_had_error_retry",
+    "_error_retry_count",
+    "_error_retry_reason",
+    "_error_retry_trace",
+}
 
 
 class LogService:
@@ -157,6 +164,40 @@ def _collect_conversation_ids(value: object) -> list[str]:
     return ids
 
 
+def _collect_retry_metadata(value: object) -> tuple[bool, int, str, list[dict[str, Any]]]:
+    had_error_retry = False
+    error_retry_count = 0
+    error_retry_reason = ""
+    error_retry_trace: list[dict[str, Any]] = []
+
+    def _walk(item: object) -> None:
+        nonlocal had_error_retry, error_retry_count, error_retry_reason, error_retry_trace
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                if key in {"_had_error_retry", "had_error_retry"} and bool(nested):
+                    had_error_retry = True
+                elif key in {"_error_retry_count", "error_retry_count"}:
+                    try:
+                        error_retry_count = max(error_retry_count, int(nested or 0))
+                    except (TypeError, ValueError):
+                        pass
+                elif key in {"_error_retry_reason", "error_retry_reason"} and isinstance(nested, str) and nested.strip():
+                    if not error_retry_reason:
+                        error_retry_reason = nested.strip()
+                elif key in {"_error_retry_trace", "error_retry_trace"} and isinstance(nested, list) and not error_retry_trace:
+                    error_retry_trace = [dict(entry) for entry in nested if isinstance(entry, dict)]
+                else:
+                    _walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                _walk(nested)
+
+    _walk(value)
+    if error_retry_count > 0:
+        had_error_retry = True
+    return had_error_retry, error_retry_count, error_retry_reason, error_retry_trace
+
+
 def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -230,41 +271,81 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+            self.log(
+                "Call failed",
+                status="failed",
+                error=str(exc),
+                account_email=getattr(exc, "account_email", ""),
+                conversation_id=getattr(exc, "conversation_id", ""),
+                had_error_retry=bool(getattr(exc, "had_error_retry", False)),
+                error_retry_count=int(getattr(exc, "error_retry_count", 0) or 0),
+                error_retry_reason=str(getattr(exc, "error_retry_reason", "") or ""),
+                error_retry_trace=getattr(exc, "error_retry_trace", None),
+            )
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            self.log("Call failed", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log(
+                "Call failed",
+                status="failed",
+                error=str(exc),
+                account_email=getattr(exc, "account_email", ""),
+                had_error_retry=bool(getattr(exc, "had_error_retry", False)),
+                error_retry_count=int(getattr(exc, "error_retry_count", 0) or 0),
+                error_retry_reason=str(getattr(exc, "error_retry_reason", "") or ""),
+                error_retry_trace=getattr(exc, "error_retry_trace", None),
+            )
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
-            self.log("调用完成", result)
+            self.log("Call completed", result)
             response = dict(result)
             response.pop("_account_email", None)
+            response.pop("_had_error_retry", None)
+            response.pop("_error_retry_count", None)
+            response.pop("_error_retry_reason", None)
+            response.pop("_error_retry_trace", None)
             return response
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+            self.log(
+                "Call failed",
+                status="failed",
+                error=str(exc),
+                account_email=getattr(exc, "account_email", ""),
+                conversation_id=getattr(exc, "conversation_id", ""),
+                had_error_retry=bool(getattr(exc, "had_error_retry", False)),
+                error_retry_count=int(getattr(exc, "error_retry_count", 0) or 0),
+                error_retry_reason=str(getattr(exc, "error_retry_reason", "") or ""),
+                error_retry_trace=getattr(exc, "error_retry_trace", None),
+            )
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            self.log("Call failed", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log(
+                "Call failed",
+                status="failed",
+                error=str(exc),
+                account_email=getattr(exc, "account_email", ""),
+                had_error_retry=bool(getattr(exc, "had_error_retry", False)),
+                error_retry_count=int(getattr(exc, "error_retry_count", 0) or 0),
+                error_retry_reason=str(getattr(exc, "error_retry_reason", "") or ""),
+                error_retry_trace=getattr(exc, "error_retry_trace", None),
+            )
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            self.log("流式调用结束")
+            self.log("Stream ended")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
@@ -272,22 +353,37 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
+        had_error_retry = False
+        error_retry_count = 0
+        error_retry_reason = ""
+        error_retry_trace: list[dict[str, Any]] = []
         failed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
+                item_had_retry, item_retry_count, item_retry_reason, item_retry_trace = _collect_retry_metadata(item)
+                had_error_retry = had_error_retry or item_had_retry
+                error_retry_count = max(error_retry_count, item_retry_count)
+                if item_retry_reason and not error_retry_reason:
+                    error_retry_reason = item_retry_reason
+                if item_retry_trace and not error_retry_trace:
+                    error_retry_trace = item_retry_trace
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
             self.log(
-                "流式调用失败",
+                "Stream failed",
                 status="failed",
                 error=str(exc),
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+                had_error_retry=had_error_retry or bool(getattr(exc, "had_error_retry", False)),
+                error_retry_count=max(error_retry_count, int(getattr(exc, "error_retry_count", 0) or 0)),
+                error_retry_reason=error_retry_reason or str(getattr(exc, "error_retry_reason", "") or ""),
+                error_retry_trace=error_retry_trace or getattr(exc, "error_retry_trace", None),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -296,11 +392,21 @@ class LoggedCall:
             raise
         finally:
             if not failed:
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
-                         conversation_id=conversation_ids[0] if conversation_ids else "")
+                self.log(
+                    "Stream ended",
+                    urls=urls,
+                    account_email=account_emails[0] if account_emails else "",
+                    conversation_id=conversation_ids[0] if conversation_ids else "",
+                    had_error_retry=had_error_retry,
+                    error_retry_count=error_retry_count,
+                    error_retry_reason=error_retry_reason,
+                    error_retry_trace=error_retry_trace,
+                )
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+            had_error_retry: bool = False, error_retry_count: int = 0, error_retry_reason: str = "",
+            error_retry_trace: list[dict[str, Any]] | None = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -334,4 +440,17 @@ class LoggedCall:
         collected_urls = [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
+        result_had_retry, result_retry_count, result_retry_reason, result_retry_trace = _collect_retry_metadata(result)
+        final_had_retry = had_error_retry or result_had_retry or error_retry_count > 0 or result_retry_count > 0
+        final_retry_count = max(int(error_retry_count or 0), int(result_retry_count or 0))
+        final_retry_reason = error_retry_reason or result_retry_reason
+        final_retry_trace = error_retry_trace or result_retry_trace
+        if final_had_retry:
+            detail["had_error_retry"] = True
+            detail["error_retry_count"] = final_retry_count
+            if final_retry_reason:
+                detail["error_retry_reason"] = final_retry_reason
+            if final_retry_trace:
+                detail["error_retry_trace"] = final_retry_trace
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
+
