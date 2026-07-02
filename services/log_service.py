@@ -272,7 +272,7 @@ class LoggedCall:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
             self.log(
-                "Call failed",
+                "\u8c03\u7528\u5931\u8d25",
                 status="failed",
                 error=str(exc),
                 account_email=getattr(exc, "account_email", ""),
@@ -284,11 +284,11 @@ class LoggedCall:
             )
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("Call failed", status="failed", error=str(exc.detail))
+            self.log("\u8c03\u7528\u5931\u8d25", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
             self.log(
-                "Call failed",
+                "\u8c03\u7528\u5931\u8d25",
                 status="failed",
                 error=str(exc),
                 account_email=getattr(exc, "account_email", ""),
@@ -302,7 +302,7 @@ class LoggedCall:
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
-            self.log("Call completed", result)
+            self.log("\u8c03\u7528\u5b8c\u6210", result)
             response = dict(result)
             response.pop("_account_email", None)
             response.pop("_had_error_retry", None)
@@ -316,7 +316,7 @@ class LoggedCall:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
             self.log(
-                "Call failed",
+                "\u8c03\u7528\u5931\u8d25",
                 status="failed",
                 error=str(exc),
                 account_email=getattr(exc, "account_email", ""),
@@ -328,11 +328,11 @@ class LoggedCall:
             )
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("Call failed", status="failed", error=str(exc.detail))
+            self.log("\u8c03\u7528\u5931\u8d25", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
             self.log(
-                "Call failed",
+                "\u8c03\u7528\u5931\u8d25",
                 status="failed",
                 error=str(exc),
                 account_email=getattr(exc, "account_email", ""),
@@ -345,7 +345,7 @@ class LoggedCall:
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            self.log("Stream ended")
+            self.log("\u6d41\u5f0f\u8c03\u7528\u7ed3\u675f")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
@@ -374,7 +374,7 @@ class LoggedCall:
         except Exception as exc:
             failed = True
             self.log(
-                "Stream failed",
+                "\u6d41\u5f0f\u8c03\u7528\u5931\u8d25",
                 status="failed",
                 error=str(exc),
                 urls=urls,
@@ -393,7 +393,7 @@ class LoggedCall:
         finally:
             if not failed:
                 self.log(
-                    "Stream ended",
+                    "\u6d41\u5f0f\u8c03\u7528\u7ed3\u675f",
                     urls=urls,
                     account_email=account_emails[0] if account_emails else "",
                     conversation_id=conversation_ids[0] if conversation_ids else "",

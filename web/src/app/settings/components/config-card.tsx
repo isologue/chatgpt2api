@@ -24,6 +24,7 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
+  const setSuspectAccountProbeIntervalSecs = useSettingsStore((state) => state.setSuspectAccountProbeIntervalSecs);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageUpstreamErrorRetryCount = useSettingsStore((state) => state.setImageUpstreamErrorRetryCount);
@@ -98,6 +99,16 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">{"\u53ef\u7591\u8d26\u53f7\u5de1\u68c0\u95f4\u9694"}</label>
+            <Input
+              value={String(config?.suspect_account_probe_interval_secs || "")}
+              onChange={(event) => setSuspectAccountProbeIntervalSecs(event.target.value)}
+              placeholder="60"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">{"\u5355\u4f4d\u79d2\uff0c\u672a\u5230\u5168\u91cf\u5237\u65b0\u65f6\uff0c\u6bcf\u9694\u591a\u4e45\u5c0f\u6279\u91cf\u5de1\u68c0\u4e00\u6b21\u53ef\u7591\u53f7\u3002"}</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>
             <Input
               value={String(config?.proxy || "")}
@@ -156,35 +167,35 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">Image poll timeout</label>
+            <label className="text-sm text-stone-700">{"\u56fe\u7247\u8f6e\u8be2\u8d85\u65f6"}</label>
             <Input
               value={String(config?.image_poll_timeout_secs || "")}
               onChange={(event) => setImagePollTimeoutSecs(event.target.value)}
               placeholder="120"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">Seconds to wait for the upstream image result.</p>
+            <p className="text-xs text-stone-500">{"\u5355\u4f4d\u79d2\uff0c\u7b49\u5f85\u4e0a\u6e38\u56fe\u7247\u7ed3\u679c\u7684\u6700\u957f\u65f6\u95f4\u3002"}</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <label className="text-sm text-stone-700">Upstream error auto retry count</label>
+              <label className="text-sm text-stone-700">{"\u4e0a\u6e38\u62a5\u9519\u81ea\u52a8\u91cd\u8bd5\u6b21\u6570"}</label>
               <Popover>
                 <PopoverTrigger asChild>
                   <button
                     type="button"
                     className="inline-flex size-5 items-center justify-center rounded-full text-amber-500 transition hover:bg-amber-50 hover:text-amber-600"
-                    aria-label="Show retry rules"
+                    aria-label="\u67e5\u770b\u5224\u5b9a\u8bf4\u660e"
                   >
                     <Info className="size-4" />
                   </button>
                 </PopoverTrigger>
                 <PopoverContent className="w-80 text-xs leading-6 text-stone-600" align="start">
                   <div className="space-y-2">
-                    <p className="font-medium text-stone-900">Retry rules</p>
-                    <p>Applies only to image requests. Does not include the first request. 0 disables it.</p>
-                    <p>502/503/504, curl 92, HTTP/2 INTERNAL_ERROR: retry once with the same account, then switch account.</p>
-                    <p>no available image quota / insufficient_quota: switch account directly.</p>
-                    <p>429, content policy, token invalid, and parameter errors are not retried here.</p>
+                    <p className="font-medium text-stone-900">{"\u5224\u5b9a\u8bf4\u660e"}</p>
+                    <p>{"\u4ec5\u5bf9\u56fe\u7247\u94fe\u8def\u751f\u6548\uff0c\u4e0d\u5305\u542b\u9996\u6b21\u8bf7\u6c42\uff0c0 \u8868\u793a\u5173\u95ed\u3002"}</p>
+                    <p>{"502/503/504\u3001curl 92\u3001HTTP/2 INTERNAL_ERROR\uff1a\u5148\u540c\u53f7\u91cd\u8bd5 1 \u6b21\uff0c\u540c\u53f7\u4ecd\u5931\u8d25\u540e\u6362\u53f7\u3002"}</p>
+                    <p>{"no available image quota / insufficient_quota\uff1a\u4e0d\u505a\u540c\u53f7\u91cd\u8bd5\uff0c\u76f4\u63a5\u6362\u53f7\u91cd\u8bd5\u3002"}</p>
+                    <p>{"429\u3001\u5185\u5bb9\u8fdd\u89c4\u3001token \u5931\u6548\u3001\u53c2\u6570\u9519\u8bef\u4e0d\u8fdb\u5165\u6b64\u91cd\u8bd5\u3002"}</p>
                   </div>
                 </PopoverContent>
               </Popover>
@@ -195,7 +206,7 @@ export function ConfigCard() {
               placeholder="2"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">Extra retry attempts; default 2 means at most 2 retries after the first failure.</p>
+            <p className="text-xs text-stone-500">{"\u989d\u5916\u91cd\u8bd5\u6b21\u6570\uff0c\u9ed8\u8ba4 2 \u8868\u793a\u9996\u6b21\u5931\u8d25\u540e\u6700\u591a\u518d\u91cd\u8bd5 2 \u6b21\u3002"}</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>

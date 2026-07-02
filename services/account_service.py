@@ -134,6 +134,8 @@ class AccountService:
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
+        if bool(account.get("suspect")):
+            return False
         if bool(account.get("image_quota_unknown")):
             return True
         return int(account.get("quota") or 0) > 0
@@ -244,6 +246,11 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["suspect"] = bool(normalized.get("suspect"))
+        normalized["suspect_reason"] = normalized.get("suspect_reason") or None
+        normalized["suspect_at"] = normalized.get("suspect_at") or None
+        normalized["suspect_count"] = int(normalized.get("suspect_count") or 0)
+        normalized["last_runtime_error"] = normalized.get("last_runtime_error") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
@@ -416,6 +423,10 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["suspect"] = False
+            next_item["suspect_reason"] = None
+            next_item["suspect_at"] = None
+            next_item["last_runtime_error"] = None
 
             account = self._normalize_account(next_item)
             if account is None:
@@ -1069,6 +1080,42 @@ class AccountService:
             ]
 
 
+    def list_suspect_tokens(self, limit: int = 3, excluded_tokens: set[str] | None = None) -> list[str]:
+        excluded = set(excluded_tokens or set())
+        with self._lock:
+            candidates: list[tuple[int, str]] = []
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if not token or token in excluded:
+                    continue
+                if item.get("status") in {"\u7981\u7528", "\u5f02\u5e38"}:
+                    continue
+                if not bool(item.get("suspect")):
+                    continue
+                suspect_count = int(item.get("suspect_count") or 0)
+                candidates.append((-suspect_count, token))
+            candidates.sort(key=lambda entry: (entry[0], entry[1]))
+            return [token for _, token in candidates[: max(0, int(limit))]]
+
+    def list_runtime_recheck_candidate_tokens(self, limit: int = 3, excluded_tokens: set[str] | None = None) -> list[str]:
+        excluded = set(excluded_tokens or set())
+        with self._lock:
+            candidates: list[tuple[int, int, int, int, int, str]] = []
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if not token or token in excluded:
+                    continue
+                if item.get("status") in {"\u7981\u7528", "\u5f02\u5e38"}:
+                    continue
+                suspect_rank = 0 if bool(item.get("suspect")) else 1
+                status_rank = 0 if item.get("status") == "\u6b63\u5e38" else 1
+                quota_rank = 10**9 if bool(item.get("image_quota_unknown")) else max(0, int(item.get("quota") or 0))
+                success_rank = int(item.get("success") or 0)
+                zero_success_rank = 0 if success_rank == 0 else 1
+                candidates.append((suspect_rank, status_rank, -quota_rank, zero_success_rank, success_rank, token))
+            candidates.sort(key=lambda entry: (entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]))
+            return [token for _, _, _, _, _, token in candidates[: max(0, int(limit))]]
+
     def list_probe_candidate_tokens(self, limit: int = 5, excluded_tokens: set[str] | None = None) -> list[str]:
         excluded = set(excluded_tokens or set())
         with self._lock:
@@ -1078,6 +1125,8 @@ class AccountService:
                 if not token or token in excluded:
                     continue
                 if item.get("status") != "正常":
+                    continue
+                if bool(item.get("suspect")):
                     continue
                 if self._token_needs_refresh(token):
                     continue
@@ -1223,6 +1272,35 @@ class AccountService:
             return dict(account)
         return None
 
+    def mark_account_suspect(self, access_token: str, reason: str, error: str = "", quiet: bool = False) -> dict | None:
+        if not access_token:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            next_item = dict(current)
+            next_item["suspect"] = True
+            next_item["suspect_reason"] = str(reason or "").strip() or "runtime_error"
+            next_item["suspect_at"] = now
+            next_item["suspect_count"] = int(next_item.get("suspect_count") or 0) + 1
+            if error:
+                next_item["last_runtime_error"] = str(error)
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+        if not quiet:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "标记可疑账号",
+                {"token": anonymize_token(access_token), "reason": reason, "error": str(error or "")[:200]},
+            )
+        return self.get_account(access_token)
+
     def _record_refresh_success(self, access_token: str) -> None:
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
@@ -1234,6 +1312,10 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["suspect"] = False
+            next_item["suspect_reason"] = None
+            next_item["suspect_at"] = None
+            next_item["last_runtime_error"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1271,6 +1353,10 @@ class AccountService:
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
+            next_item["suspect"] = True
+            next_item["suspect_reason"] = "invalid_token"
+            next_item["suspect_at"] = now.isoformat()
+            next_item["last_runtime_error"] = str(error or "invalid access token")
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account

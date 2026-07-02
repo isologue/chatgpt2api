@@ -84,6 +84,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
+    suspect_account_probe_interval_secs: Number(config.suspect_account_probe_interval_secs || 60),
     image_retention_days: Number(config.image_retention_days || 30),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_upstream_error_retry_count: Number(config.image_upstream_error_retry_count ?? 2),
@@ -207,6 +208,7 @@ type SettingsStore = {
   removeBackup: (key: string) => Promise<void>;
   testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
+  setSuspectAccountProbeIntervalSecs: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
   setImageUpstreamErrorRetryCount: (value: string) => void;
@@ -349,6 +351,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const data = await updateSettingsConfig({
         ...config,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
+        suspect_account_probe_interval_secs: Math.max(1, Number(config.suspect_account_probe_interval_secs) || 60),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
         image_upstream_error_retry_count: Math.max(0, Number(config.image_upstream_error_retry_count) || 0),
@@ -417,6 +420,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
       };
     });
+  },
+
+  setSuspectAccountProbeIntervalSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, suspect_account_probe_interval_secs: value } } : {});
   },
 
   setImageRetentionDays: (value) => {

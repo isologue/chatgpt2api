@@ -43,13 +43,13 @@ function getUrls(item: SystemLog | null) {
 
 function getStatus(item: SystemLog) {
   const status = item.detail?.status;
-  if (status === "success") return "Success";
-  if (status === "failed") return "Failed";
+  if (status === "success") return "\u6210\u529f";
+  if (status === "failed") return "\u5931\u8d25";
   return "-";
 }
 
 function getRetryStatus(item: SystemLog) {
-  return item.detail?.had_error_retry ? "Yes" : "No";
+  return item.detail?.had_error_retry ? "\u662f" : "\u5426";
 }
 
 function getRetryCount(item: SystemLog) {
@@ -145,7 +145,7 @@ function LogsContent() {
     <section className="space-y-5">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div className="space-y-1">
-          <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Logs</div>
+          <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">{"\u65e5\u5fd7"}</div>
           <h1 className="text-2xl font-semibold tracking-tight">日志管理</h1>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -201,16 +201,16 @@ function LogsContent() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-12"></TableHead>
-                  <TableHead>Time</TableHead>
-                  <TableHead>Type</TableHead>
-                  {isCallLog ? <TableHead>Key name</TableHead> : null}
-                  {isCallLog ? <TableHead>Duration</TableHead> : null}
-                  {isCallLog ? <TableHead>Status</TableHead> : null}
-                  {isCallLog ? <TableHead className="w-36">Images</TableHead> : null}
-                  {isCallLog ? <TableHead>Error retry</TableHead> : null}
-                  {isCallLog ? <TableHead>Retry count</TableHead> : null}
-                  <TableHead>Summary</TableHead>
-                  <TableHead className="w-40">Actions</TableHead>
+                  <TableHead>{"\u65f6\u95f4"}</TableHead>
+                  <TableHead>{"\u7c7b\u578b"}</TableHead>
+                  {isCallLog ? <TableHead>{"\u4ee4\u724c\u540d\u79f0"}</TableHead> : null}
+                  {isCallLog ? <TableHead>{"\u8c03\u7528\u8017\u65f6"}</TableHead> : null}
+                  {isCallLog ? <TableHead>{"\u72b6\u6001"}</TableHead> : null}
+                  {isCallLog ? <TableHead className="w-36">{"\u56fe\u7247"}</TableHead> : null}
+                  {isCallLog ? <TableHead>{"\u62a5\u9519\u91cd\u8bd5"}</TableHead> : null}
+                  {isCallLog ? <TableHead>{"\u91cd\u8bd5\u6b21\u6570"}</TableHead> : null}
+                  <TableHead>{"\u6458\u8981"}</TableHead>
+                  <TableHead className="w-40">{"\u64cd\u4f5c"}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

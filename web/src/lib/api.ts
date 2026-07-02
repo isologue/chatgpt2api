@@ -119,6 +119,7 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
+  suspect_account_probe_interval_secs?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_upstream_error_retry_count?: number | string;

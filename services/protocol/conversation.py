@@ -1318,23 +1318,27 @@ def _apply_retry_metadata_to_exception(exc: Exception, retry_trace: list[dict[st
     return exc
 
 
+def _mark_runtime_suspect(token: str, reason: str, error: str) -> None:
+    try:
+        account_service.mark_account_suspect(token, reason, error, quiet=True)
+    except Exception:
+        pass
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
         total: int,
 ) -> list[ImageOutput]:
-    """为单张图片执行生成逻辑（含重试），返回结果列表。
+    """Generate one image with retry handling and return output items."""
 
-    该函数在独立线程中运行，每个线程使用不同的账号，
-    实现并行生图，避免串行超时阻塞。
-    """
-    # 模型返回文本而非图片的最大重试次数
+    # Max retries when upstream returns text instead of image
     MAX_TEXT_REPLY_RETRIES = 3
-    # TLS 连接错误最大重试次数
+    # Max retries for TLS errors
     MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
+    # Max retries for connection timeout on the same account
     MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
+    # Max retries for image poll timeout by switching account
     MAX_POLL_TIMEOUT_RETRIES = 4
     MAX_UPSTREAM_ERROR_RETRIES = max(0, int(config.image_upstream_error_retry_count))
 
@@ -1392,6 +1396,51 @@ def _generate_single_image(
             switch_retry_excluded_tokens.add(current_token)
         return True
 
+    def _retry_runtime_pool_recheck(error_text: str, reason: str) -> bool:
+        nonlocal upstream_error_retry_count
+        if upstream_error_retry_count >= MAX_UPSTREAM_ERROR_RETRIES:
+            return False
+        probe_tokens = account_service.list_runtime_recheck_candidate_tokens(
+            limit=3,
+            excluded_tokens=switch_retry_excluded_tokens,
+        )
+        if not probe_tokens:
+            return False
+        upstream_error_retry_count += 1
+        retry_trace.append({
+            "attempt": upstream_error_retry_count,
+            "mode": "retry_pool",
+            "reason": reason,
+            "account_email": account_email,
+            "probe_count": len(probe_tokens),
+            "wait_secs": 0.0,
+            "error": error_text[:200],
+        })
+        logger.warning({
+            "event": "image_upstream_error_retry",
+            "request_token": "",
+            "account_email": account_email,
+            "retry_count": upstream_error_retry_count,
+            "retry_limit": MAX_UPSTREAM_ERROR_RETRIES,
+            "mode": "retry_pool",
+            "reason": reason,
+            "probe_count": len(probe_tokens),
+            "probe_tokens": [token[:12] for token in probe_tokens],
+            "index": index,
+            "error": error_text[:200],
+        })
+        try:
+            account_service.refresh_accounts(probe_tokens, defer_invalid_removal=True)
+        except Exception as refresh_exc:
+            logger.warning({
+                "event": "image_runtime_pool_recheck_failed",
+                "probe_count": len(probe_tokens),
+                "probe_tokens": [token[:12] for token in probe_tokens],
+                "index": index,
+                "error": str(refresh_exc)[:200],
+            })
+        return True
+
     while True:
         if request.image_deadline_ts > 0 and time.time() >= request.image_deadline_ts:
             logger.warning({
@@ -1402,7 +1451,7 @@ def _generate_single_image(
                 "account_email": account_email,
             })
             raise _apply_retry_metadata_to_exception(ImageGenerationError(
-                f"ChatGPT 生图总超时（已超过 {int(config.image_poll_timeout_secs)} 秒上限）。",
+                f"ChatGPT \u751f\u56fe\u603b\u8d85\u65f6\uff08\u5df2\u8d85\u8fc7 {int(config.image_poll_timeout_secs)} \u79d2\u4e0a\u9650\uff09\u3002",
                 account_email=account_email,
                 conversation_id="",
             ), retry_trace)
@@ -1422,7 +1471,11 @@ def _generate_single_image(
                     excluded_tokens=switch_retry_excluded_tokens,
                 )
         except RuntimeError as exc:
-            error = ImageGenerationError(str(exc) or "image generation failed", account_email=account_email)
+            error_text = str(exc) or "image generation failed"
+            if is_no_available_image_quota_error(error_text):
+                if _retry_runtime_pool_recheck(error_text, "image_quota_exhausted_pool"):
+                    continue
+            error = ImageGenerationError(error_text, account_email=account_email)
             raise _apply_retry_metadata_to_exception(error, retry_trace) from exc
 
         emitted_for_token = False
@@ -1479,9 +1532,10 @@ def _generate_single_image(
             return _apply_retry_metadata_to_outputs(outputs, retry_trace)
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False)
+            _mark_runtime_suspect(token, "image_poll_timeout", str(exc))
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
+            # Poll timeout: retry with another account
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
@@ -1525,16 +1579,25 @@ def _generate_single_image(
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            exc_code = str(getattr(exc, "code", "") or "").strip()
+            suspect_reason = ""
             if not emitted_for_token:
                 if is_no_available_image_quota_error(error_text):
-                    if _retry_upstream_error(token, error_text, "image_quota_exhausted", "switch_account"):
+                    suspect_reason = "image_quota_exhausted"
+                    _mark_runtime_suspect(token, suspect_reason, error_text)
+                    if _retry_upstream_error(token, error_text, suspect_reason, "switch_account"):
                         continue
                 elif is_retryable_upstream_image_error(exc, error_text):
+                    suspect_reason = "upstream_502"
+                    _mark_runtime_suspect(token, suspect_reason, error_text)
                     retry_mode = "same_account" if not same_account_upstream_retry_used else "switch_account"
-                    if _retry_upstream_error(token, error_text, "upstream_502", retry_mode):
+                    if _retry_upstream_error(token, error_text, suspect_reason, retry_mode):
                         continue
-            # 如果是模型返回文本而非图片，尝试换账号重试
+            # If model returns text instead of image, retry with another account
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+                if not suspect_reason:
+                    suspect_reason = "upstream_text_reply"
+                    _mark_runtime_suspect(token, suspect_reason, error_text)
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1562,6 +1625,8 @@ def _generate_single_image(
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ), retry_trace) from exc
+            if not suspect_reason and exc_code not in {"content_policy_violation", "invalid_request_error"}:
+                _mark_runtime_suspect(token, "image_generation_error", error_text)
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1582,10 +1647,12 @@ def _generate_single_image(
             })
             if not emitted_for_token:
                 if is_no_available_image_quota_error(last_error):
+                    _mark_runtime_suspect(token, "image_quota_exhausted", last_error)
                     if _retry_upstream_error(token, last_error, "image_quota_exhausted", "switch_account"):
                         continue
                 elif is_retryable_upstream_image_error(exc, last_error):
                     retry_mode = "same_account" if not same_account_upstream_retry_used else "switch_account"
+                    _mark_runtime_suspect(token, "upstream_502", last_error)
                     if _retry_upstream_error(token, last_error, "upstream_502", retry_mode):
                         continue
             if not emitted_for_token and is_token_invalid_error(last_error):
@@ -1595,8 +1662,9 @@ def _generate_single_image(
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
-            # TLS/SSL 连接错误：自动重试
+            # TLS/SSL connection errors: auto retry
             if not emitted_for_token and is_tls_connection_error(last_error):
+                _mark_runtime_suspect(token, "tls_error", last_error)
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
                     logger.warning({
@@ -1611,8 +1679,9 @@ def _generate_single_image(
                     if sleep_for > 0:
                         time.sleep(sleep_for)
                     continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
+            # Connection timeout errors (curl 28): short same-account retry
             if not emitted_for_token and is_connection_timeout_error(last_error):
+                _mark_runtime_suspect(token, "connection_timeout", last_error)
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
@@ -1629,6 +1698,8 @@ def _generate_single_image(
                     if sleep_for > 0:
                         time.sleep(sleep_for)
                     continue
+            if not is_token_invalid_error(last_error):
+                _mark_runtime_suspect(token, "runtime_error", last_error)
             raise _apply_retry_metadata_to_exception(
                 ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id=""),
                 retry_trace,
