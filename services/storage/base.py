@@ -17,6 +17,16 @@ class StorageBackend(ABC):
         """保存所有账号数据"""
         pass
 
+    supports_incremental_account_writes = False
+
+    def save_account(self, account: dict[str, Any]) -> None:
+        """Optional single-account persistence for backends that support it."""
+        raise NotImplementedError
+
+    def delete_account(self, access_token: str) -> None:
+        """Optional single-account deletion for backends that support it."""
+        raise NotImplementedError
+
     @abstractmethod
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """加载所有鉴权密钥数据"""

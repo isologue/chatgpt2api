@@ -32,6 +32,12 @@ function getDetailText(item: SystemLog, key: string) {
   return typeof value === "string" || typeof value === "number" ? String(value) : "-";
 }
 
+function getCallTime(item: SystemLog, key: "started_at" | "ended_at") {
+  const value = item.detail?.[key];
+  if (typeof value === "string" && value) return value;
+  return key === "ended_at" ? item.time : "-";
+}
+
 function formatDuration(item: SystemLog) {
   const value = item.detail?.duration_ms;
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
@@ -193,7 +199,12 @@ function LogsContent() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-12"></TableHead>
-                  <TableHead>时间</TableHead>
+                  {isCallLog ? (
+                    <>
+                      <TableHead>开始时间</TableHead>
+                      <TableHead>结束时间</TableHead>
+                    </>
+                  ) : <TableHead>时间</TableHead>}
                   <TableHead>类型</TableHead>
                   {isCallLog ? <TableHead>令牌名称</TableHead> : null}
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
@@ -211,7 +222,12 @@ function LogsContent() {
                       <TableCell>
                         <Checkbox checked={selectedSet.has(item.id)} onCheckedChange={(checked) => toggleIds([item.id], Boolean(checked))} />
                       </TableCell>
-                      <TableCell className="whitespace-nowrap">{item.time}</TableCell>
+                      {isCallLog ? (
+                        <>
+                          <TableCell className="whitespace-nowrap">{getCallTime(item, "started_at")}</TableCell>
+                          <TableCell className="whitespace-nowrap">{getCallTime(item, "ended_at")}</TableCell>
+                        </>
+                      ) : <TableCell className="whitespace-nowrap">{item.time}</TableCell>}
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}

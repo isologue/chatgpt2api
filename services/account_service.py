@@ -153,6 +153,18 @@ class AccountService:
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
 
+    def _save_account(self, account: dict) -> None:
+        if getattr(self.storage, "supports_incremental_account_writes", False):
+            self.storage.save_account(account)
+        else:
+            self._save_accounts()
+
+    def _delete_account(self, access_token: str) -> None:
+        if getattr(self.storage, "supports_incremental_account_writes", False):
+            self.storage.delete_account(access_token)
+        else:
+            self._save_accounts()
+
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
@@ -339,7 +351,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[resolved] = account
-                self._save_accounts()
+                self._save_account(account)
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
@@ -450,7 +462,14 @@ class AccountService:
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
-            self._save_accounts()
+            if rotated and self._accounts.get(old_token) is None:
+                if getattr(self.storage, "supports_incremental_account_writes", False):
+                    self.storage.delete_account(old_token)
+                    self.storage.save_account(account)
+                else:
+                    self._save_accounts()
+            else:
+                self._save_account(account)
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -1073,7 +1092,7 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1192,7 +1211,6 @@ class AccountService:
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
-                    self._save_cumulative_total()
                     current = {"created_at": self._now()}
                 else:
                     skipped += 1
@@ -1217,6 +1235,7 @@ class AccountService:
                 )
                 if account is not None:
                     self._accounts[access_token] = account
+            self._save_cumulative_total()
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
@@ -1242,7 +1261,11 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                self._save_accounts()
+                if getattr(self.storage, "supports_incremental_account_writes", False):
+                    for token in target_set:
+                        self.storage.delete_account(token)
+                else:
+                    self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
@@ -1260,11 +1283,11 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._delete_account(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
@@ -1322,7 +1345,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
-                self._save_accounts()
+                self._save_account(account)
             if should_defer:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
@@ -1358,11 +1381,11 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._delete_account(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_account(account)
             return dict(account)
         return None
 
@@ -1416,7 +1439,7 @@ class AccountService:
 
     # ---- 刷新进度追踪 ----
 
-    def init_refresh_progress(self, progress_id: str, total: int) -> None:
+    def init_refresh_progress(self, progress_id: str, total: int, *, phase: str = "refreshing") -> None:
         """初始化刷新进度记录。"""
         with self._refresh_progress_lock:
             self._refresh_progress[progress_id] = {
@@ -1426,6 +1449,7 @@ class AccountService:
                 "error": None,
                 "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
+                "phase": phase,
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
@@ -1448,6 +1472,8 @@ class AccountService:
             progress = self._refresh_progress.get(progress_id)
             if progress is None:
                 return
+            if result is not None and result.get("refreshed") == 0 and not error:
+                progress["processed"] = progress["total"]
             progress["done"] = True
             progress["result"] = result
             if error:
@@ -1519,11 +1545,12 @@ class AccountService:
         access_tokens: list[str],
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
+        result_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            result = {**(result_metadata or {}), "refreshed": 0, "errors": [], "items": items, "relogined": 0}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1591,6 +1618,7 @@ class AccountService:
                 relogined += 1
 
         result = {
+            **(result_metadata or {}),
             "refreshed": refreshed,
             "errors": errors,
             "items": self.list_accounts(),

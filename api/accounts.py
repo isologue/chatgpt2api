@@ -48,6 +48,7 @@ class UserKeyUpdateRequest(BaseModel):
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    refresh_after_import: bool = True
 
 
 class AccountDeleteRequest(BaseModel):
@@ -150,6 +151,23 @@ def _sanitize_account_response(payload: Any) -> Any:
     return sanitized
 
 
+# 保留后台任务引用，避免请求结束后任务被提前回收。
+_import_tasks: set[asyncio.Task] = set()
+
+
+def _save_import_accounts(tokens: list[str], account_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    if not account_payloads:
+        return account_service.add_accounts(tokens)
+    result = account_service.add_account_items(account_payloads)
+    payload_tokens = {_account_payload_token(item) for item in account_payloads}
+    extra_tokens = [token for token in tokens if token not in payload_tokens]
+    if extra_tokens:
+        extra_result = account_service.add_accounts(extra_tokens)
+        result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
+        result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+    return result
+
+
 def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
 
@@ -236,7 +254,7 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return _sanitize_account_response({"items": account_service.list_accounts()})
+        return _sanitize_account_response({"items": await run_in_threadpool(account_service.list_accounts)})
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -246,17 +264,8 @@ def create_router() -> APIRouter:
         tokens = _unique_tokens([*body.tokens, *payload_tokens])
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        if account_payloads:
-            result = account_service.add_account_items(account_payloads)
-            payload_token_set = set(_unique_tokens(payload_tokens))
-            extra_tokens = [token for token in tokens if token not in payload_token_set]
-            if extra_tokens:
-                extra_result = account_service.add_accounts(extra_tokens)
-                result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
-                result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
-        else:
-            result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        result = await run_in_threadpool(_save_import_accounts, tokens, account_payloads)
+        refresh_result = await run_in_threadpool(account_service.refresh_accounts, tokens)
         return _sanitize_account_response({
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
@@ -264,13 +273,55 @@ def create_router() -> APIRouter:
             "items": refresh_result.get("items", result.get("items", [])),
         })
 
+    @router.post("/api/accounts/import")
+    async def import_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        tokens = _unique_tokens([*body.tokens, *[_account_payload_token(item) for item in account_payloads]])
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+
+        progress_id = str(uuid.uuid4())
+        # 在入队前登记进度，第一次轮询不会因为后台任务尚未获得线程而返回 404。
+        account_service.init_refresh_progress(
+            progress_id, len(tokens), phase="saving" if body.refresh_after_import else "importing"
+        )
+
+        async def _do_import():
+            try:
+                result = await run_in_threadpool(_save_import_accounts, tokens, account_payloads)
+                counts = {"added": result.get("added", 0), "skipped": result.get("skipped", 0)}
+                if body.refresh_after_import:
+                    await run_in_threadpool(
+                        account_service.refresh_accounts, tokens, progress_id, True, counts
+                    )
+                else:
+                    completed = {
+                        **counts,
+                        "refreshed": 0,
+                        "relogined": 0,
+                        "errors": [],
+                        "items": await run_in_threadpool(account_service.list_accounts),
+                    }
+                    account_service.finish_refresh_progress(progress_id, completed)
+            except Exception as exc:
+                account_service.finish_refresh_progress(progress_id, error=str(exc))
+            finally:
+                # 结果保留一小时供前端读取，避免长期堆积账号快照。
+                asyncio.get_running_loop().call_later(3600, account_service.clean_refresh_progress, progress_id)
+
+        task = asyncio.create_task(_do_import())
+        _import_tasks.add(task)
+        task.add_done_callback(_import_tasks.discard)
+        return {"progress_id": progress_id}
+
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return _sanitize_account_response(account_service.delete_accounts(tokens))
+        return _sanitize_account_response(await run_in_threadpool(account_service.delete_accounts, tokens))
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -365,10 +416,10 @@ def create_router() -> APIRouter:
         updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy}.items() if value is not None}
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
-        account = account_service.update_account(access_token, updates)
+        account = await run_in_threadpool(account_service.update_account, access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return _sanitize_account_response({"item": account, "items": account_service.list_accounts()})
+        return _sanitize_account_response({"item": account, "items": await run_in_threadpool(account_service.list_accounts)})
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import Column, String, Text, create_engine, Integer, text
+from sqlalchemy import Column, String, Text, create_engine, Integer, text, update, delete
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -62,6 +62,38 @@ class DatabaseStorageBackend(StorageBackend):
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存账号数据到数据库"""
         self._save_rows(AccountModel, accounts, "access_token")
+
+    supports_incremental_account_writes = True
+
+    def save_account(self, account: dict[str, Any]) -> None:
+        access_token = str(account.get("access_token") or "").strip()
+        if not access_token:
+            return
+        session = self.Session()
+        try:
+            serialized_data = json.dumps(account, ensure_ascii=False)
+            row = session.query(AccountModel).filter_by(access_token=access_token).one_or_none()
+            if row is None:
+                session.add(AccountModel(access_token=access_token, data=serialized_data))
+            elif row.data != serialized_data:
+                row.data = serialized_data
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def delete_account(self, access_token: str) -> None:
+        session = self.Session()
+        try:
+            session.execute(delete(AccountModel).where(AccountModel.access_token == access_token))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从数据库加载鉴权密钥数据"""

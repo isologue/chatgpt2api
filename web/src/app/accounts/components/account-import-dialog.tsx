@@ -29,12 +29,15 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  createAccounts,
+  importAccounts,
+  fetchAccounts,
+  fetchRefreshProgress,
   finishOAuthLogin,
   startOAuthLogin,
   type Account,
   type AccountImportPayload,
   type OAuthLoginStartResponse,
+  type RefreshProgressResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -188,6 +191,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [sessionInput, setSessionInput] = useState("");
   const [codexAuthInput, setCodexAuthInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [importProgress, setImportProgress] = useState<RefreshProgressResponse | null>(null);
+  const [importError, setImportError] = useState("");
   const [pendingAccountJsonImport, setPendingAccountJsonImport] = useState<PendingAccountJsonImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [oauthEmailHint, setOauthEmailHint] = useState("");
@@ -199,6 +204,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
+    setImportProgress(null);
+    setImportError("");
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
@@ -212,6 +219,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
+    if (isSubmitting || oauthStarting) return;
     setOpen(nextOpen);
     if (!nextOpen) {
       resetState();
@@ -226,26 +234,42 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       return;
     }
 
+    const shouldRefreshAfterImport = new Set(normalizedTokens).size < 100;
     setIsSubmitting(true);
+    setConfirmOpen(false);
+    setImportError("");
+    setImportProgress({ total: new Set(normalizedTokens).size, processed: 0, done: false, error: null, phase: "saving" });
     try {
-      const data = await createAccounts(normalizedTokens, accountPayloads);
-      onImported(data.items);
-      setOpen(false);
-      resetState();
-
-      if ((data.errors?.length ?? 0) > 0) {
-        const firstError = data.errors?.[0]?.error;
-        toast.error(
-          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，失败 ${data.errors?.length ?? 0} 个${firstError ? `，首个错误：${firstError}` : ""}`,
-        );
-      } else {
-        toast.success(
-          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，已自动刷新账号信息`,
-        );
+      const { progress_id } = await importAccounts(normalizedTokens, accountPayloads, shouldRefreshAfterImport);
+      let progress: RefreshProgressResponse;
+      let pollFailures = 0;
+      for (;;) {
+        try {
+          progress = await fetchRefreshProgress(progress_id);
+          pollFailures = 0;
+        } catch (error) {
+          // 短暂网络中断只重试查询，不重复提交导入。
+          if (++pollFailures >= 5) throw new Error("无法获取导入进度，任务可能仍在后台运行。请刷新账号列表确认，勿重复提交。");
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          continue;
+        }
+        setImportProgress(progress);
+        if (progress.error) throw new Error(progress.error);
+        if (progress.done) break;
+        await new Promise((resolve) => setTimeout(resolve, 800));
       }
+      const data = progress.result;
+      if (!data) throw new Error("导入任务已结束，但未返回结果，请刷新账号列表确认");
+      onImported(data.items);
+      const summary = `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，重复 ${data.skipped ?? 0} 个，刷新成功 ${data.refreshed ?? 0} 个，刷新错误 ${data.errors?.length ?? 0} 个`;
+      if (data.errors?.length) toast.error(summary);
+      else toast.success(summary);
     } catch (error) {
       const message = error instanceof Error ? error.message : "导入账户失败";
+      setImportError(message);
       toast.error(message);
+      // 账号可能已经入库，只是后续刷新失败；同步列表避免误以为全部未导入。
+      try { onImported((await fetchAccounts()).items); } catch { /* 保留原始导入错误。 */ }
     } finally {
       setIsSubmitting(false);
     }
@@ -781,7 +805,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           <Upload className="size-4" />
           导入
         </Button>
-        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+        <DialogContent showCloseButton={false} className="max-h-[90dvh] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>
               {method === "menu"
@@ -811,9 +835,63 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             </DialogDescription>
           </DialogHeader>
 
-          {renderMethodBody()}
+          {importProgress ? (
+            <div className="min-w-0 space-y-4 py-2" aria-live="polite" aria-busy={isSubmitting}>
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 text-sm">
+                <span className="flex items-center gap-2 font-medium text-stone-800">
+                  {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                  {importError ? "导入未正常完成" : importProgress.done ? "导入完成" : importProgress.phase === "saving" ? "正在保存账号" : "正在刷新账号信息"}
+                </span>
+                <span className="shrink-0 tabular-nums text-stone-500">
+                  {importProgress.processed} / {importProgress.total}
+                  {" · "}{Math.floor(importProgress.processed / Math.max(1, importProgress.total) * 100)}%
+                </span>
+              </div>
+              <div
+                role="progressbar"
+                aria-label="账号导入进度"
+                aria-valuemin={0}
+                aria-valuemax={importProgress.total}
+                aria-valuenow={importProgress.processed}
+                className="h-2 overflow-hidden rounded-full bg-stone-100"
+              >
+                <div
+                  className={cn("h-full w-full origin-left transition-transform duration-300 motion-reduce:transition-none", importError ? "bg-rose-500" : "bg-stone-800")}
+                  style={{ transform: `scaleX(${Math.min(1, importProgress.processed / Math.max(1, importProgress.total))})` }}
+                />
+              </div>
+              {importProgress.result ? (
+                <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-4">
+                  {[
+                    ["新增", importProgress.result.added ?? 0],
+                    ["重复", importProgress.result.skipped ?? 0],
+                    ["刷新成功", importProgress.result.refreshed],
+                    ["刷新错误", importProgress.result.errors?.length ?? 0],
+                  ].map(([label, value]) => (
+                    <div key={label} className="space-y-1">
+                      <dt className="text-xs text-stone-500">{label}</dt>
+                      <dd className="font-medium tabular-nums text-stone-900">{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : null}
+              <p className={cn("break-words text-xs leading-5", importError || importProgress.result?.errors?.length ? "text-rose-600" : "text-stone-500")}>
+                {importError || importProgress.result?.errors?.[0]?.error || (importProgress.done ? "账号列表已更新。重复账号仍会更新导入字段并刷新信息。" : "进度按实际处理账号数更新；上游响应较慢时可能暂时停留，请勿重复提交。")}
+              </p>
+            </div>
+          ) : isSubmitting && method === "oauth" ? (
+            <div className="flex items-center gap-3 py-6 text-sm text-stone-600" role="status">
+              <LoaderCircle className="size-4 animate-spin" />正在交换授权信息并保存、刷新账号，请稍候…
+            </div>
+          ) : renderMethodBody()}
 
-          <DialogFooter className="pt-2">
+          {importProgress ? (
+            <DialogFooter className="pt-2">
+              <Button onClick={() => handleOpenChange(false)} disabled={isSubmitting} className="rounded-xl">
+                {isSubmitting ? "正在导入…" : "关闭"}
+              </Button>
+            </DialogFooter>
+          ) : <DialogFooter className="pt-2">
             <Button
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
@@ -877,7 +955,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                 查看导入确认
               </Button>
             ) : null}
-          </DialogFooter>
+          </DialogFooter>}
         </DialogContent>
       </Dialog>
 

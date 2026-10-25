@@ -84,6 +84,8 @@ type AccountMutationResponse = {
 };
 
 export type AccountRefreshResponse = {
+  added?: number;
+  skipped?: number;
   items: Account[];
   refreshed: number;
   relogined?: number;
@@ -91,6 +93,7 @@ export type AccountRefreshResponse = {
 };
 
 export type RefreshProgressResponse = {
+  phase?: "saving" | "refreshing";
   total: number;
   processed: number;
   done: boolean;
@@ -350,6 +353,17 @@ export async function createAccounts(tokens: string[], accounts: AccountImportPa
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
     body: { tokens, accounts },
+  });
+}
+
+export async function importAccounts(
+  tokens: string[],
+  accounts: AccountImportPayload[] = [],
+  refreshAfterImport = true,
+) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/import", {
+    method: "POST",
+    body: { tokens, accounts, refresh_after_import: refreshAfterImport },
   });
 }
 
