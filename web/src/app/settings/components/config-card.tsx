@@ -23,6 +23,7 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
+  const setAnyioThreadLimit = useSettingsStore((state) => state.setAnyioThreadLimit);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
@@ -98,6 +99,20 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">同步线程池并发上限</label>
+            <Input
+              type="number"
+              min={1}
+              max={1000}
+              step={1}
+              value={String(config?.anyio_thread_limit ?? 40)}
+              onChange={(event) => setAnyioThreadLimit(event.target.value)}
+              placeholder="40"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs leading-5 text-stone-500">默认 40，限制 FastAPI/Starlette 通过 AnyIO 执行的同步任务并发线程数；不限制纯异步请求或单独创建的线程池。最大 1000，调高会增加 CPU 和内存压力，保存后即时生效。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>

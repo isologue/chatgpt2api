@@ -1,7 +1,7 @@
 {
   "auth-key": "chatgpt2api",
-  "refresh_account_interval_minute": 5,
-  "image_retention_days": 15,
+  "refresh_account_interval_minute": 60,
+  "image_retention_days": 1,
   "image_poll_timeout_secs": 120,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
@@ -69,7 +69,7 @@
       "images": false
     }
   },
-  "image_account_concurrency": 3,
+  "image_account_concurrency": 1,
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,
@@ -100,9 +100,11 @@
   "image_timeout_retry_secs": 30,
   "third_party_apps": {
     "infinite_canvas": {
-      "enabled": true,
+      "enabled": false,
       "url": "https://canvas.best"
     }
   },
-  "image_remove_conversation_after_result": true
+  "image_remove_conversation_after_result": true,
+  "image_remove_conversation_always": false,
+  "anyio_thread_limit": 300
 }

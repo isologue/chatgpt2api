@@ -124,6 +124,32 @@ def _account_payload_token(item: dict[str, Any]) -> str:
     return str(item.get("access_token") or item.get("accessToken") or "").strip()
 
 
+def _sanitize_account(item: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(item)
+    refresh_token = str(sanitized.pop("refresh_token", "") or "").strip()
+    sanitized.pop("id_token", None)
+    sanitized.pop("password", None)
+    sanitized["has_refresh_token"] = bool(refresh_token or sanitized.get("has_refresh_token"))
+    return sanitized
+
+
+def _sanitize_account_response(payload: Any) -> Any:
+    if isinstance(payload, list):
+        return [_sanitize_account_response(item) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+    if "access_token" in payload:
+        return _sanitize_account(payload)
+    sanitized = dict(payload)
+    if isinstance(sanitized.get("items"), list):
+        sanitized["items"] = [_sanitize_account_response(item) for item in sanitized["items"]]
+    if isinstance(sanitized.get("item"), dict):
+        sanitized["item"] = _sanitize_account_response(sanitized["item"])
+    if isinstance(sanitized.get("result"), dict):
+        sanitized["result"] = _sanitize_account_response(sanitized["result"])
+    return sanitized
+
+
 def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
 
@@ -210,7 +236,7 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return _sanitize_account_response({"items": account_service.list_accounts()})
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -231,12 +257,12 @@ def create_router() -> APIRouter:
         else:
             result = account_service.add_accounts(tokens)
         refresh_result = account_service.refresh_accounts(tokens)
-        return {
+        return _sanitize_account_response({
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", result.get("items", [])),
-        }
+        })
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
@@ -244,7 +270,7 @@ def create_router() -> APIRouter:
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        return _sanitize_account_response(account_service.delete_accounts(tokens))
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -273,7 +299,7 @@ def create_router() -> APIRouter:
         progress = account_service.get_refresh_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
-        return progress
+        return _sanitize_account_response(progress)
 
     @router.post("/api/accounts/re-login")
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -301,7 +327,7 @@ def create_router() -> APIRouter:
         progress = account_service.get_relogin_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
-        return progress
+        return _sanitize_account_response(progress)
 
     @router.post("/api/accounts/export")
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
@@ -342,7 +368,7 @@ def create_router() -> APIRouter:
         account = account_service.update_account(access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return _sanitize_account_response({"item": account, "items": account_service.list_accounts()})
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(
@@ -386,12 +412,12 @@ def create_router() -> APIRouter:
         refresh_result = await run_in_threadpool(
             account_service.refresh_accounts, [tokens["access_token"]]
         )
-        return {
+        return _sanitize_account_response({
             **add_result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),
-        }
+        })
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):

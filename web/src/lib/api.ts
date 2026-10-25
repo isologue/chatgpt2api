@@ -2,6 +2,7 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type RefreshTokenStatus = "missing" | "unverified" | "pending" | "valid" | "invalid";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -36,6 +37,11 @@ export type Account = {
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
   last_used_at?: string | null;
+  has_refresh_token?: boolean;
+  refresh_token_status?: RefreshTokenStatus;
+  last_token_refresh_at?: string | null;
+  last_token_refresh_error?: string | null;
+  last_token_refresh_error_at?: string | null;
   proxy?: string | null;
 };
 
@@ -166,6 +172,7 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
+  anyio_thread_limit?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;

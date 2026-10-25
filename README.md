@@ -106,10 +106,37 @@ docker-compose up -d
 
 支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
 
-- `json` - 本地 JSON 文件（默认）
+- `json` - 本地 JSON 文件（直接运行 Python、未设置环境变量时的默认值）
 - `sqlite` - 本地 SQLite 数据库
-- `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
+- `postgres` - PostgreSQL（Compose 默认使用内置数据库，也可配置外部 `DATABASE_URL`）
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
+
+三个 Compose 文件均默认启用 `postgres:16-alpine`，应用等待数据库健康后启动。
+数据库不映射宿主机端口，数据保存在命名卷 `postgres16_data` 中。不要使用
+`docker compose down -v`，否则会删除数据库持久卷。
+
+首次部署先复制 `.env.example` 为 `.env`，设置随机 `POSTGRES_PASSWORD`，并将
+`DATABASE_URL` 中的用户名、密码、库名保持一致。连接地址中的 `postgres` 是 Compose
+内网服务名；已有数据库卷的密码不会因为修改 `.env` 而自动更新。
+
+```bash
+docker compose -f docker-compose.warp.yml up -d --build
+```
+
+已有 JSON 数据不会自动导入 PostgreSQL。切换前备份 `data` 和 `config.json`，停止旧应用
+以避免并发写入，然后在数据库健康、应用镜像构建完成后执行一次迁移：
+
+```bash
+docker compose -f docker-compose.warp.yml build app
+docker compose -f docker-compose.warp.yml up -d --wait postgres
+docker compose -f docker-compose.warp.yml stop app
+docker compose -f docker-compose.warp.yml run --rm --no-deps app uv run python scripts/migrate_storage.py --from json --to postgres
+docker compose -f docker-compose.warp.yml up -d
+```
+
+迁移包含账号与用户密钥，会校验源 JSON 和迁移结果，并拒绝覆盖非空目标数据库。
+原 JSON 文件保留用于回退；迁移后不再自动同步。此存储后端只管理账号和用户密钥，
+图片文件、任务记录、日志和 `config.json` 仍保留在原有文件路径。
 
 示例：使用 PostgreSQL
 

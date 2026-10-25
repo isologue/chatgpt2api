@@ -12,3 +12,8 @@ web/node_modules
 
 assets
 README.md
+
+# 不将本地凭据和持久化数据发送到构建上下文
+.env
+.env.*
+data

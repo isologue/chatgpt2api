@@ -104,6 +104,60 @@ function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
 }
 
+function formatAccountTimestamp(value?: string | null) {
+  if (!value) return "";
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(value)
+    ? value.replace(" ", "T") + "Z"
+    : value;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function getRefreshTokenMeta(account: Account) {
+  const status = account.refresh_token_status ?? (account.has_refresh_token ? "unverified" : "missing");
+  const refreshedAt = formatAccountTimestamp(account.last_token_refresh_at);
+  const errorAt = formatAccountTimestamp(account.last_token_refresh_error_at);
+  const error = account.last_token_refresh_error?.trim();
+  const errorDetail = [errorAt ? "最近刷新：" + errorAt : "", error || "暂无刷新错误详情"]
+    .filter(Boolean)
+    .join("\n");
+
+  switch (status) {
+    case "valid":
+      return {
+        label: "RT有效",
+        className: "bg-emerald-50 text-emerald-700",
+        title: refreshedAt ? "最近一次 RT 刷新成功：" + refreshedAt : "最近一次 RT 刷新成功",
+      };
+    case "invalid":
+      return {
+        label: "RT失效",
+        className: "bg-rose-50 text-rose-700",
+        title: "最近一次刷新确认 RT 失效\n" + errorDetail,
+      };
+    case "pending":
+      return {
+        label: "RT待确认",
+        className: "bg-amber-50 text-amber-700",
+        title: "最近一次刷新失败，但错误不足以确认 RT 失效\n" + errorDetail,
+      };
+    case "unverified":
+      return {
+        label: "RT未验证",
+        className: "bg-stone-100 text-stone-600",
+        title: "账号包含 RT，但还没有可用于判断有效性的刷新记录",
+      };
+    default:
+      return {
+        label: "无 RT",
+        className: "bg-stone-100 text-stone-500",
+        title: "账号未包含 refresh_token",
+      };
+  }
+}
+
 function formatRestoreAt(value?: string | null) {
   if (!value) {
     return { absolute: "—", relative: "" };
@@ -1048,6 +1102,7 @@ function AccountsPageContent() {
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">来源</th>
                     <th className="w-24 px-4 py-3">状态</th>
+                    <th className="w-28 px-4 py-3">RT状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
                     <th className="w-24 px-4 py-3">额度</th>
@@ -1115,6 +1170,20 @@ function AccountsPageContent() {
                             <StatusIcon className="size-3.5" />
                             {account.status}
                           </Badge>
+                        </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const refreshToken = getRefreshTokenMeta(account);
+                            return (
+                              <span
+                                className={cn("inline-flex rounded-md px-2 py-1 text-xs font-medium", refreshToken.className)}
+                                title={refreshToken.title}
+                                aria-label={refreshToken.title}
+                              >
+                                {refreshToken.label}
+                              </span>
+                            );
+                          })()}
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>

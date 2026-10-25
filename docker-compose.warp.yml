@@ -1,4 +1,21 @@
 services:
+  # PostgreSQL 仅供 Compose 内网使用，不向宿主机暴露端口。
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chatgpt2api}
+      POSTGRES_USER: ${POSTGRES_USER:-chatgpt2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - postgres16_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   init-config:
     image: python:3.13-alpine
     container_name: chatgpt2api-warp-init
@@ -90,6 +107,8 @@ services:
     container_name: chatgpt2api-warp
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       init-config:
         condition: service_completed_successfully
       privoxy:
@@ -102,7 +121,10 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
-      DATABASE_URL: ${DATABASE_URL:-}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-chatgpt2api}:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatgpt2api}}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+
+volumes:
+  postgres16_data:

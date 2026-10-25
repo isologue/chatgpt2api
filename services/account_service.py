@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import secrets
 import time
 import uuid
@@ -107,6 +108,30 @@ class AccountService:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _refresh_token_error_is_terminal(error: object) -> bool:
+        text = str(error or "").lower()
+        patterns = (
+            r"\binvalid_grant\b",
+            r"\binvalid_refresh_token\b",
+            r"\brefresh[\s_-]*token\b.{0,24}\b(?:is|has\s+been|was)?\s*(?:expired|revoked|invalid|reused)\b",
+            r"\b(?:expired|revoked|invalid|reused)\s+refresh[\s_-]*token\b",
+        )
+        return any(re.search(pattern, text, flags=re.DOTALL) for pattern in patterns)
+
+    @classmethod
+    def _refresh_token_status(cls, account: dict) -> str:
+        if not str(account.get("refresh_token") or "").strip():
+            return "missing"
+        error = str(account.get("last_token_refresh_error") or "").strip()
+        error_at = cls._parse_time(account.get("last_token_refresh_error_at"))
+        refreshed_at = cls._parse_time(account.get("last_token_refresh_at"))
+        if error and not (error_at and refreshed_at and refreshed_at >= error_at):
+            return "invalid" if cls._refresh_token_error_is_terminal(error) else "pending"
+        if refreshed_at is not None:
+            return "valid"
+        return "unverified"
 
     @staticmethod
     def _timestamp_to_iso(value: object) -> str:
@@ -239,6 +264,7 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["refresh_token_status"] = self._refresh_token_status(normalized)
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
@@ -1173,6 +1199,14 @@ class AccountService:
                 incoming = dict(payload)
                 if not incoming.get("created_at"):
                     incoming.pop("created_at", None)
+                if current is not None and "refresh_token" in incoming:
+                    current_refresh_token = str(current.get("refresh_token") or "").strip()
+                    incoming_refresh_token = str(incoming.get("refresh_token") or "").strip()
+                    if current_refresh_token != incoming_refresh_token:
+                        current = dict(current)
+                        current["last_token_refresh_at"] = None
+                        current["last_token_refresh_error"] = None
+                        current["last_token_refresh_error_at"] = None
                 account = self._normalize_account(
                     {
                         **current,

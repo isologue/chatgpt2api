@@ -104,6 +104,18 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     return max(minimum, normalized)
 
 
+DEFAULT_ANYIO_THREAD_LIMIT = 40
+MAX_ANYIO_THREAD_LIMIT = 1000
+
+
+def _normalize_anyio_thread_limit(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = DEFAULT_ANYIO_THREAD_LIMIT
+    return min(MAX_ANYIO_THREAD_LIMIT, max(1, normalized))
+
+
 def _normalize_backup_include(value: object) -> dict[str, bool]:
     source = value if isinstance(value, dict) else {}
     normalized = dict(DEFAULT_BACKUP_INCLUDE)
@@ -385,6 +397,10 @@ class ConfigStore:
             return 5
 
     @property
+    def anyio_thread_limit(self) -> int:
+        return _normalize_anyio_thread_limit(self.data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT))
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -563,6 +579,7 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+        data["anyio_thread_limit"] = self.anyio_thread_limit
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
@@ -612,6 +629,9 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data["anyio_thread_limit"] = _normalize_anyio_thread_limit(
+            next_data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT)
+        )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

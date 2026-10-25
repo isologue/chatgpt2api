@@ -70,23 +70,50 @@ def migrate_data(from_backend: str, to_backend: str):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     # 保存原始环境变量
     original_backend = os.environ.get("STORAGE_BACKEND")
+    from_storage = None
+    to_storage = None
     
     try:
         # 从源后端读取数据
         os.environ["STORAGE_BACKEND"] = from_backend
         from_storage = create_storage_backend(DATA_DIR)
+        # JSON 后端的普通加载会忽略损坏文件；迁移必须先严格校验，避免静默丢数据。
+        if from_backend == "json":
+            for path, wrapped in ((DATA_DIR / "accounts.json", False), (DATA_DIR / "auth_keys.json", True)):
+                if not path.exists():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if wrapped and isinstance(data, dict):
+                    data = data.get("items")
+                if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+                    raise ValueError(f"Invalid migration source: {path.name}")
         accounts = from_storage.load_accounts()
-        print(f"[migrate] Loaded {len(accounts)} accounts from {from_backend}")
+        auth_keys = from_storage.load_auth_keys()
+        print(f"[migrate] Loaded {len(accounts)} accounts and {len(auth_keys)} auth keys from {from_backend}")
         
         # 写入目标后端
         os.environ["STORAGE_BACKEND"] = to_backend
         to_storage = create_storage_backend(DATA_DIR)
+        # 快照保存会删除目标中不在源数据里的记录，因此拒绝覆盖非空目标。
+        if to_storage.load_accounts() or to_storage.load_auth_keys():
+            raise ValueError("Migration target is not empty; back up and review the target before migrating")
         to_storage.save_accounts(accounts)
-        print(f"[migrate] Saved {len(accounts)} accounts to {to_backend}")
+        to_storage.save_auth_keys(auth_keys)
+        canonical = lambda items: sorted(json.dumps(item, ensure_ascii=False, sort_keys=True) for item in items)
+        if canonical(to_storage.load_accounts()) != canonical(accounts):
+            raise RuntimeError("Account migration verification failed")
+        if canonical(to_storage.load_auth_keys()) != canonical(auth_keys):
+            raise RuntimeError("Auth key migration verification failed")
+        print(f"[migrate] Saved and verified {len(accounts)} accounts and {len(auth_keys)} auth keys in {to_backend}")
         
         print(f"[migrate] Migration completed successfully!")
         
     finally:
+        # 迁移进程结束或失败时释放连接池，避免 SQLite 文件被占用。
+        for storage in (from_storage, to_storage):
+            engine = getattr(storage, "engine", None)
+            if engine is not None:
+                engine.dispose()
         # 恢复原始环境变量
         if original_backend:
             os.environ["STORAGE_BACKEND"] = original_backend
