@@ -1129,6 +1129,58 @@ class AccountService:
                 result.append(account)
             return result
 
+    def list_accounts_page(
+        self, page: int = 1, page_size: int = 20, query: str = "",
+        account_type: str = "all", status: str = "all",
+    ) -> dict[str, Any]:
+        """基于调度器的实时内存快照分页，只复制当前页，不读取上游或全量序列化。"""
+        with self._lock:
+            snapshot = tuple(self._accounts.values())
+        query = query.strip().lower()
+        summary = dict(total=len(snapshot), active=0, limited=0, abnormal=0, disabled=0, quota=0)
+        status_keys = {"正常": "active", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}
+        types = set()
+        matched = []
+        for item in snapshot:
+            item_type = str(item.get("type") or "Free")
+            item_status = item.get("status")
+            types.add(item_type)
+            if key := status_keys.get(item_status):
+                summary[key] += 1
+            if item_status == "正常":
+                summary["quota"] += max(0, int(item.get("quota") or 0))
+            if query and query not in str(item.get("email") or "").lower():
+                continue
+            if account_type != "all" and item_type != account_type:
+                continue
+            if status != "all" and item_status != status:
+                continue
+            matched.append(item)
+        total = len(matched)
+        page = min(max(1, page), max(1, (total + page_size - 1) // page_size))
+        start = (page - 1) * page_size
+        # 列表采用白名单，避免大段上游元数据和凭证进入列表响应。
+        fields = (
+            "access_token", "email", "type", "status", "quota", "success", "fail", "proxy",
+            "source_type", "restore_at", "created_at", "updated_at", "refresh_token_status",
+            "last_token_refresh_at", "last_token_refresh_error", "last_token_refresh_error_at",
+        )
+        with self._lock:
+            items = []
+            for item in matched[start:start + page_size]:
+                account = {key: item[key] for key in fields if key in item}
+                account["has_refresh_token"] = bool(item.get("refresh_token") or item.get("has_refresh_token"))
+                account["image_inflight"] = int(self._image_inflight.get(item.get("access_token"), 0))
+                items.append(account)
+        return dict(items=items, total=total, page=page, page_size=page_size,
+                    summary=summary, types=sorted(types))
+
+    def list_account_tokens(self, status: str = "all") -> list[str]:
+        """显式批量操作才读取全池 token，普通列表加载不调用。"""
+        with self._lock:
+            return [token for token, item in self._accounts.items()
+                    if status == "all" or item.get("status") == status]
+
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
             return [
@@ -1172,24 +1224,24 @@ class AccountService:
             payload["type"] = str(payload.get("plan_type") or "").strip()
         return payload
 
-    def add_account_items(self, items: list[dict]) -> dict:
+    def add_account_items(self, items: list[dict], *, include_items: bool = True) -> dict:
         payloads = [
             payload
             for item in items
             if (payload := self._prepare_account_payload(item)) is not None
         ]
-        return self._add_account_payloads(payloads)
+        return self._add_account_payloads(payloads, include_items=include_items)
 
-    def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
+    def add_accounts(self, tokens: list[str], source_type: str = "web", *, include_items: bool = True) -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
         if not tokens:
-            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+            return {"added": 0, "skipped": 0, **({"items": self.list_accounts()} if include_items else {})}
         return self._add_account_payloads([
             {"access_token": token, "source_type": self._normalize_source_type(source_type)}
             for token in tokens
-        ])
+        ], include_items=include_items)
 
-    def _add_account_payloads(self, payloads: list[dict]) -> dict:
+    def _add_account_payloads(self, payloads: list[dict], *, include_items: bool = True) -> dict:
         deduped: dict[str, dict] = {}
         for payload in payloads:
             if not isinstance(payload, dict):
@@ -1201,7 +1253,7 @@ class AccountService:
             deduped[access_token] = {**current, **payload, "access_token": access_token}
 
         if not deduped:
-            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+            return {"added": 0, "skipped": 0, **({"items": self.list_accounts()} if include_items else {})}
 
         with self._lock:
             added = 0
@@ -1236,16 +1288,19 @@ class AccountService:
                 if account is not None:
                     self._accounts[access_token] = account
             self._save_cumulative_total()
-            self._save_accounts()
-            items = [dict(item) for item in self._accounts.values()]
+            if callable(batch_save := getattr(self.storage, "save_account_batch", None)):
+                batch_save([self._accounts[token] for token in deduped if token in self._accounts])
+            else:
+                self._save_accounts()
+            items = [dict(item) for item in self._accounts.values()] if include_items else []
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
-        return {"added": added, "skipped": skipped, "items": items}
+        return {"added": added, "skipped": skipped, **({"items": items} if include_items else {})}
 
-    def delete_accounts(self, tokens: list[str]) -> dict:
+    def delete_accounts(self, tokens: list[str], *, include_items: bool = True) -> dict:
         target_set = set(token for token in tokens if token)
         if not target_set:
-            return {"removed": 0, "items": self.list_accounts()}
+            return {"removed": 0, **({"items": self.list_accounts()} if include_items else {})}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
@@ -1261,14 +1316,16 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                if getattr(self.storage, "supports_incremental_account_writes", False):
+                if callable(batch_delete := getattr(self.storage, "delete_account_batch", None)):
+                    batch_delete(list(target_set))
+                elif getattr(self.storage, "supports_incremental_account_writes", False):
                     for token in target_set:
                         self.storage.delete_account(token)
                 else:
                     self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
-            items = [dict(item) for item in self._accounts.values()]
-        return {"removed": removed, "items": items}
+            items = [dict(item) for item in self._accounts.values()] if include_items else []
+        return {"removed": removed, **({"items": items} if include_items else {})}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
@@ -1546,11 +1603,12 @@ class AccountService:
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
         result_metadata: dict[str, Any] | None = None,
+        include_items: bool = True,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            items = self.list_accounts()
-            result = {**(result_metadata or {}), "refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            items = self.list_accounts() if include_items else []
+            result = {**(result_metadata or {}), "refreshed": 0, "errors": [], **({"items": items} if include_items else {}), "relogined": 0}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1621,7 +1679,7 @@ class AccountService:
             **(result_metadata or {}),
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
+            **({"items": self.list_accounts()} if include_items else {}),
             "relogined": relogined,
         }
 
@@ -1630,7 +1688,7 @@ class AccountService:
 
         return result
 
-    def re_login_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:
+    def re_login_accounts(self, access_tokens: list[str], progress_id: str | None = None, include_items: bool = True) -> dict[str, Any]:
         """对选中账号执行密码重新登录流程。
 
         仅对包含 email + password 的账号有效。
@@ -1638,7 +1696,7 @@ class AccountService:
         """
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            result = {"relogined": 0, "skipped": 0, "errors": [], "items": self.list_accounts()}
+            result = {"relogined": 0, "skipped": 0, "errors": [], **({"items": self.list_accounts()} if include_items else {})}
             if progress_id:
                 self.finish_relogin_progress(progress_id, result)
             return result
@@ -1679,7 +1737,7 @@ class AccountService:
             "relogined": relogined,
             "skipped": skipped,
             "errors": errors,
-            "items": self.list_accounts(),
+            **({"items": self.list_accounts()} if include_items else {}),
         }
         if progress_id:
             # 如果所有账号都已同步处理完毕（没有启动线程），直接标记完成

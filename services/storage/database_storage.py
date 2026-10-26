@@ -84,6 +84,37 @@ class DatabaseStorageBackend(StorageBackend):
         finally:
             session.close()
 
+    def save_account_batch(self, accounts: list[dict[str, Any]]) -> None:
+        """只写入导入批次，不扫描或重写整个号池；分块但一次提交。"""
+        dialect = self.engine.dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+        elif dialect == "mysql":
+            from sqlalchemy.dialects.mysql import insert
+        else:
+            for account in accounts:
+                self.save_account(account)
+            return
+        rows = [{"access_token": item["access_token"], "data": json.dumps(item, ensure_ascii=False)}
+                for item in accounts]
+        with self.Session.begin() as session:
+            for start in range(0, len(rows), 500):
+                statement = insert(AccountModel).values(rows[start:start + 500])
+                if dialect == "mysql":
+                    statement = statement.on_duplicate_key_update(data=statement.inserted.data)
+                else:
+                    statement = statement.on_conflict_do_update(
+                        index_elements=[AccountModel.access_token], set_={"data": statement.excluded.data}
+                    )
+                session.execute(statement)
+
+    def delete_account_batch(self, access_tokens: list[str]) -> None:
+        with self.Session.begin() as session:
+            for start in range(0, len(access_tokens), 500):
+                session.execute(delete(AccountModel).where(AccountModel.access_token.in_(access_tokens[start:start + 500])))
+
     def delete_account(self, access_token: str) -> None:
         session = self.Session()
         try:

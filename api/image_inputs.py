@@ -35,7 +35,7 @@ def _is_upload(value: object) -> TypeGuard[UploadFile]:
     return isinstance(value, UploadFile)
 
 
-def _parse_bool(value: object) -> bool | None:
+def _parse_bool(value: object, field_name: str = "stream") -> bool | None:
     """解析布尔字段：兼容 JSON 布尔值和表单字符串。"""
     if value is None or value == "":
         return None
@@ -46,7 +46,14 @@ def _parse_bool(value: object) -> bool | None:
         return True
     if text in {"false", "0", "no", "n", "off"}:
         return False
-    raise HTTPException(status_code=400, detail={"error": "stream must be a boolean"})
+    raise HTTPException(status_code=400, detail={"error": f"{field_name} must be a boolean"})
+
+
+def _parse_response_format(value: object, default: str = "url") -> str:
+    response_format = _clean(value, default)
+    if response_format not in {"url", "b64_json"}:
+        raise HTTPException(status_code=400, detail={"error": "response_format must be 'url' or 'b64_json'"})
+    return response_format
 
 
 def _parse_count(value: object) -> int:
@@ -71,8 +78,9 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
-        "response_format": _clean(fields.get("response_format"), "b64_json"),
+        "response_format": _parse_response_format(fields.get("response_format")),
         "stream": _parse_bool(fields.get("stream")),
+        "async": _parse_bool(fields.get("async"), "async") or False,
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
@@ -183,7 +191,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "async"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

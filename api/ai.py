@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from typing import Literal
+from uuid import uuid4
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_task_response import serialize_task_creation, strip_revised_prompt
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
-from services.log_service import LoggedCall
+from services.image_task_service import image_task_service
+from services.log_service import LoggedCall, json_safe
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -27,9 +32,11 @@ class ImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
-    response_format: str = "b64_json"
+    response_format: Literal["url", "b64_json"] = "url"
     history_disabled: bool = True
     stream: bool | None = None
+    async_: bool = Field(default=False, alias="async")
+    client_task_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -77,6 +84,13 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+async def request_body_for_log(request: Request) -> object:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "application/json":
+        return await request.json()
+    return json_safe(await request.body())
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -98,8 +112,36 @@ def create_router() -> APIRouter:
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
+        request_body = await request.json()
+        call.request_body = request_body
+        call.log_context = {"is_async": body.async_, "response_format": body.response_format}
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        if body.async_:
+            try:
+                task = await run_in_threadpool(
+                    image_task_service.submit_generation,
+                    identity,
+                    client_task_id=body.client_task_id or uuid4().hex,
+                    prompt=body.prompt,
+                    model=body.model,
+                    n=body.n,
+                    size=body.size,
+                    quality=body.quality,
+                    response_format=body.response_format,
+                    base_url=payload["base_url"],
+                    request_body=request_body,
+                )
+                return serialize_task_creation(task)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return await call.run(
+            openai_v1_image_generations.handle,
+            payload,
+            response_transform=lambda response: {
+                **response,
+                "data": strip_revised_prompt(response.get("data")),
+            },
+        )
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -107,19 +149,49 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        request_body = await request_body_for_log(request)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
+        call.request_body = request_body
+        call.log_context = {"is_async": payload["async"], "response_format": payload["response_format"]}
         await filter_or_log(call, prompt)
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        if payload["async"]:
+            try:
+                task = await run_in_threadpool(
+                    image_task_service.submit_edit,
+                    identity,
+                    client_task_id=payload.get("client_task_id") or uuid4().hex,
+                    prompt=prompt,
+                    model=model,
+                    n=payload["n"],
+                    size=payload["size"],
+                    quality=payload["quality"],
+                    response_format=payload["response_format"],
+                    base_url=payload["base_url"],
+                    images=payload["images"],
+                    masks=payload.get("mask"),
+                    request_body=request_body,
+                )
+                return serialize_task_creation(task)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return await call.run(
+            openai_v1_image_edit.handle,
+            payload,
+            response_transform=lambda response: {
+                **response,
+                "data": strip_revised_prompt(response.get("data")),
+            },
+        )
 
     @router.post("/v1/chat/completions")
-    async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
+    async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
@@ -132,11 +204,12 @@ def create_router() -> APIRouter:
             request_text=request_preview,
             request_shape=request_shape(payload.get("messages")),
         )
+        call.request_body = await request.json()
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
@@ -149,12 +222,14 @@ def create_router() -> APIRouter:
             request_text=request_preview,
             request_shape=request_shape(payload.get("input")),
         )
+        call.request_body = await request.json()
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
 
     @router.post("/v1/messages")
     async def create_message(
             body: AnthropicMessageRequest,
+            request: Request,
             authorization: str | None = Header(default=None),
             x_api_key: str | None = Header(default=None, alias="x-api-key"),
             anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
@@ -164,13 +239,15 @@ def create_router() -> APIRouter:
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
+        call.request_body = await request.json()
         await filter_or_log(call, request_preview)
         return await call.run(anthropic_v1_messages.handle, payload, sse="anthropic")
 
     @router.post("/v1/search")
-    async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
+    async def search(body: SearchRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
+        call.request_body = await request.json()
         await filter_or_log(call, body.prompt)
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
 

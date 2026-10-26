@@ -21,7 +21,7 @@ class ImagesEditsApiTests(unittest.TestCase):
 
         def fake_handle(payload):
             self.handle_calls.append(payload)
-            return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii")}]}
+            return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii"), "revised_prompt": "internal"}]}
 
         self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.handler_patcher.start()
@@ -50,6 +50,7 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.assertEqual(payload["prompt"], "edit")
         self.assertEqual(payload["n"], 1)
         self.assertEqual(payload["images"], [(PNG_BYTES, "image_url.png", "image/png")])
+        self.assertNotIn("revised_prompt", response.json()["data"][0])
 
     def test_edit_rejects_file_id_reference(self):
         """测试图片编辑接口对暂不支持的 file_id 返回明确错误。"""
@@ -66,6 +67,28 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("file_id image references are not supported", response.text)
         self.assertEqual(self.handle_calls, [])
+
+    def test_sync_generation_omits_revised_prompt(self):
+        request_body = {"prompt": "cat", "response_format": "url", "client_option": "kept"}
+        with mock.patch.object(
+            ai_module.openai_v1_image_generations,
+            "handle",
+            return_value={"created": 1, "data": [{"url": "https://example.test/image.png", "revised_prompt": "internal"}]},
+        ), mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()), mock.patch(
+            "services.log_service.log_service.add"
+        ) as add_log:
+            response = self.client.post(
+                "/v1/images/generations",
+                headers=AUTH_HEADERS,
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"], [{"url": "https://example.test/image.png"}])
+        detail = add_log.call_args.args[2]
+        self.assertEqual(detail["request_body"], request_body)
+        self.assertEqual(detail["response_body"], response.json())
+        self.assertNotIn("base_url", detail["request_body"])
 
 
 if __name__ == "__main__":

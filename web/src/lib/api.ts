@@ -74,7 +74,7 @@ type ModelListResponse = {
 };
 
 type AccountMutationResponse = {
-  items: Account[];
+  items?: Account[];
   added?: number;
   skipped?: number;
   removed?: number;
@@ -86,7 +86,7 @@ type AccountMutationResponse = {
 export type AccountRefreshResponse = {
   added?: number;
   skipped?: number;
-  items: Account[];
+  items?: Account[];
   refreshed: number;
   relogined?: number;
   errors: Array<{ access_token: string; error: string }>;
@@ -106,7 +106,7 @@ export type RefreshProgressResponse = {
 
 type AccountUpdateResponse = {
   item: Account;
-  items: Account[];
+  items?: Account[];
 };
 
 export type ProxyRuntimeEgressMode = "direct" | "single_proxy";
@@ -307,6 +307,40 @@ export type ImageTask = {
   duration_ms?: number;
 };
 
+type ImageTaskResponse =
+  | { created_at: number; model: string; status: "queued"; task_id: string }
+  | { task_id: string; status: "queued" | "processing"; progress: string }
+  | {
+      created_at: number;
+      data: ImageResponse;
+      model: string;
+      progress: "100%";
+      status: "succeeded";
+      task_id: string;
+    }
+  | { task_id: string; status: "failed"; error: { message: string } };
+
+function fromImageTaskResponse(task: ImageTaskResponse): ImageTask {
+  const base = {
+    id: task.task_id,
+    mode: "generate" as const,
+    model: "model" in task ? task.model as ImageModel : undefined,
+    created_at: new Date(("created_at" in task ? task.created_at : Date.now() / 1000) * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  if (task.status === "failed") {
+    return { ...base, status: "error", error: task.error.message };
+  }
+  if (task.status === "succeeded") {
+    return { ...base, status: "success", data: task.data.data, progress: task.progress };
+  }
+  return {
+    ...base,
+    status: task.status === "processing" ? "running" : "queued",
+    progress: "progress" in task ? task.progress : undefined,
+  };
+}
+
 type ImageTaskListResponse = {
   items: ImageTask[];
   missing_ids: string[];
@@ -341,8 +375,27 @@ export async function login(authKey: string) {
   });
 }
 
+export type AccountSummary = {
+  total: number; active: number; limited: number; abnormal: number; disabled: number; quota: number;
+};
+export type AccountPage = {
+  items: Account[]; total: number; page: number; page_size: number;
+  summary: AccountSummary; types: string[];
+};
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
+}
+export async function fetchAccountsPage(options: {
+  page: number; pageSize: number; query?: string; accountType?: string; status?: string;
+}, signal?: AbortSignal) {
+  const params = new URLSearchParams({
+    page: String(options.page), page_size: String(options.pageSize),
+    query: options.query ?? "", account_type: options.accountType ?? "all", status: options.status ?? "all",
+  });
+  return (await request.get<AccountPage>(`/api/accounts?${params}`, { signal, timeout: 30000 })).data;
+}
+export async function fetchAccountTokens(status = "all") {
+  return httpRequest<{ tokens: string[] }>(`/api/accounts/tokens?status=${encodeURIComponent(status)}`);
 }
 
 export async function fetchModels() {
@@ -361,7 +414,7 @@ export async function importAccounts(
   accounts: AccountImportPayload[] = [],
   refreshAfterImport = true,
 ) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/import", {
+  return httpRequest<{ progress_id: string }>("/api/accounts/import?include_items=false", {
     method: "POST",
     body: { tokens, accounts, refresh_after_import: refreshAfterImport },
   });
@@ -382,39 +435,39 @@ export async function startOAuthLogin(emailHint?: string) {
 }
 
 export async function finishOAuthLogin(sessionId: string, callback: string) {
-  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
+  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish?include_items=false", {
     method: "POST",
     body: { session_id: sessionId, callback },
   });
 }
 
-export async function deleteAccounts(tokens: string[]) {
-  return httpRequest<AccountMutationResponse>("/api/accounts", {
+export async function deleteAccounts(tokens: string[], includeItems = true) {
+  return httpRequest<AccountMutationResponse>(`/api/accounts?include_items=${includeItems}`, {
     method: "DELETE",
     body: { tokens },
   });
 }
 
 export async function refreshAccounts(accessTokens: string[]) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/refresh", {
+  return httpRequest<{ progress_id: string }>("/api/accounts/refresh?include_items=false", {
     method: "POST",
     body: { access_tokens: accessTokens },
   });
 }
 
-export async function fetchRefreshProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
+export async function fetchRefreshProgress(progressId: string, includeItems = true) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}?include_items=${includeItems}`);
 }
 
 export async function reLoginAccounts(accessTokens: string[]) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/re-login", {
+  return httpRequest<{ progress_id: string }>("/api/accounts/re-login?include_items=false", {
     method: "POST",
     body: { access_tokens: accessTokens },
   });
 }
 
 export async function fetchReLoginProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`);
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}?include_items=false`);
 }
 
 export async function updateAccount(
@@ -426,7 +479,7 @@ export async function updateAccount(
     proxy?: string;
   },
 ) {
-  return httpRequest<AccountUpdateResponse>("/api/accounts/update", {
+  return httpRequest<AccountUpdateResponse>("/api/accounts/update?include_items=false", {
     method: "POST",
     body: {
       access_token: accessToken,
@@ -479,9 +532,10 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
 }
 
 export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageTask>("/api/image-tasks/generations", {
+  const task = await httpRequest<ImageTaskResponse>("/v1/images/generations", {
     method: "POST",
     body: {
+      async: true,
       client_task_id: clientTaskId,
       prompt,
       ...(model ? { model } : {}),
@@ -489,6 +543,7 @@ export async function createImageGenerationTask(clientTaskId: string, prompt: st
       quality,
     },
   });
+  return fromImageTaskResponse(task);
 }
 
 export async function createImageEditTask(
@@ -514,20 +569,26 @@ export async function createImageEditTask(
     formData.append("size", size);
   }
   formData.append("quality", quality);
+  formData.append("async", "true");
 
-  return httpRequest<ImageTask>("/api/image-tasks/edits", {
+  const task = await httpRequest<ImageTaskResponse>("/v1/images/edits", {
     method: "POST",
     body: formData,
   });
+  return fromImageTaskResponse(task);
 }
 
 export async function fetchImageTasks(ids: string[]) {
-  const params = new URLSearchParams();
-  if (ids.length > 0) {
-    params.set("ids", ids.join(","));
-  }
-  params.set("_t", String(Date.now()));
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
+  const tasks = await Promise.all(ids.map(async (id) => {
+    try {
+      const task = await httpRequest<ImageTaskResponse>(`/v1/images/tasks/${encodeURIComponent(id)}?_t=${Date.now()}`);
+      return fromImageTaskResponse(task);
+    } catch (error) {
+      if (error instanceof Error && error.message === "task not found") return null;
+      throw error;
+    }
+  }));
+  return { items: tasks.filter((task): task is ImageTask => task !== null), missing_ids: ids.filter((_, index) => tasks[index] === null) };
 }
 
 export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
@@ -685,6 +746,10 @@ export async function fetchSystemLogs(filters: { type?: string; start_date?: str
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
   return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function fetchSystemLog(id: string) {
+  return httpRequest<{ item: SystemLog }>(`/api/logs/${encodeURIComponent(id)}`);
 }
 
 export async function deleteSystemLogs(ids: string[]) {

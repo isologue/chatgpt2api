@@ -105,7 +105,9 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
-      ["response_format", "string", "可选，默认 b64_json。"],
+      ["response_format", "string", "可选，url 或 b64_json，默认 url。"],
+      ["async", "boolean", "可选，true 时立即返回任务信息，可通过 GET /v1/images/tasks/{task_id} 查询。"],
+      ["client_task_id", "string", "可选，异步任务幂等 ID；不传时服务端自动生成。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
@@ -129,6 +131,9 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
+      ["response_format", "string", "可选，url 或 b64_json，默认 url。"],
+      ["async", "boolean", "可选，true 时立即返回任务信息，可通过 GET /v1/images/tasks/{task_id} 查询。"],
+      ["client_task_id", "string", "可选，异步任务幂等 ID；不传时服务端自动生成。"],
     ],
     output: [
       ["data", "array", "编辑后的图片结果列表。"],

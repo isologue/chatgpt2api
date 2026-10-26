@@ -14,7 +14,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
+import { deleteSystemLogs, fetchSystemLog, fetchSystemLogs, type SystemLog } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LogType = {
@@ -43,6 +43,17 @@ function formatDuration(item: SystemLog) {
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
 }
 
+function getAsyncLabel(item: SystemLog) {
+  return typeof item.detail?.is_async === "boolean" ? (item.detail.is_async ? "是" : "否") : "-";
+}
+
+function getResponseFormat(item: SystemLog) {
+  const value = item.detail?.response_format;
+  if (value === "b64_json") return "b64_json";
+  if (value === "url") return "URL";
+  return "-";
+}
+
 function getUrls(item: SystemLog | null) {
   const urls = item?.detail?.urls;
   return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
@@ -55,6 +66,35 @@ function getStatus(item: SystemLog) {
   return "-";
 }
 
+function JsonValue({ value, path, expanded, onToggle }: {
+  value: unknown;
+  path: string;
+  expanded: Set<string>;
+  onToggle: (path: string) => void;
+}) {
+  if (typeof value === "string") {
+    const isLong = value.length > 240 || (/^[A-Za-z0-9+/=]+$/.test(value) && value.length > 100);
+    if (!isLong) return <span className="whitespace-pre-wrap break-all text-emerald-800">{JSON.stringify(value)}</span>;
+    const isExpanded = expanded.has(path);
+    const preview = `${value.slice(0, 96)}... (${value.length.toLocaleString()} 字符)`;
+    return (
+      <button type="button" className="text-left whitespace-pre-wrap break-all text-emerald-800 underline decoration-dotted underline-offset-2 hover:text-emerald-950" aria-expanded={isExpanded} onClick={() => onToggle(path)}>
+        {JSON.stringify(isExpanded ? value : preview)}
+      </button>
+    );
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return <span>[]</span>;
+    return <span>[<span className="block border-l border-stone-200 pl-4">{value.map((item, index) => <span key={`${path}.${index}`} className="block"><JsonValue value={item} path={`${path}.${index}`} expanded={expanded} onToggle={onToggle} />{index < value.length - 1 ? "," : ""}</span>)}</span>]</span>;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return <span>{"{}"}</span>;
+    return <span>{"{"}<span className="block border-l border-stone-200 pl-4">{entries.map(([key, item], index) => <span key={`${path}.${key}`} className="block"><span className="text-sky-800">{JSON.stringify(key)}</span>: <JsonValue value={item} path={`${path}.${key}`} expanded={expanded} onToggle={onToggle} />{index < entries.length - 1 ? "," : ""}</span>)}</span>{"}"}</span>;
+  }
+  return <span className="text-amber-800">{JSON.stringify(value) ?? "null"}</span>;
+}
+
 function LogsContent() {
   const [items, setItems] = useState<SystemLog[]>([]);
   const [type, setType] = useState<string>(LogType.Call);
@@ -62,6 +102,8 @@ function LogsContent() {
   const [endDate, setEndDate] = useState("");
   const [detailLog, setDetailLog] = useState<SystemLog | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  const [expandedJsonValues, setExpandedJsonValues] = useState<Set<string>>(() => new Set());
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
@@ -71,6 +113,15 @@ function LogsContent() {
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
   const detailUrls = getUrls(detailLog);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
+  const detailData = detailLog?.detail || {};
+  const requestBody = detailData.request_body ?? (typeof detailData.request_text === "string" ? { prompt: detailData.request_text } : null);
+  const responseBody = detailData.response_body ?? Object.fromEntries(
+    Object.entries(detailData).filter(([key]) => ![
+      "request_text", "request_shape", "request_body", "response_body", "duration_ms", "urls",
+      "key_id", "key_name", "role", "endpoint", "model", "started_at", "ended_at", "status",
+      "is_async", "response_format", "account_email", "conversation_id",
+    ].includes(key)),
+  );
   const isCallLog = type === LogType.Call;
   const pageSize = 10;
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
@@ -99,9 +150,28 @@ function LogsContent() {
     setEndDate("");
   };
 
-  const openDetail = (item: SystemLog) => {
+  const openDetail = async (item: SystemLog) => {
     setDetailLog(item);
+    setExpandedJsonValues(new Set());
     setDetailOpen(true);
+    setIsLoadingDetail(true);
+    try {
+      const response = await fetchSystemLog(item.id);
+      setDetailLog(response.item);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "加载日志详情失败");
+    } finally {
+      setIsLoadingDetail(false);
+    }
+  };
+
+  const toggleJsonValue = (path: string) => {
+    setExpandedJsonValues((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
   };
 
   const openLogImage = (item: SystemLog, index: number) => {
@@ -208,6 +278,8 @@ function LogsContent() {
                   <TableHead>类型</TableHead>
                   {isCallLog ? <TableHead>令牌名称</TableHead> : null}
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
+                  {isCallLog ? <TableHead>异步</TableHead> : null}
+                  {isCallLog ? <TableHead>返回格式</TableHead> : null}
                   {isCallLog ? <TableHead>状态</TableHead> : null}
                   {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
                   <TableHead>简述</TableHead>
@@ -231,6 +303,8 @@ function LogsContent() {
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
+                      {isCallLog ? <TableCell>{getAsyncLabel(item)}</TableCell> : null}
+                      {isCallLog ? <TableCell>{getResponseFormat(item)}</TableCell> : null}
                       {isCallLog ? (
                         <TableCell>
                           <Badge variant={item.detail?.status === "failed" ? "danger" : "success"} className="rounded-md">
@@ -299,9 +373,10 @@ function LogsContent() {
           </DialogHeader>
           <div className="flex-1 overflow-y-auto px-6 py-5">
             <div className="space-y-4">
+              {isLoadingDetail ? <div className="text-sm text-stone-400">正在加载日志详情...</div> : null}
               <div className="grid gap-3 rounded-xl border border-stone-200 bg-white p-4 text-sm text-stone-600 md:grid-cols-2">
                 {Object.entries(detailLog?.detail || {})
-                  .filter(([key, value]) => key !== "urls" && typeof value !== "object")
+                  .filter(([key, value]) => !["urls", "request_text", "duration_ms", "request_body", "response_body"].includes(key) && typeof value !== "object")
                   .map(([key, value]) => (
                     <div key={key} className="flex items-start justify-between gap-4">
                       <span className="text-stone-400">{key}</span>
@@ -309,26 +384,18 @@ function LogsContent() {
                     </div>
                   ))}
               </div>
-              {detailUrls.length ? (
-                <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3">
-                  {detailUrls.map((url, index) => (
-                    <button
-                      key={url}
-                      type="button"
-                      className="aspect-square overflow-hidden rounded-xl border border-stone-200 bg-stone-100"
-                      onClick={() => {
-                        setLightboxIndex(index);
-                        setLightboxOpen(true);
-                      }}
-                    >
-                      <img src={url} alt="" className="h-full w-full object-cover" />
-                    </button>
-                  ))}
+              <section className="space-y-2">
+                <h3 className="text-sm font-semibold text-stone-700">请求体</h3>
+                <div className="max-h-[34vh] overflow-auto rounded-md border border-stone-200 bg-stone-50 p-4 font-mono text-xs leading-6 text-stone-700">
+                  {requestBody === null ? <span className="text-stone-400">该日志没有保存请求体</span> : <JsonValue value={requestBody} path="request" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
                 </div>
-              ) : null}
-              <pre className="max-h-[72vh] overflow-auto rounded-xl border border-stone-200 bg-stone-50 p-4 text-xs leading-6 text-stone-700">
-                {JSON.stringify(detailLog?.detail || {}, null, 2)}
-              </pre>
+              </section>
+              <section className="space-y-2">
+                <h3 className="text-sm font-semibold text-stone-700">响应体</h3>
+                <div className="max-h-[34vh] overflow-auto rounded-md border border-stone-200 bg-stone-50 p-4 font-mono text-xs leading-6 text-stone-700">
+                  {Object.keys(responseBody).length === 0 ? <span className="text-stone-400">该日志没有保存响应体</span> : <JsonValue value={responseBody} path="response" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
+                </div>
+              </section>
             </div>
           </div>
         </DialogContent>

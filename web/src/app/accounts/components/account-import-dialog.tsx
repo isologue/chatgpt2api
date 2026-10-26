@@ -30,7 +30,6 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   importAccounts,
-  fetchAccounts,
   fetchRefreshProgress,
   finishOAuthLogin,
   startOAuthLogin,
@@ -245,7 +244,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       let pollFailures = 0;
       for (;;) {
         try {
-          progress = await fetchRefreshProgress(progress_id);
+          progress = await fetchRefreshProgress(progress_id, false);
           pollFailures = 0;
         } catch (error) {
           // 短暂网络中断只重试查询，不重复提交导入。
@@ -260,7 +259,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       }
       const data = progress.result;
       if (!data) throw new Error("导入任务已结束，但未返回结果，请刷新账号列表确认");
-      onImported(data.items);
+      onImported(data.items ?? []);
       const summary = `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，重复 ${data.skipped ?? 0} 个，刷新成功 ${data.refreshed ?? 0} 个，刷新错误 ${data.errors?.length ?? 0} 个`;
       if (data.errors?.length) toast.error(summary);
       else toast.success(summary);
@@ -269,7 +268,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       setImportError(message);
       toast.error(message);
       // 账号可能已经入库，只是后续刷新失败；同步列表避免误以为全部未导入。
-      try { onImported((await fetchAccounts()).items); } catch { /* 保留原始导入错误。 */ }
+      onImported([]);
     } finally {
       setIsSubmitting(false);
     }
@@ -313,7 +312,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setIsSubmitting(true);
     try {
       const data = await finishOAuthLogin(oauthSession.session_id, trimmed);
-      onImported(data.items);
+      onImported(data.items ?? []);
       setOpen(false);
       resetState();
 

@@ -135,6 +135,14 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
 
+    @router.get("/api/logs/{log_id}")
+    async def get_log_detail(log_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        item = log_service.get(log_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "log not found"})
+        return {"item": item}
+
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

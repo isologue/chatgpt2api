@@ -127,6 +127,37 @@ class AccountImportProgressTests(unittest.TestCase):
         self.assertEqual(progress["result"]["refreshed"], 0)
         self.assertEqual(calls, [])
 
+    def test_compact_import_avoids_full_account_snapshot(self):
+        with patch.object(self.service, "list_accounts", side_effect=AssertionError("full snapshot forbidden")):
+            response = self.client.post("/api/accounts/import?include_items=false", headers=self.headers,
+                                        json={"tokens": ["compact"], "refresh_after_import": False})
+            done = self.completed(response.json()["progress_id"])
+        self.assertEqual(done["result"]["added"], 1)
+        self.assertNotIn("items", done["result"])
+        self.assertIsNotNone(self.service.get_account("compact"))
+
+    def test_refresh_all_compact_mode_includes_accounts_beyond_first_page(self):
+        self.service.add_accounts([f"t-{i}" for i in range(35)])
+        response = self.client.post("/api/accounts/refresh?include_items=false", headers=self.headers,
+                                    json={"access_tokens": []})
+        done = self.completed(response.json()["progress_id"])
+        self.assertEqual(done["total"], 35)
+        self.assertEqual(done["result"]["refreshed"], 35)
+        self.assertNotIn("items", done["result"])
+
+    def test_compact_update_delete_and_refresh_return_no_full_pool(self):
+        self.service.add_accounts(["a", "b"])
+        response = self.client.post("/api/accounts/update?include_items=false", headers=self.headers,
+                                    json={"access_token": "a", "quota": 20})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("items", response.json())
+        self.assertEqual(response.json()["item"]["quota"], 20)
+        response = self.client.request("DELETE", "/api/accounts?include_items=false", headers=self.headers,
+                                       json={"tokens": ["a"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"removed": 1})
+        self.assertIsNotNone(self.service.get_account("b"))
+
     def test_save_failure_finishes_progress_with_error(self):
         def fail(_tokens):
             raise RuntimeError("storage write failed")

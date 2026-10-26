@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import base64
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -82,10 +83,24 @@ class LogService:
                 continue
             if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
                 continue
-            items.append(item)
+            summary_item = dict(item)
+            detail = summary_item.get("detail")
+            if isinstance(detail, dict):
+                summary_item["detail"] = {key: value for key, value in detail.items() if key not in {"request_body", "response_body"}}
+            items.append(summary_item)
             if len(items) >= limit:
                 break
         return items
+
+    def get(self, log_id: str) -> dict[str, Any] | None:
+        if not self.path.exists():
+            return None
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        for line_number in range(len(lines) - 1, -1, -1):
+            item = self._parse_line(lines[line_number], line_number)
+            if item is not None and item.get("id") == log_id:
+                return item
+        return None
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
@@ -169,6 +184,18 @@ def _strip_internal_response_fields(value: object) -> object:
     return value
 
 
+def json_safe(value: object) -> object:
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _request_excerpt(text: object, limit: int = 1000) -> str:
     value = str(text or "").strip()
     if not value:
@@ -207,6 +234,13 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
     return openai_error_response(message, status_code)
 
 
+def _response_body(response: JSONResponse) -> object:
+    try:
+        return json.loads(response.body.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
 def _next_item(items):
     try:
         return True, next(items)
@@ -223,29 +257,39 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    log_context: dict[str, Any] = field(default_factory=dict)
+    request_body: object = None
 
-    async def run(self, handler, *args, sse: str = "openai"):
+    async def run(self, handler, *args, sse: str = "openai", response_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None):
         from services.protocol.conversation import ImageGenerationError
 
+        if args and self.request_body is None:
+            self.request_body = json_safe(args[0])
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
+            response = _image_error_response(exc)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
-            return _image_error_response(exc)
+                     conversation_id=getattr(exc, "conversation_id", ""), response_body=_response_body(response))
+            return response
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            self.log("调用失败", status="failed", error=str(exc.detail), response_body={"detail": exc.detail})
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
-                return _image_error_response(exc)
-            return _protocol_error_response(exc, 502, sse)
+                response = _image_error_response(exc)
+            else:
+                response = _protocol_error_response(exc, 502, sse)
+            self.log("调用失败", status="failed", error=str(exc),
+                     account_email=getattr(exc, "account_email", ""), response_body=_response_body(response))
+            return response
 
         if isinstance(result, dict):
-            self.log("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
+            if response_transform is not None:
+                response = response_transform(response)
+            self.log("调用完成", result, response_body=response)
             return response
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
@@ -300,7 +344,8 @@ class LoggedCall:
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+            response_body: object = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -312,6 +357,11 @@ class LoggedCall:
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
+        detail.update(self.log_context)
+        if self.request_body is not None:
+            detail["request_body"] = self.request_body
+        if response_body is not None:
+            detail["response_body"] = json_safe(response_body)
         request_excerpt = _request_excerpt(self.request_text)
         if request_excerpt:
             detail["request_text"] = request_excerpt

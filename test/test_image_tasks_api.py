@@ -65,6 +65,16 @@ class ImageTasksApiTests(unittest.TestCase):
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)
         self.service_patcher.start()
         self.addCleanup(self.service_patcher.stop)
+        self.identity_patcher = mock.patch.object(
+            image_tasks_module,
+            "require_identity",
+            return_value={"id": "test-user", "name": "Tester", "role": "user"},
+        )
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
+        self.filter_patcher = mock.patch.object(image_tasks_module, "check_request")
+        self.filter_patcher.start()
+        self.addCleanup(self.filter_patcher.stop)
         app = FastAPI()
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
@@ -118,13 +128,20 @@ class ImageTasksApiTests(unittest.TestCase):
         images = self.fake_service.edit_calls[0][1]["images"]
         self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
 
-    def test_list_tasks_reports_missing_ids(self):
-        response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)
+    def test_get_task_returns_single_task(self):
+        response = self.client.get("/v1/images/tasks/task-1", headers=AUTH_HEADERS)
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
-        self.assertEqual(payload["missing_ids"], ["missing"])
+        self.assertEqual(payload["task_id"], "task-1")
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertEqual(payload["data"]["data"][0]["url"], "http://testserver/images/fake.png")
+
+    def test_get_missing_task_returns_404(self):
+        response = self.client.get("/v1/images/tasks/missing", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"]["error"], "task not found")
 
 
 if __name__ == "__main__":

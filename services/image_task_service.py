@@ -10,8 +10,9 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
-from services.log_service import LOG_TYPE_CALL, log_service
+from services.log_service import LOG_TYPE_CALL, json_safe, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from api.image_task_response import serialize_task_status
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -76,6 +77,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
         item["data"] = task.get("data")
+    if task.get("result_created") is not None:
+        item["result_created"] = task.get("result_created")
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
@@ -126,20 +129,23 @@ class ImageTaskService:
         client_task_id: str,
         prompt: str,
         model: str,
+        n: int = 1,
         size: str | None,
         quality: str = "auto",
+        response_format: str = "url",
         base_url: str = "",
+        request_body: object = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "model": model,
-            "n": 1,
+            "n": n,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": response_format,
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload, request_body=request_body)
 
     def submit_edit(
         self,
@@ -148,24 +154,27 @@ class ImageTaskService:
         client_task_id: str,
         prompt: str,
         model: str,
+        n: int = 1,
         size: str | None,
         quality: str = "auto",
+        response_format: str = "url",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        request_body: object = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "images": images or [],
             "mask": masks or [],
             "model": model,
-            "n": 1,
+            "n": n,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": response_format,
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload, request_body=request_body)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
@@ -198,6 +207,7 @@ class ImageTaskService:
         client_task_id: str,
         mode: str,
         payload: dict[str, Any],
+        request_body: object = None,
     ) -> dict[str, Any]:
         task_id = _clean(client_task_id)
         if not task_id:
@@ -224,6 +234,7 @@ class ImageTaskService:
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
+                "request_body": json_safe(request_body) if request_body is not None else None,
             }
             self._tasks[key] = task
             self._save_locked()
@@ -232,7 +243,7 @@ class ImageTaskService:
         if should_start:
             thread = threading.Thread(
                 target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2"), request_body),
                 name=f"image-task-{task_id[:16]}",
                 daemon=True,
             )
@@ -246,6 +257,7 @@ class ImageTaskService:
         payload: dict[str, Any],
         identity: dict[str, object],
         model: str,
+        request_body: object = None,
     ) -> None:
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
@@ -275,7 +287,11 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            result_created = result.get("created")
+            if not isinstance(result_created, (int, float)):
+                result_created = int(time.time())
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, result_created=int(result_created), usage=usage, error="", duration_ms=duration_ms)
+            public_task = self._task_for_log(key)
             self._log_call(
                 identity,
                 mode,
@@ -285,6 +301,9 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                response_format=str(payload.get("response_format") or "url"),
+                request_body=request_body if request_body is not None else {key: value for key, value in payload.items() if key != "progress_callback"},
+                response_body=serialize_task_status(public_task) if public_task is not None else None,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
@@ -294,6 +313,7 @@ class ImageTaskService:
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
                               **({"conversation_id": conversation_id} if conversation_id else {}))
+            public_task = self._task_for_log(key)
             self._log_call(
                 identity,
                 mode,
@@ -304,7 +324,15 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                response_format=str(payload.get("response_format") or "url"),
+                request_body=request_body if request_body is not None else {key: value for key, value in payload.items() if key != "progress_callback"},
+                response_body=serialize_task_status(public_task) if public_task is not None else None,
             )
+
+    def _task_for_log(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            task = self._tasks.get(key)
+            return _public_task(task) if task is not None else None
 
     def _log_call(
         self,
@@ -319,6 +347,9 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        response_format: str = "url",
+        request_body: object = None,
+        response_body: object = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -332,9 +363,15 @@ class ImageTaskService:
             "ended_at": _now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "status": status,
+            "is_async": True,
+            "response_format": response_format,
         }
         if request_preview:
             detail["request_text"] = request_preview
+        if request_body is not None:
+            detail["request_body"] = json_safe(request_body)
+        if response_body is not None:
+            detail["response_body"] = json_safe(response_body)
         if error:
             detail["error"] = error
         if account_email:
@@ -395,6 +432,9 @@ class ImageTaskService:
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
+            result_created = item.get("result_created")
+            if isinstance(result_created, (int, float)):
+                task["result_created"] = int(result_created)
             usage = item.get("usage")
             if isinstance(usage, dict):
                 task["usage"] = usage

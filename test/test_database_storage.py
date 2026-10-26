@@ -179,3 +179,45 @@ def test_save_auth_keys_rejects_duplicate_ids_and_rolls_back(tmp_path):
 
     assert "key-a" not in str(exc_info.value)
     assert backend.load_auth_keys() == [original]
+
+
+def test_account_batch_upsert_preserves_unrelated_rows_and_ids(tmp_path):
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'batch.db'}")
+    backend.save_accounts([{"access_token": "a", "name": "old"}, {"access_token": "b", "name": "unchanged"}])
+    before = _account_rows(backend)
+    backend.save_account_batch([{"access_token": "a", "name": "new"}, {"access_token": "c", "name": "added"}])
+    after = _account_rows(backend)
+    assert set(after) == {"a", "b", "c"}
+    assert before["a"].id == after["a"].id
+    assert before["b"].data == after["b"].data
+    assert json.loads(after["a"].data)["name"] == "new"
+    backend.delete_account_batch(["a", "c"])
+    assert set(_account_rows(backend)) == {"b"}
+
+
+def test_account_batch_chunking(tmp_path):
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'chunks.db'}")
+    backend.save_account_batch([{"access_token": f"t-{i}"} for i in range(1200)])
+    assert len(backend.load_accounts()) == 1200
+    backend.delete_account_batch([f"t-{i}" for i in range(1100)])
+    assert len(backend.load_accounts()) == 100
+
+
+def test_service_import_and_delete_use_batch_without_full_snapshot(tmp_path):
+    from unittest.mock import Mock, patch
+    from services.account_service import AccountService
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'service.db'}")
+    backend.save_account_batch([{"access_token": "original", "email": "old@example.test"}])
+    with patch.object(AccountService, "_load_cumulative_total", return_value=1), \
+         patch.object(AccountService, "_save_cumulative_total"), \
+         patch("services.account_service.log_service.add"):
+        service = AccountService(backend)
+        backend.save_accounts = Mock(side_effect=AssertionError("full snapshot forbidden"))
+        backend.save_account = Mock(side_effect=AssertionError("per-account writes forbidden"))
+        backend.delete_account = Mock(side_effect=AssertionError("per-account deletes forbidden"))
+        service.list_accounts = Mock(side_effect=AssertionError("full pool copy forbidden"))
+        result = service.add_accounts(["new"], include_items=False)
+        assert result == {"added": 1, "skipped": 0}
+        assert set(item["access_token"] for item in backend.load_accounts()) == {"original", "new"}
+        assert service.delete_accounts(["new"], include_items=False) == {"removed": 1}
+        assert [item["access_token"] for item in backend.load_accounts()] == ["original"]
