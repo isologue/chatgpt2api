@@ -170,8 +170,14 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     anyio_thread_limit: Number(config.anyio_thread_limit || 40),
+    image_response_format: config.image_response_format === "b64_json" ? "b64_json" : "url",
+    image_allow_response_format_override: config.image_allow_response_format_override !== false,
     image_workers: Number(config.image_workers || 32),
     image_queue_size: Number(config.image_queue_size ?? 128),
+    image_account_selection_max_attempts: Number(config.image_account_selection_max_attempts || 20),
+    image_poll_timeout_account_switch_retries: Number(config.image_poll_timeout_account_switch_retries ?? 4),
+    image_text_reply_account_switch_retries: Number(config.image_text_reply_account_switch_retries ?? 3),
+    monitoring_refresh_interval_secs: Number(config.monitoring_refresh_interval_secs || 3),
     image_retention_days: Number(config.image_retention_days || 30),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
@@ -296,9 +302,14 @@ type SettingsStore = {
   testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
   setAnyioThreadLimit: (value: string) => void;
+  setImageResponseFormat: (value: "url" | "b64_json") => void;
+  setImageAllowResponseFormatOverride: (value: boolean) => void;
   setImageWorkers: (value: string) => void;
   setImageQueueSize: (value: string) => void;
-  setImageRetentionDays: (value: string) => void;
+  setImageAccountSelectionMaxAttempts: (value: string) => void;
+  setImagePollTimeoutAccountSwitchRetries: (value: string) => void;
+  setImageTextReplyAccountSwitchRetries: (value: string) => void;
+  setMonitoringRefreshIntervalSecs: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageParallelGeneration: (value: boolean) => void;
@@ -424,12 +435,20 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
     set({ isSavingConfig: true });
     try {
+      const generalConfig = { ...config };
+      delete generalConfig.data_retention; // 清理策略由图片/日志页面独立保存，避免旧表单覆盖。
       const data = await updateSettingsConfig({
-        ...config,
+        ...generalConfig,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         anyio_thread_limit: Math.min(1000, Math.max(1, Number(config.anyio_thread_limit) || 40)),
+        image_response_format: config.image_response_format === "b64_json" ? "b64_json" : "url",
+        image_allow_response_format_override: config.image_allow_response_format_override !== false,
         image_workers: Math.min(10000, Math.max(1, Number(config.image_workers) || 32)),
         image_queue_size: Math.min(10000, Math.max(0, Number(config.image_queue_size) || 0)),
+        image_account_selection_max_attempts: Math.min(1000, Math.max(1, Number(config.image_account_selection_max_attempts) || 20)),
+        image_poll_timeout_account_switch_retries: Math.min(100, Math.max(0, Number(config.image_poll_timeout_account_switch_retries) || 0)),
+        image_text_reply_account_switch_retries: Math.min(100, Math.max(0, Number(config.image_text_reply_account_switch_retries) || 0)),
+        monitoring_refresh_interval_secs: Math.min(60, Math.max(1, Number(config.monitoring_refresh_interval_secs) || 3)),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
@@ -537,6 +556,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, anyio_thread_limit: value } } : {});
   },
 
+  setImageResponseFormat: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_response_format: value } } : {});
+  },
+  setImageAllowResponseFormatOverride: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_allow_response_format_override: value } } : {});
+  },
   setImageWorkers: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_workers: value } } : {});
   },
@@ -545,9 +570,22 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, image_queue_size: value } } : {});
   },
 
-  setImageRetentionDays: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
+  setImageAccountSelectionMaxAttempts: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_selection_max_attempts: value } } : {});
   },
+
+  setImagePollTimeoutAccountSwitchRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_poll_timeout_account_switch_retries: value } } : {});
+  },
+
+  setImageTextReplyAccountSwitchRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_text_reply_account_switch_retries: value } } : {});
+  },
+
+  setMonitoringRefreshIntervalSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, monitoring_refresh_interval_secs: value } } : {});
+  },
+
 
   setImagePollTimeoutSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});

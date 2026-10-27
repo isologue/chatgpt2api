@@ -49,11 +49,13 @@ def _parse_bool(value: object, field_name: str = "stream") -> bool | None:
     raise HTTPException(status_code=400, detail={"error": f"{field_name} must be a boolean"})
 
 
-def _parse_response_format(value: object, default: str = "url") -> str:
-    response_format = _clean(value, default)
-    if response_format not in {"url", "b64_json"}:
-        raise HTTPException(status_code=400, detail={"error": "response_format must be 'url' or 'b64_json'"})
-    return response_format
+def _parse_response_format(value: object) -> str:
+    from services.image_response_format import resolve_image_response_format
+
+    try:
+        return resolve_image_response_format(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
 
 def _parse_count(value: object) -> int:

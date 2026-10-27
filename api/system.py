@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from urllib.parse import quote
+from typing import Literal
+from datetime import date, datetime
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from api.support import require_admin, require_identity, resolve_image_base_url
 from services.backup_service import BackupError, backup_service
@@ -24,6 +26,9 @@ from services.image_service import (
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
+from services.retention_service import CleanupBusyError, retention_service
+from services.account_service import account_service
+from services.monitoring import snapshot as monitoring_snapshot
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 from services.thread_pool import apply_anyio_thread_limit, configure_image_executors
 
@@ -52,6 +57,16 @@ class ImageDownloadRequest(BaseModel):
 class ImageTagsRequest(BaseModel):
     path: str
     tags: list[str]
+
+class RetentionPolicyRequest(BaseModel):
+    enabled: StrictBool = False
+    retention_hours: StrictInt = Field(ge=1, le=876000)
+    interval_minutes: StrictInt = Field(default=60, ge=1, le=43200)
+
+
+class CleanupRequest(BaseModel):
+    retention_hours: StrictInt = Field(ge=1, le=876000)
+
 
 class LogDeleteRequest(BaseModel):
     ids: list[str] = []
@@ -98,6 +113,30 @@ def create_router(app_version: str) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
+    @router.get("/api/monitoring")
+    async def get_monitoring(
+        start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            start = date.fromisoformat(start_date) if start_date else date.today()
+            end = date.fromisoformat(end_date) if end_date else start
+            if start > end:
+                raise ValueError("start_date must not be later than end_date")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "日期范围无效，请使用 YYYY-MM-DD，开始日期不能晚于结束日期"}) from exc
+
+        def collect():
+            images = log_service.image_stats(start.isoformat(), end.isoformat())
+            return {
+                **monitoring_snapshot(account_service.get_stats(), images),
+                "refresh_interval_secs": config.monitoring_refresh_interval_secs,
+                "server_date": date.today().isoformat(),
+                "timezone": str(datetime.now().astimezone().tzinfo),
+            }
+
+        return await run_in_threadpool(collect)
+
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -132,14 +171,58 @@ def create_router(app_version: str) -> APIRouter:
         return get_image_download_response(image_path)
 
     @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    async def get_logs(
+        type: str = "", start_date: str = "", end_date: str = "", key_name: str | None = None,
+        is_async: bool | None = None, response_format: Literal["", "url", "b64_json"] = "",
+        status: Literal["", "success", "failed", "safety_rejected"] = "",
+        page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=1, le=100),
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+
+        def collect():
+            scope = {"type": type.strip(), "start_date": start_date.strip(), "end_date": end_date.strip()}
+            return log_service.list_page(**scope, page=page, page_size=page_size, key_name=key_name,
+                                         is_async=is_async, response_format=response_format, status=status)
+
+        return await run_in_threadpool(collect)
+
+    @router.get("/api/logs/storage")
+    async def get_log_storage(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(log_service.storage_stats)
+
+    @router.get("/api/logs/filter-options")
+    async def get_log_filter_options(
+        type: str = "call", start_date: str = "", end_date: str = "", query: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        names = await run_in_threadpool(log_service.list_key_names, type.strip(), start_date.strip(), end_date.strip(), query)
+        return {"key_names": names}
+
+    @router.get("/api/retention/{kind}")
+    async def get_retention(kind: Literal["images", "logs"], authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return retention_service.snapshot(kind)
+
+    @router.post("/api/retention/{kind}")
+    async def save_retention(kind: Literal["images", "logs"], body: RetentionPolicyRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(retention_service.update, kind, body.model_dump())
+
+    @router.post("/api/retention/{kind}/run", status_code=202)
+    async def run_retention(kind: Literal["images", "logs"], body: CleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return retention_service.run(kind, body.retention_hours)
+        except CleanupBusyError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.get("/api/logs/{log_id}")
     async def get_log_detail(log_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        item = log_service.get(log_id)
+        item = await run_in_threadpool(log_service.get, log_id)
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "log not found"})
         return {"item": item}
@@ -147,7 +230,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return log_service.delete(body.ids)
+        return await run_in_threadpool(log_service.delete, body.ids)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):

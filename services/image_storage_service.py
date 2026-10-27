@@ -333,22 +333,42 @@ class ImageStorageService:
 
     def delete(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
+        # 远端请求不得持有生图保存所需的元数据锁；远端失败时保留索引以便重试。
+        item = self._index_store.get(safe_rel)
         removed = False
-        path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
+        if item.get("webdav"):
+            removed = WebDAVClient(self.settings()).delete(safe_rel)
         with self._index_lock:
-            item = self._index_store.get(safe_rel)
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
+            path = _local_image_path(safe_rel)
+            if path.is_file():
+                path.unlink()
+                removed = True
             if item:
                 self._index_store.delete(safe_rel)
-        return removed
+        return removed or bool(item)
+
+    def expired_paths(self, cutoff: float):
+        from services.retention_settings import timestamp
+
+        # SQLite 游标流式读取元数据，不加载图片内容，也不占用生图的索引锁。
+        indexed = set()
+        for rel, item in self._index_store.iter_items():
+            if not _is_image_rel(rel):
+                continue
+            indexed.add(rel)
+            created = timestamp(item.get("created_at"))
+            path = _local_image_path(rel)
+            if created is None and path.is_file():
+                created = path.stat().st_mtime
+            if created is not None and created < cutoff:
+                yield rel
+        # 兼容尚未进入索引的旧图片，只读取文件元数据。
+        for path in config.images_dir.rglob("*"):
+            if not path.is_file() or not _is_image_rel(path.name):
+                continue
+            rel = path.relative_to(config.images_dir).as_posix()
+            if rel not in indexed and path.stat().st_mtime < cutoff:
+                yield rel
 
     def sync_all(self) -> dict[str, int]:
         settings = self.settings()

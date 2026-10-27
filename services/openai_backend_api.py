@@ -111,25 +111,11 @@ CODEX_RESPONSES_INSTRUCTIONS = (
     "Return the generated image result."
 )
 
-# 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
-_CONTENT_POLICY_KEYWORDS = (
-    # 明确的内容政策违规
-    "内容政策", "防护限制", "违反", "moderation", "policy", "blocked",
-    # 拒绝生成类
-    "不能生成", "无法生成", "不能帮助", "无法帮助",
-    # 敏感内容类
-    "裸体", "裸露", "色情", "性内容", "未成年",
-    # 通用拒绝
-    "抱歉，我不能",
-)
-
-
 def _is_content_policy_error(error_msg: str) -> bool:
-    """检查错误消息是否为内容政策违规。"""
-    if not error_msg:
-        return False
-    msg_lower = error_msg.lower()
-    return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+    """只识别明确内容拒绝，避免将审核超时、无图回复等技术故障标成违规。"""
+    from services.image_statistics import is_content_policy_rejection
+
+    return is_content_policy_rejection(error_msg)
 
 
 @dataclass
@@ -2527,7 +2513,7 @@ class OpenAIBackendAPI:
                 # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
-                    if task_error:
+                    if task_error and _is_content_policy_error(task_error):
                         raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({

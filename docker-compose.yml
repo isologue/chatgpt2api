@@ -29,6 +29,8 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
+      # 主服务日志和监控日期使用的时区，默认中国标准时间。
+      - TZ=${TZ:-Asia/Shanghai}
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
       - STORAGE_BACKEND=${STORAGE_BACKEND:-postgres}
       - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-chatgpt2api}:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatgpt2api}}

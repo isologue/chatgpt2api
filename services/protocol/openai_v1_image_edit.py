@@ -5,6 +5,7 @@ from typing import Any, Iterator
 
 from PIL import Image
 
+from services.config import config
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -57,13 +58,13 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
-    response_format = str(body.get("response_format") or "b64_json")
+    response_format = str(body.get("response_format") or config.image_response_format)
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
-    outputs = stream_image_outputs_with_pool(ConversationRequest(
+    request = ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
@@ -74,10 +75,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
-    ))
+    )
+    outputs = stream_image_outputs_with_pool(request)
     if body.get("stream"):
         return stream_image_chunks(outputs)
-    result = collect_image_outputs(outputs)
+    result = collect_image_outputs(outputs, request.account_switch_tracker)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),

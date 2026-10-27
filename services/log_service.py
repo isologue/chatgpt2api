@@ -6,6 +6,8 @@ import itertools
 import base64
 import time
 import sqlite3
+import shutil
+import os
 from contextlib import contextmanager
 from threading import RLock
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.image_statistics import call_log_status, image_result_counts
 from services.thread_pool import run_image_in_threadpool
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
@@ -33,6 +36,7 @@ class LogService:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._maintenance_lock = RLock()
         self._index_path = path.with_suffix(".index.sqlite3")
 
     @staticmethod
@@ -74,7 +78,15 @@ class LogService:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("CREATE TABLE IF NOT EXISTS entries (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, type TEXT, day TEXT, offset INTEGER, length INTEGER, summary TEXT)")
             connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_seq ON entries(type, seq)")
+            connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_day_seq ON entries(type, day, seq)")
+            connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_day_seq ON entries(day, seq)")
+            connection.execute("CREATE TABLE IF NOT EXISTS entry_filters (seq INTEGER PRIMARY KEY, key_name TEXT, is_async INTEGER, response_format TEXT, status TEXT)")
+            for column in ("key_name", "is_async", "response_format", "status"):
+                connection.execute(f"CREATE INDEX IF NOT EXISTS ix_entry_filters_{column}_seq ON entry_filters({column}, seq)")
+            connection.execute("CREATE TABLE IF NOT EXISTS log_filters_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS source (id INTEGER PRIMARY KEY, size INTEGER, mtime TEXT, lines INTEGER)")
+            connection.execute("CREATE TABLE IF NOT EXISTS image_stats_daily (day TEXT PRIMARY KEY, success INTEGER NOT NULL, failed INTEGER NOT NULL, excluded INTEGER NOT NULL, success_images INTEGER NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS image_stats_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
             with connection:
                 # Reads only need a deferred transaction. BEGIN IMMEDIATE here
                 # made log listing/detail compete with every image completion.
@@ -90,7 +102,17 @@ class LogService:
         return stat.st_size, str(stat.st_mtime_ns)
 
     @staticmethod
-    def _summary(item):
+    def _with_call_status(item):
+        result = dict(item)
+        if item.get("type") == "call" and isinstance(detail := item.get("detail"), dict):
+            result["detail"] = dict(detail)
+            if "status" in detail:
+                result["detail"]["status"] = call_log_status(detail)
+        return result
+
+    @classmethod
+    def _summary(cls, item):
+        item = cls._with_call_status(item)
         summary = dict(item)
         if isinstance(detail := item.get("detail"), dict):
             summary["detail"] = {key: value for key, value in detail.items()
@@ -101,15 +123,68 @@ class LogService:
         connection.execute("INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)",
             (number, item["id"], str(item.get("type") or ""), str(item.get("time") or "")[:10],
              offset, length, self._serialize_item(self._summary(item))))
+        self._index_filters(connection, number, self._summary(item))
+        self._index_image_stats(connection, item)
+
+    @staticmethod
+    def _index_image_stats(connection, item):
+        counts = image_result_counts(item)
+        if any(counts):
+            connection.execute(
+                "INSERT INTO image_stats_daily VALUES (?, ?, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET "
+                "success=success+excluded.success, failed=failed+excluded.failed, "
+                "excluded=excluded+excluded.excluded, success_images=success_images+excluded.success_images",
+                (str(item.get("time") or "")[:10], *counts),
+            )
+
+    @staticmethod
+    def _index_filters(connection, number, item):
+        detail = item.get("detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        is_async = detail.get("is_async")
+        connection.execute("INSERT OR REPLACE INTO entry_filters VALUES (?, ?, ?, ?, ?)", (
+            number, str(detail.get("key_name") or ""),
+            int(is_async) if isinstance(is_async, bool) else None,
+            str(detail.get("response_format") or ""), call_log_status(detail),
+        ))
+
+    def _sync_filter_index(self, connection):
+        if connection.execute("SELECT version FROM log_filters_meta WHERE id=1").fetchone() == (1,):
+            return
+        # 只回填已有摘要，不加载历史请求体或 Base64 响应。
+        connection.execute("DELETE FROM entry_filters")
+        for number, summary in connection.execute("SELECT seq, summary FROM entries"):
+            self._index_filters(connection, number, json.loads(summary))
+        connection.execute("INSERT OR REPLACE INTO log_filters_meta VALUES (1, 1)")
 
     def _sync_index(self, connection):
         size, mtime = self._fingerprint()
         saved = connection.execute("SELECT size, mtime, lines FROM source WHERE id=1").fetchone()
+        stats_version = connection.execute("SELECT version FROM image_stats_meta WHERE id=1").fetchone()
         if saved and saved[:2] == (size, mtime):
+            if stats_version != (1,):
+                # 升级时复用已有摘要，避免再次读取历史请求体和大 Base64。
+                connection.execute("DELETE FROM image_stats_daily")
+                daily = {}
+                for row in connection.execute("SELECT summary FROM entries"):
+                    item = json.loads(row[0])
+                    counts = image_result_counts(item)
+                    if any(counts):
+                        day = str(item.get("time") or "")[:10]
+                        previous = daily.setdefault(day, [0, 0, 0, 0])
+                        for index, count in enumerate(counts):
+                            previous[index] += count
+                connection.executemany("INSERT INTO image_stats_daily VALUES (?, ?, ?, ?, ?)",
+                                       [(day, *counts) for day, counts in daily.items()])
+                connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
+            self._sync_filter_index(connection)
             return saved[2]
         # Rebuild once for legacy logs or externally restored/edited files.
         # Stream the source: historical Base64 bodies never accumulate in RAM.
         connection.execute("DELETE FROM entries")
+        connection.execute("DELETE FROM entry_filters")
+        connection.execute("DELETE FROM image_stats_daily")
         number = 0
         if self.path.exists():
             with self.path.open("rb") as source:
@@ -123,6 +198,8 @@ class LogService:
                         self._index_line(connection, item, number, offset, len(line))
                     number += 1
         connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, number))
+        connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
+        connection.execute("INSERT OR REPLACE INTO log_filters_meta VALUES (1, 1)")
         return number
 
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
@@ -142,18 +219,121 @@ class LogService:
             size, mtime = self._fingerprint()
             connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, number + 1))
 
-    def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    @staticmethod
+    def _list_conditions(type="", start_date="", end_date=""):
+        clauses, params = [], []
+        for clause, value in (("entries.type = ?", type), ("day >= ?", start_date), ("day <= ?", end_date)):
+            if value:
+                clauses.append(clause)
+                params.append(value)
+        return clauses, params
+
+    def _query_scope(self, type="", start_date="", end_date="", key_name=None,
+                     is_async=None, response_format="", status=""):
+        clauses, params = self._list_conditions(type, start_date, end_date)
+        filtered = False
+        for column, value in (("key_name", key_name), ("is_async", is_async),
+                              ("response_format", response_format or None), ("status", status or None)):
+            if value is not None:
+                filtered = True
+                clauses.append(f"entry_filters.{column} = ?")
+                params.append(value)
+        source = "entries JOIN entry_filters USING(seq)" if filtered else "entries"
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return source, where, params
+
+    def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200,
+             *, key_name: str | None = None, is_async: bool | None = None,
+             response_format: str = "", status: str = "") -> list[dict[str, Any]]:
         with self._lock, self._index() as connection:
             self._sync_index(connection)
-            clauses, params = [], []
-            for clause, value in (("type = ?", type), ("day >= ?", start_date), ("day <= ?", end_date)):
-                if value:
-                    clauses.append(clause)
-                    params.append(value)
+            source, where, params = self._query_scope(type, start_date, end_date, key_name, is_async, response_format, status)
+            rows = connection.execute(
+                "SELECT summary FROM " + source + where + " ORDER BY seq DESC LIMIT ?",
+                [*params, max(0, limit)],
+            ).fetchall()
+            return [self._with_call_status(json.loads(row[0])) for row in rows]
+
+    def list_page(self, *, page: int = 1, page_size: int = 20, **filters) -> dict[str, Any]:
+        page_size = max(1, min(100, page_size))
+        with self._index() as connection:
+            with self._lock:
+                self._sync_index(connection)
+            # WAL 快照查询不持有追加锁，避免翻页阻塞图片完成日志写入。
+            source, where, params = self._query_scope(**filters)
+            total = connection.execute("SELECT COUNT(*) FROM " + source + where, params).fetchone()[0]
+            page = max(1, min(page, max(1, (total + page_size - 1) // page_size)))
+            # 深页仅跳过索引中的序号，确定当前页后才加载少量日志摘要。
+            rows = connection.execute(
+                "SELECT summary FROM entries WHERE seq IN (SELECT seq FROM " + source + where +
+                " ORDER BY seq DESC LIMIT ? OFFSET ?) ORDER BY seq DESC",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+            return {"items": [self._with_call_status(json.loads(row[0])) for row in rows],
+                    "total": total, "page": page, "page_size": page_size}
+
+    def storage_stats(self) -> dict[str, int]:
+        # 仅复用索引计数、读取文件元数据，不扫描历史请求体或响应体。
+        with self._index() as connection:
+            with self._lock:
+                self._sync_index(connection)
+            count = connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+
+        def size(path: Path) -> int:
+            try:
+                return path.stat().st_size
+            except FileNotFoundError:
+                # WAL/SHM 文件可能在读取期间被 SQLite 自动移除。
+                return 0
+
+        body_size = size(self.path)
+        index_size = sum(size(path) for path in (
+            self._index_path, Path(str(self._index_path) + "-wal"), Path(str(self._index_path) + "-shm"),
+        ))
+        usage = shutil.disk_usage(self.path.parent)
+        return {
+            "disk_total_mb": usage.total // (1024 * 1024),
+            "disk_used_mb": usage.used // (1024 * 1024),
+            "disk_free_mb": usage.free // (1024 * 1024),
+            "log_count": count,
+            "log_size_bytes": body_size + index_size,
+            "log_file_size_bytes": body_size,
+            "log_index_size_bytes": index_size,
+        }
+
+    def list_key_names(self, type: str = "", start_date: str = "", end_date: str = "",
+                       query: str = "", limit: int = 50) -> list[str]:
+        with self._index() as connection:
+            with self._lock:
+                self._sync_index(connection)
+            # WAL 快照查询不持有追加锁，避免翻页阻塞图片完成日志写入。
+            clauses, params = self._list_conditions(type, start_date, end_date)
+            if query:
+                # instr 使用字面子串搜索，令牌名称里的 % 和 _ 不是通配符。
+                clauses.append("instr(lower(key_name), lower(?)) > 0")
+                params.append(query)
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
-            rows = connection.execute("SELECT summary FROM entries" + where + " ORDER BY seq DESC LIMIT ?",
-                                      [*params, max(0, limit)]).fetchall()
-            return [json.loads(row[0]) for row in rows]
+            return [row[0] for row in connection.execute(
+                "SELECT DISTINCT key_name FROM entries JOIN entry_filters USING(seq)" + where +
+                " ORDER BY key_name LIMIT ?", [*params, max(1, min(100, limit))],
+            )]
+
+    def image_stats(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """增量维护日汇总；正常刷新只读日期范围内的少量汇总行。"""
+        with self._lock, self._index() as connection:
+            self._sync_index(connection)
+            row = connection.execute(
+                "SELECT SUM(success), SUM(failed), SUM(excluded), SUM(success_images) "
+                "FROM image_stats_daily WHERE day >= ? AND day <= ?", (start_date, end_date),
+            ).fetchone()
+        success, failed, excluded, success_images = (int(value or 0) for value in row)
+        total = success + failed
+        return {
+            "success": success, "failed": failed, "excluded": excluded,
+            "success_images": success_images, "total": total,
+            "success_rate": round(success * 100 / total, 2) if total else 0.0,
+            "start_date": start_date, "end_date": end_date,
+        }
 
     def get(self, log_id: str) -> dict[str, Any] | None:
         with self._lock, self._index(write=True) as connection:
@@ -163,30 +343,107 @@ class LogService:
                 return None
             with self.path.open("rb") as source:
                 source.seek(row[1])
-                return self._parse_line(source.read(row[2]).decode("utf-8").rstrip("\r\n"), row[0])
+                item = self._parse_line(source.read(row[2]).decode("utf-8").rstrip("\r\n"), row[0])
+                return self._with_call_status(item) if item is not None else None
+
+    def cleanup_before(self, cutoff: float) -> dict[str, int]:
+        from services.retention_settings import timestamp
+
+        # 先查轻量摘要；没有过期日志时不读取/重写请求体和响应体。
+        with self._maintenance_lock:
+            with self._index() as connection:
+                with self._lock:
+                    self._sync_index(connection)
+                cutoff_day = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d")
+                ids = set()
+                for log_id, summary in connection.execute("SELECT id, summary FROM entries WHERE day <= ?", (cutoff_day,)):
+                    created = timestamp(json.loads(summary).get("time"))
+                    if created is not None and created < cutoff:
+                        ids.add(log_id)
+            return self._compact_ids(ids)
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
-            return {"removed": 0}
-        with self._lock, self._index() as connection:
-            self._sync_index(connection)
-            removed = 0
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            try:
-                with self.path.open("rb") as source, temporary.open("wb") as target:
-                    for number, line in enumerate(source):
-                        item = self._parse_line(line.decode("utf-8").rstrip("\r\n"), number)
-                        if item is not None and item["id"] in target_ids:
-                            removed += 1
-                            continue
-                        # Persist legacy IDs before line numbers change.
-                        target.write((self._serialize_item(item) + "\n").encode("utf-8") if item else line)
-                temporary.replace(self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
-            self._sync_index(connection)
-            return {"removed": removed}
+        with self._maintenance_lock:
+            return self._compact_ids(target_ids)
+
+    def _compact_ids(self, target_ids: set[str]) -> dict[str, int]:
+        if not target_ids or not self.path.exists():
+            return {"removed": 0, "reclaimed_bytes": 0}
+        temporary = self.path.with_name(self.path.stem + ".cleanup-" + uuid4().hex + ".jsonl")
+        staged = LogService(temporary)
+        removed = old_number = new_number = 0
+        source = target = None
+        try:
+            # 只在取得快照边界和最终替换时持追加锁，主体压缩在锁外流式完成。
+            with self._lock, self._index() as connection:
+                self._sync_index(connection)
+                boundary = self.path.stat().st_size
+                source = self.path.open("rb")
+            target = temporary.open("wb")
+
+            def copy_until(limit, connection):
+                nonlocal removed, old_number, new_number
+                while source.tell() < limit:
+                    line = source.readline()
+                    if not line:
+                        raise RuntimeError("log source changed during cleanup")
+                    item = self._parse_line(line.decode("utf-8").rstrip("\r\n"), old_number)
+                    old_number += 1
+                    if item is not None and item["id"] in target_ids:
+                        removed += 1
+                        continue
+                    # 重排前持久化 legacy id；正文原字段及值完整保留。
+                    payload = (self._serialize_item(item) + "\n").encode("utf-8") if item is not None else line
+                    offset = target.tell()
+                    target.write(payload)
+                    if item is not None:
+                        staged._index_line(connection, item, new_number, offset, len(payload))
+                    new_number += 1
+                target.flush()
+
+            with staged._index(write=True) as connection:
+                copy_until(boundary, connection)
+            if not removed:
+                return {"removed": 0, "reclaimed_bytes": 0}
+            while True:
+                with self._lock:
+                    current = self.path.stat()
+                    if not os.path.samestat(os.fstat(source.fileno()), current):
+                        raise RuntimeError("log source was replaced during cleanup")
+                    end = current.st_size
+                    if end < source.tell():
+                        raise RuntimeError("log source was truncated during cleanup")
+                    if end - source.tell() <= 1024 * 1024:
+                        # 新日志通常已在前面的追赶阶段复制，此处只处理小尾部。
+                        with staged._index(write=True) as connection:
+                            copy_until(end, connection)
+                        target.flush()
+                        os.fsync(target.fileno())
+                        target.close()
+                        source.close()
+                        # 元数据整体交换无需再扫描大正文。WAL 读者继续使用旧快照。
+                        with self._index(write=True) as connection:
+                            connection.execute("ATTACH DATABASE ? AS compacted", (str(staged._index_path),))
+                            for table in ("entries", "entry_filters", "image_stats_daily"):
+                                connection.execute(f"DELETE FROM {table}")
+                                connection.execute(f"INSERT INTO {table} SELECT * FROM compacted.{table}")
+                            connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
+                            connection.execute("INSERT OR REPLACE INTO log_filters_meta VALUES (1, 1)")
+                            temporary.replace(self.path)
+                            size, mtime = self._fingerprint()
+                            connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, new_number))
+                        return {"removed": removed, "reclaimed_bytes": max(0, end - size)}
+                # 锁外追赶清理期间追加的日志，不阻塞生图完成写日志。
+                with staged._index(write=True) as connection:
+                    copy_until(end, connection)
+        finally:
+            if source is not None:
+                source.close()
+            if target is not None:
+                target.close()
+            for path in (temporary, staged._index_path, Path(str(staged._index_path) + "-wal"), Path(str(staged._index_path) + "-shm")):
+                path.unlink(missing_ok=True)
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")
@@ -333,7 +590,11 @@ class LoggedCall:
             runner = run_image_in_threadpool if self.endpoint.startswith("/v1/images") else run_in_threadpool
             result = await runner(handler, *args)
         except ImageGenerationError as exc:
+            self.log_context["error_code"] = exc.code
             response = _image_error_response(exc)
+            for key in ("switch_count", "account_time_ms", "account_switch_trace"):
+                if hasattr(exc, key):
+                    self.log_context[key] = getattr(exc, key)
             await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""), response_body=_response_body(response))
             return response
@@ -363,6 +624,7 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            self.log_context["error_code"] = exc.code
             await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
@@ -391,6 +653,7 @@ class LoggedCall:
                 conversation_ids.extend(_collect_conversation_ids(item))
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
+            self.log_context["error_code"] = getattr(exc, "code", "")
             failed = True
             self.log(
                 "流式调用失败",
@@ -451,4 +714,8 @@ class LoggedCall:
         collected_urls = [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
+        if isinstance(result, dict):
+            for key in ("_switch_count", "_account_time_ms", "_account_switch_trace"):
+                if key in result:
+                    detail[key[1:]] = result[key]
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

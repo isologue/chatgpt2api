@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -8,7 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import _parse_response_format, parse_image_edit_request, read_image_sources
 from api.image_task_response import serialize_task_creation, strip_revised_prompt
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
@@ -32,7 +31,7 @@ class ImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: object = None
     history_disabled: bool = True
     stream: bool | None = None
     async_: bool = Field(default=False, alias="async")
@@ -110,11 +109,12 @@ def create_router() -> APIRouter:
     ):
         identity = await run_in_threadpool(require_identity, authorization)
         payload = body.model_dump(mode="python")
+        payload["response_format"] = _parse_response_format(body.response_format)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         request_body = await request.json()
         call.request_body = request_body
-        call.log_context = {"is_async": body.async_, "response_format": body.response_format}
+        call.log_context = {"is_async": body.async_, "response_format": payload["response_format"]}
         await filter_or_log(call, body.prompt)
         if body.async_:
             try:
@@ -127,7 +127,7 @@ def create_router() -> APIRouter:
                     n=body.n,
                     size=body.size,
                     quality=body.quality,
-                    response_format=body.response_format,
+                    response_format=payload["response_format"],
                     base_url=payload["base_url"],
                     request_body=request_body,
                 )

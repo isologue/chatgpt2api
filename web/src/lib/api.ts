@@ -176,8 +176,14 @@ export type SettingsConfig = {
   };
   refresh_account_interval_minute?: number | string;
   anyio_thread_limit?: number | string;
+  image_response_format?: "url" | "b64_json";
+  image_allow_response_format_override?: boolean;
   image_workers?: number | string;
   image_queue_size?: number | string;
+  image_account_selection_max_attempts?: number | string;
+  image_poll_timeout_account_switch_retries?: number | string;
+  image_text_reply_account_switch_retries?: number | string;
+  monitoring_refresh_interval_secs?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
@@ -285,6 +291,48 @@ export type SystemLog = {
   summary?: string;
   detail?: Record<string, unknown>;
   [key: string]: unknown;
+};
+
+export type MonitoringSnapshot = {
+  timestamp: number;
+  refresh_interval_secs: number;
+  server_date: string;
+  timezone: string;
+  accounts: {
+    total: number;
+    available: number;
+    unavailable: number;
+    limited: number;
+    abnormal: number;
+    disabled: number;
+  };
+  image_executor: {
+    workers: number;
+    queue_size: number;
+    capacity: number;
+    inflight: number;
+    queued: number;
+    available: number;
+    available_slots: number;
+    remaining_queue_slots: number;
+    full: boolean;
+  };
+  images: {
+    success: number;
+    failed: number;
+    total: number;
+    success_rate: number;
+    success_images: number;
+    excluded: number;
+    start_date: string;
+    end_date: string;
+  };
+  system: {
+    cpu_percent: number | null;
+    memory: { used_bytes: number; total_bytes: number; percent: number };
+    disk: { used_bytes: number; total_bytes: number; free_bytes: number; percent: number };
+    load_average: number[];
+  };
 };
 
 export type ImageResponse = {
@@ -742,16 +790,39 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: {
+  type?: string; start_date?: string; end_date?: string; key_name?: string;
+  is_async?: boolean; response_format?: string; status?: string; page?: number; page_size?: number;
+}, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  if (filters.key_name !== undefined) params.set("key_name", filters.key_name);
+  if (filters.is_async !== undefined) params.set("is_async", String(filters.is_async));
+  if (filters.response_format) params.set("response_format", filters.response_format);
+  if (filters.status) params.set("status", filters.status);
+  params.set("page", String(filters.page || 1));
+  params.set("page_size", String(filters.page_size || 20));
+  return (await request.get<{ items: SystemLog[]; total: number; page: number; page_size: number }>(
+    `/api/logs?${params.toString()}`, { signal },
+  )).data;
+}
+
+export async function fetchLogKeyNames(filters: { type: string; start_date: string; end_date: string; query: string }, signal?: AbortSignal) {
+  const params = new URLSearchParams(filters);
+  return (await request.get<{ key_names: string[] }>(`/api/logs/filter-options?${params.toString()}`, { signal })).data;
 }
 
 export async function fetchSystemLog(id: string) {
   return httpRequest<{ item: SystemLog }>(`/api/logs/${encodeURIComponent(id)}`);
+}
+
+export async function fetchMonitoring(startDate?: string, endDate?: string) {
+  const query = new URLSearchParams();
+  if (startDate) query.set("start_date", startDate);
+  if (endDate) query.set("end_date", endDate);
+  return httpRequest<MonitoringSnapshot>(`/api/monitoring?${query.toString()}`);
 }
 
 export async function deleteSystemLogs(ids: string[]) {
@@ -1011,4 +1082,45 @@ export async function testProxyClearance(targetUrl?: string) {
     method: "POST",
     body: { target_url: targetUrl ?? "https://chatgpt.com" },
   });
+}
+
+
+export type RetentionKind = "images" | "logs";
+export type RetentionPolicy = { enabled: boolean; retention_hours: number; interval_minutes: number };
+export type RetentionStatus = {
+  policy: RetentionPolicy;
+  running: boolean;
+  last_started_at: string | null;
+  last_finished_at: string | null;
+  next_run_at: string | null;
+  cutoff?: string;
+  retention_hours?: number;
+  source?: "manual" | "automatic";
+  last_result: { removed: number; failed?: number; reclaimed_bytes?: number; errors?: string[] } | null;
+  last_error: string | null;
+};
+
+export async function fetchRetention(kind: RetentionKind, signal?: AbortSignal) {
+  return (await request.get<RetentionStatus>(`/api/retention/${kind}`, { signal })).data;
+}
+export async function saveRetention(kind: RetentionKind, policy: RetentionPolicy) {
+  return (await request.post<RetentionStatus>(`/api/retention/${kind}`, policy)).data;
+}
+export async function runRetention(kind: RetentionKind, retentionHours: number) {
+  return (await request.post<RetentionStatus>(`/api/retention/${kind}/run`, { retention_hours: retentionHours })).data;
+}
+
+
+export type LogStorageStats = {
+  disk_total_mb: number;
+  disk_used_mb: number;
+  disk_free_mb: number;
+  log_count: number;
+  log_size_bytes: number;
+  log_file_size_bytes: number;
+  log_index_size_bytes: number;
+};
+
+export async function fetchLogStorage(signal?: AbortSignal) {
+  return (await request.get<LogStorageStats>("/api/logs/storage", { signal })).data;
 }

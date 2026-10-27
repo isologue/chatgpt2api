@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import io
 import shutil
-import threading
-import time
 import zipfile
 from pathlib import Path
 
@@ -13,8 +11,7 @@ from PIL import Image, ImageOps
 
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.image_tags_service import load_tags, remove_tags
-from utils.log import logger
+from services.image_tags_service import load_tags, remove_tags, remove_tags_many
 
 THUMBNAIL_SIZE = (320, 320)
 
@@ -149,8 +146,6 @@ def cleanup_image_thumbnails() -> int:
     return removed
 
 def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    config.cleanup_old_images()
-    cleanup_image_thumbnails()
     all_tags = load_tags()
     items = [
         {
@@ -349,28 +344,27 @@ def download_images_zip(paths: list[str]) -> io.BytesIO:
     return buf
 
 
-def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    """后台线程：每30分钟检查存储，空间低于阈值自动清理最旧图片"""
-    import shutil
-    min_free_mb = getattr(config, "image_min_free_mb", None)
-    if min_free_mb is None:
-        min_free_mb = 500
 
-    while not stop_event.wait(1800):  # 每30分钟
+def cleanup_expired_images(cutoff: float) -> dict:
+    removed = failed = 0
+    deleted = []
+    errors = []
+    for rel in image_storage_service.expired_paths(cutoff):
         try:
-            config.cleanup_old_images()
-            cleanup_image_thumbnails()
-            usage = shutil.disk_usage(config.images_dir)
-            free_mb = usage.free // (1024 * 1024)
-            if free_mb < min_free_mb:
-                logger.info({"event": "image_auto_cleanup", "free_mb": free_mb, "min_free_mb": min_free_mb})
-                result = delete_to_target(min_free_mb)
-                logger.info({"event": "image_auto_cleanup_done", **result})
-        except Exception:
-            pass
-
-
-def start_image_cleanup_scheduler(stop_event: threading.Event) -> threading.Thread:
-    t = threading.Thread(target=_auto_cleanup_worker, args=(stop_event,), daemon=True, name="image-cleanup")
-    t.start()
-    return t
+            if image_storage_service.delete(rel):
+                removed += 1
+            for thumbnail in (_thumbnail_path(rel), config.image_thumbnails_dir / _safe_relative_path(rel)):
+                thumbnail.unlink(missing_ok=True)
+            deleted.append(rel)
+            if len(deleted) >= 500:
+                remove_tags_many(deleted)
+                deleted.clear()
+        except Exception as exc:
+            failed += 1
+            if len(errors) < 5:
+                errors.append(f"{rel}: {exc}")
+    if deleted:
+        remove_tags_many(deleted)
+    _cleanup_empty_dirs(config.images_dir)
+    _cleanup_empty_dirs(config.image_thumbnails_dir)
+    return {"removed": removed, "failed": failed, "errors": errors}

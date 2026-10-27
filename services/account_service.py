@@ -1179,7 +1179,7 @@ class AccountService:
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
-        max_attempts = 20  # 防止无限循环
+        max_attempts = config.image_account_selection_max_attempts
         attempted_tokens: set[str] = set()
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(

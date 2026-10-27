@@ -11,9 +11,15 @@ from services.config import (
     DEFAULT_ANYIO_THREAD_LIMIT,
     DEFAULT_IMAGE_QUEUE_SIZE,
     DEFAULT_IMAGE_WORKERS,
+    DEFAULT_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS,
+    DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+    DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
     MAX_ANYIO_THREAD_LIMIT,
     MAX_IMAGE_QUEUE_SIZE,
     MAX_IMAGE_WORKERS,
+    MAX_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS,
+    MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+    MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
     ConfigStore,
 )
 from services.thread_pool import BoundedImageExecutor, apply_anyio_thread_limit
@@ -64,10 +70,31 @@ class AnyIOThreadPoolConfigTests(unittest.TestCase):
         with tmp_dir:
             self.assertEqual(store.image_workers, DEFAULT_IMAGE_WORKERS)
             self.assertEqual(store.image_queue_size, DEFAULT_IMAGE_QUEUE_SIZE)
+            self.assertEqual(
+                store.image_account_selection_max_attempts,
+                DEFAULT_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS,
+            )
+            self.assertEqual(
+                store.image_poll_timeout_account_switch_retries,
+                DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+            )
+            self.assertEqual(
+                store.image_text_reply_account_switch_retries,
+                DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+            )
 
-            updated = store.update({"image_workers": 1000, "image_queue_size": 0})
+            updated = store.update({
+                "image_workers": 1000,
+                "image_queue_size": 0,
+                "image_account_selection_max_attempts": 50,
+                "image_poll_timeout_account_switch_retries": 0,
+                "image_text_reply_account_switch_retries": 7,
+            })
             self.assertEqual(updated["image_workers"], 1000)
             self.assertEqual(updated["image_queue_size"], 0)
+            self.assertEqual(updated["image_account_selection_max_attempts"], 50)
+            self.assertEqual(updated["image_poll_timeout_account_switch_retries"], 0)
+            self.assertEqual(updated["image_text_reply_account_switch_retries"], 7)
 
             self.assertEqual(
                 store.update({"image_workers": MAX_IMAGE_WORKERS + 1})["image_workers"],
@@ -77,6 +104,28 @@ class AnyIOThreadPoolConfigTests(unittest.TestCase):
                 store.update({"image_queue_size": MAX_IMAGE_QUEUE_SIZE + 1})["image_queue_size"],
                 MAX_IMAGE_QUEUE_SIZE,
             )
+            self.assertEqual(
+                store.update({"image_account_selection_max_attempts": MAX_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS + 1})[
+                    "image_account_selection_max_attempts"
+                ],
+                MAX_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS,
+            )
+            self.assertEqual(
+                store.update({"image_poll_timeout_account_switch_retries": MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES + 1})[
+                    "image_poll_timeout_account_switch_retries"
+                ],
+                MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+            )
+            self.assertEqual(
+                store.update({"image_text_reply_account_switch_retries": MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES + 1})[
+                    "image_text_reply_account_switch_retries"
+                ],
+                MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+            )
+            self.assertEqual(store.update({"image_account_selection_max_attempts": 0})["image_account_selection_max_attempts"], 1)
+            self.assertEqual(store.update({"image_poll_timeout_account_switch_retries": "invalid"})[
+                "image_poll_timeout_account_switch_retries"
+            ], DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES)
 
     def test_image_executor_rejects_when_capacity_is_full(self) -> None:
         started = threading.Event()

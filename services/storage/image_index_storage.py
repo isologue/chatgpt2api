@@ -64,6 +64,11 @@ class ImageIndexStorage:
             row = connection.execute("SELECT data FROM images WHERE path=?", (path,)).fetchone()
             return json.loads(row[0]) if row else {}
 
+    def iter_items(self):
+        with self.connection() as connection:
+            for path, data in connection.execute("SELECT path, data FROM images"):
+                yield path, json.loads(data)
+
     def all(self):
         with self.connection() as connection:
             return {row[0]: json.loads(row[1]) for row in connection.execute("SELECT path, data FROM images")}

@@ -6,9 +6,9 @@ import json
 import os
 import sys
 from pathlib import Path
-import time
 
 from services.storage.base import StorageBackend
+from services.image_response_format import normalize_image_response_format
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -110,6 +110,14 @@ DEFAULT_IMAGE_WORKERS = 32
 MAX_IMAGE_WORKERS = 10000
 DEFAULT_IMAGE_QUEUE_SIZE = 128
 MAX_IMAGE_QUEUE_SIZE = 10000
+DEFAULT_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS = 20
+MAX_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS = 1000
+DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES = 4
+MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES = 100
+DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES = 3
+MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES = 100
+DEFAULT_MONITORING_REFRESH_INTERVAL_SECS = 3
+MAX_MONITORING_REFRESH_INTERVAL_SECS = 60
 
 
 def _normalize_anyio_thread_limit(value: object) -> int:
@@ -134,6 +142,30 @@ def _normalize_image_queue_size(value: object) -> int:
     except (OverflowError, TypeError, ValueError):
         normalized = DEFAULT_IMAGE_QUEUE_SIZE
     return min(MAX_IMAGE_QUEUE_SIZE, max(0, normalized))
+
+
+def _normalize_image_account_selection_max_attempts(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = DEFAULT_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS
+    return min(MAX_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS, max(1, normalized))
+
+
+def _normalize_image_account_switch_retries(value: object, default: int, maximum: int) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = default
+    return min(maximum, max(0, normalized))
+
+
+def _normalize_monitoring_refresh_interval_secs(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = DEFAULT_MONITORING_REFRESH_INTERVAL_SECS
+    return min(MAX_MONITORING_REFRESH_INTERVAL_SECS, max(1, normalized))
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -433,6 +465,51 @@ class ConfigStore:
         )
 
     @property
+    def image_account_selection_max_attempts(self) -> int:
+        return _normalize_image_account_selection_max_attempts(
+            self.data.get(
+                "image_account_selection_max_attempts",
+                DEFAULT_IMAGE_ACCOUNT_SELECTION_MAX_ATTEMPTS,
+            )
+        )
+
+    @property
+    def image_poll_timeout_account_switch_retries(self) -> int:
+        return _normalize_image_account_switch_retries(
+            self.data.get(
+                "image_poll_timeout_account_switch_retries",
+                DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+            ),
+            DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+            MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+        )
+
+    @property
+    def image_text_reply_account_switch_retries(self) -> int:
+        return _normalize_image_account_switch_retries(
+            self.data.get(
+                "image_text_reply_account_switch_retries",
+                DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+            ),
+            DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+            MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+        )
+
+    @property
+    def image_response_format(self) -> str:
+        return normalize_image_response_format(self.data.get("image_response_format", "url"))
+
+    @property
+    def image_allow_response_format_override(self) -> bool:
+        return bool(self.data.get("image_allow_response_format_override", True))
+
+    @property
+    def monitoring_refresh_interval_secs(self) -> int:
+        return _normalize_monitoring_refresh_interval_secs(
+            self.data.get("monitoring_refresh_interval_secs", DEFAULT_MONITORING_REFRESH_INTERVAL_SECS)
+        )
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -578,19 +655,10 @@ class ConfigStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
+    def get_retention_settings(self) -> dict:
+        from services.retention_settings import normalize_retention
+
+        return normalize_retention(self.data.get("data_retention"), self.image_retention_days)
 
     @property
     def base_url(self) -> str:
@@ -610,10 +678,17 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data["data_retention"] = self.get_retention_settings()
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["anyio_thread_limit"] = self.anyio_thread_limit
+        data["image_response_format"] = self.image_response_format
+        data["image_allow_response_format_override"] = self.image_allow_response_format_override
         data["image_workers"] = self.image_workers
         data["image_queue_size"] = self.image_queue_size
+        data["image_account_selection_max_attempts"] = self.image_account_selection_max_attempts
+        data["image_poll_timeout_account_switch_retries"] = self.image_poll_timeout_account_switch_retries
+        data["image_text_reply_account_switch_retries"] = self.image_text_reply_account_switch_retries
+        data["monitoring_refresh_interval_secs"] = self.monitoring_refresh_interval_secs
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
@@ -663,14 +738,50 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        if "data_retention" in data:
+            from services.retention_settings import normalize_retention
+
+            next_data["data_retention"] = normalize_retention(data["data_retention"], self.image_retention_days)
         next_data["anyio_thread_limit"] = _normalize_anyio_thread_limit(
             next_data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT)
         )
+        next_data["image_response_format"] = normalize_image_response_format(
+            next_data.get("image_response_format", self.image_response_format)
+        )
+        allow_override = next_data.get("image_allow_response_format_override", self.image_allow_response_format_override)
+        if not isinstance(allow_override, bool):
+            raise ValueError("image_allow_response_format_override must be a boolean")
+        next_data["image_allow_response_format_override"] = allow_override
         next_data["image_workers"] = _normalize_image_workers(
             next_data.get("image_workers", self.image_workers)
         )
         next_data["image_queue_size"] = _normalize_image_queue_size(
             next_data.get("image_queue_size", self.image_queue_size)
+        )
+        next_data["image_account_selection_max_attempts"] = _normalize_image_account_selection_max_attempts(
+            next_data.get(
+                "image_account_selection_max_attempts",
+                self.image_account_selection_max_attempts,
+            )
+        )
+        next_data["image_poll_timeout_account_switch_retries"] = _normalize_image_account_switch_retries(
+            next_data.get(
+                "image_poll_timeout_account_switch_retries",
+                self.image_poll_timeout_account_switch_retries,
+            ),
+            DEFAULT_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+            MAX_IMAGE_POLL_TIMEOUT_ACCOUNT_SWITCH_RETRIES,
+        )
+        next_data["image_text_reply_account_switch_retries"] = _normalize_image_account_switch_retries(
+            next_data.get(
+                "image_text_reply_account_switch_retries",
+                self.image_text_reply_account_switch_retries,
+            ),
+            DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+            MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES,
+        )
+        next_data["monitoring_refresh_interval_secs"] = _normalize_monitoring_refresh_interval_secs(
+            next_data.get("monitoring_refresh_interval_secs", self.monitoring_refresh_interval_secs)
         )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))

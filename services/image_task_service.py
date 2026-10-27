@@ -263,7 +263,7 @@ class ImageTaskService:
                 "mode": mode, "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")), "quality": _clean(payload.get("quality"), "auto"),
                 "created_at": now, "updated_at": now, "created_ts": time.time(),
-                "updated_ts": time.time(), "response_format": payload.get("response_format", "url"),
+                "updated_ts": time.time(), "base_url": payload.get("base_url", ""), "response_format": payload.get("response_format", "url"),
                 "request_body": json_safe(request_body) if request_body is not None else None,
             }
             created = self._store.create(key, task)
@@ -353,6 +353,9 @@ class ImageTaskService:
                 response_format=str(payload.get("response_format") or "url"),
                 request_body=request_body if request_body is not None else {key: value for key, value in payload.items() if key != "progress_callback"},
                 response_body=serialize_task_status(public_task) if public_task is not None else None,
+                switch_count=int(result.get("_switch_count") or 0),
+                account_time_ms=int(result.get("_account_time_ms") or 0),
+                account_switch_trace=result.get("_account_switch_trace") or [],
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
@@ -372,10 +375,14 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 status="failed",
                 error=error_message,
+                error_code=str(getattr(exc, "code", "")),
                 account_email=account_email,
                 response_format=str(payload.get("response_format") or "url"),
                 request_body=request_body if request_body is not None else {key: value for key, value in payload.items() if key != "progress_callback"},
                 response_body=serialize_task_status(public_task) if public_task is not None else None,
+                switch_count=int(getattr(exc, "switch_count", 0)),
+                account_time_ms=int(getattr(exc, "account_time_ms", 0)),
+                account_switch_trace=getattr(exc, "account_switch_trace", []),
             )
 
     def _task_for_log(self, key: str) -> dict[str, Any] | None:
@@ -393,11 +400,15 @@ class ImageTaskService:
         request_preview: str = "",
         status: str = "success",
         error: str = "",
+        error_code: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
         response_format: str = "url",
         request_body: object = None,
         response_body: object = None,
+        switch_count: int = 0,
+        account_time_ms: int = 0,
+        account_switch_trace: object = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -412,6 +423,7 @@ class ImageTaskService:
             "duration_ms": int((time.time() - started) * 1000),
             "status": status,
             "is_async": True,
+            "error_code": error_code,
             "response_format": response_format,
         }
         if request_preview:
@@ -426,6 +438,9 @@ class ImageTaskService:
             detail["account_email"] = account_email
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
+        detail["switch_count"] = max(0, int(switch_count))
+        detail["account_time_ms"] = max(0, int(account_time_ms))
+        detail["account_switch_trace"] = account_switch_trace if isinstance(account_switch_trace, list) else []
         try:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
@@ -485,7 +500,7 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
-            for field in ("progress", "conversation_id", "request_body", "response_format"):
+            for field in ("progress", "conversation_id", "request_body", "response_format", "base_url"):
                 if field in item:
                     task[field] = item[field]
             tasks[_task_key(owner, task_id)] = task
@@ -553,13 +568,18 @@ class ImageTaskService:
         model: str,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
+        from api.image_task_response import serialize_task_status
+
         started = time.time()
         backend = None
+        task = self._store.get(key)
+        response_format = str(task.get("response_format") or "url") if task else "url"
+        base_url = str(task.get("base_url") or "") if task else ""
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            backend = OpenAIBackendAPI()
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -579,16 +599,11 @@ class ImageTaskService:
                 {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._store.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                response_format,
+                base_url,
                 int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
@@ -598,6 +613,8 @@ class ImageTaskService:
                 model,
                 started,
                 "调用完成（续轮询）",
+                response_format=response_format,
+                response_body=serialize_task_status(self._task_for_log(key) or {}),
                 status="success",
                 urls=_collect_image_urls(data),
             )
@@ -611,6 +628,9 @@ class ImageTaskService:
                 model,
                 started,
                 "调用失败（续轮询）",
+                response_format=response_format,
+                response_body=serialize_task_status(self._task_for_log(key) or {}),
+                error_code=str(getattr(exc, "code", "")),
                 status="failed",
                 error=error_message,
             )

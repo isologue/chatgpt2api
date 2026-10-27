@@ -20,7 +20,7 @@ class ImageGenerationTaskRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
-    response_format: str = "url"
+    response_format: object = None
 
 
 class ResumePollRequest(BaseModel):

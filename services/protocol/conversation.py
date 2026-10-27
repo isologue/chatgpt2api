@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -66,6 +67,84 @@ def public_image_error_message(message: str) -> str:
     if any(item in lower for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
         return "The image generation request failed. Please try again later."
     return text or "The image generation request failed. Please try again later."
+
+
+class ImageAccountSwitchTracker:
+    """Track account attempts for one image request, including parallel n images."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._attempts: dict[int, list[dict[str, Any]]] = {}
+        self._active: dict[int, dict[str, Any]] = {}
+        self._pending_reasons: dict[int, str] = {}
+
+    @staticmethod
+    def _now() -> tuple[float, str]:
+        timestamp = time.time()
+        return timestamp, datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    def mark_switch(self, index: int, reason: str) -> None:
+        with self._lock:
+            self._pending_reasons[index] = str(reason or "账号不可用，切换账号")
+
+    def begin(self, index: int, account_name: str) -> None:
+        name = str(account_name or "未知账号").strip() or "未知账号"
+        with self._lock:
+            current = self._active.get(index)
+            if current and current["account_name"] == name:
+                return
+            if current:
+                self._finish_locked(index, self._pending_reasons.pop(index, "账号不可用，切换账号"))
+            started_ts, started_at = self._now()
+            attempt = {
+                "image_index": index,
+                "account_name": name,
+                "started_at": started_at,
+                "started_ts": started_ts,
+            }
+            self._attempts.setdefault(index, []).append(attempt)
+            self._active[index] = attempt
+
+    def finish(self, index: int, reason: str = "生成完成") -> None:
+        with self._lock:
+            if index in self._active:
+                self._finish_locked(index, reason)
+            self._pending_reasons.pop(index, None)
+
+    def _finish_locked(self, index: int, reason: str) -> None:
+        attempt = self._active.pop(index, None)
+        if not attempt:
+            return
+        ended_ts, ended_at = self._now()
+        attempt["ended_at"] = ended_at
+        attempt["duration_ms"] = max(0, int((ended_ts - float(attempt.pop("started_ts", ended_ts))) * 1000))
+        attempt["reason"] = str(reason or "生成完成")
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            for index in tuple(self._active):
+                self._finish_locked(index, "请求结束")
+            attempts = [attempt for index in sorted(self._attempts) for attempt in self._attempts[index]]
+            for attempt in attempts:
+                attempt.pop("started_ts", None)
+            switch_count = sum(max(0, len(items) - 1) for items in self._attempts.values())
+            account_time_ms = sum(int(item.get("duration_ms") or 0) for item in attempts)
+            return {
+                "switch_count": switch_count,
+                "account_time_ms": account_time_ms,
+                "account_switch_trace": [dict(item) for item in attempts],
+            }
+
+
+def _attach_account_switch_summary(
+        error: ImageGenerationError,
+        tracker: ImageAccountSwitchTracker | None,
+) -> ImageGenerationError:
+    """将失败请求的账号尝试轨迹挂到异常，确保失败日志也能分析切号耗时。"""
+    if tracker is not None:
+        for key, value in tracker.summary().items():
+            setattr(error, key, value)
+    return error
 
 
 def is_token_invalid_error(message: str) -> bool:
@@ -279,17 +358,14 @@ def format_image_result(
             if not b64_json:
                 continue
             image_data = base64.b64decode(b64_json)
-        revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json or base64.b64encode(image_data).decode("ascii"),
                 "url": save_image_bytes(image_data, base_url),
-                "revised_prompt": revised_prompt,
             })
         else:
             data.append({
                 "url": save_image_bytes(image_data, base_url),
-                "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
@@ -311,6 +387,7 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    account_switch_tracker: ImageAccountSwitchTracker | None = None
 
 
 @dataclass
@@ -1300,25 +1377,45 @@ def _generate_single_image(
         index: int,
         total: int,
 ) -> list[ImageOutput]:
+    tracker = request.account_switch_tracker
+    try:
+        outputs = _generate_single_image_impl(request, index, total)
+        if tracker:
+            tracker.finish(index, "生成成功" if any(item.kind == "result" for item in outputs) else "未生成图片")
+        return outputs
+    except Exception as exc:
+        if tracker:
+            tracker.finish(index, "生成失败")
+            for key, value in tracker.summary().items():
+                setattr(exc, key, value)
+        raise
+
+
+def _generate_single_image_impl(
+        request: ConversationRequest,
+        index: int,
+        total: int,
+) -> list[ImageOutput]:
     """为单张图片执行生成逻辑（含重试），返回结果列表。
 
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
     # 模型返回文本而非图片的最大重试次数
-    MAX_TEXT_REPLY_RETRIES = 3
+    max_text_reply_account_switch_retries = config.image_text_reply_account_switch_retries
     # TLS 连接错误最大重试次数
     MAX_TLS_RETRIES = 3
     # 连接超时错误最大重试次数（同账号短等待重试）
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
-    MAX_POLL_TIMEOUT_RETRIES = 4
+    max_poll_timeout_account_switch_retries = config.image_poll_timeout_account_switch_retries
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
+    tracker = request.account_switch_tracker
 
     while True:
         try:
@@ -1346,6 +1443,8 @@ def _generate_single_image(
         returned_result = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        if tracker:
+            tracker.begin(index, account_email or (token[:12] + "..."))
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
@@ -1367,11 +1466,14 @@ def _generate_single_image(
                     if account_email and not output.account_email:
                         output.account_email = account_email
                     if output.kind == "message" and request.message_as_error:
+                        from services.image_statistics import is_content_policy_rejection
+
+                        policy_rejection = is_content_policy_rejection(output.text)
                         raise ImageGenerationError(
-                            output.text or "Image generation was rejected by upstream policy.",
-                            status_code=400,
-                            error_type="invalid_request_error",
-                            code="content_policy_violation",
+                            output.text or "Upstream returned no image.",
+                            status_code=400 if policy_rejection else 502,
+                            error_type="invalid_request_error" if policy_rejection else "server_error",
+                            code="content_policy_violation" if policy_rejection else "no_image_generated",
                             account_email=account_email,
                             conversation_id=output.conversation_id,
                         )
@@ -1410,7 +1512,9 @@ def _generate_single_image(
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                if poll_timeout_retry_count <= max_poll_timeout_account_switch_retries:
+                    if tracker:
+                        tracker.mark_switch(index, "轮询超时后切换账号")
                     logger.warning({
                         "event": "image_poll_timeout_retry",
                         "request_token": token,
@@ -1454,7 +1558,9 @@ def _generate_single_image(
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
-                if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
+                if text_reply_retry_count <= max_text_reply_account_switch_retries:
+                    if tracker:
+                        tracker.mark_switch(index, "上游未生成图片后切换账号")
                     logger.warning({
                         "event": "image_model_text_reply_retry",
                         "request_token": token,
@@ -1504,6 +1610,8 @@ def _generate_single_image(
                     token = refreshed_token
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
+                if tracker:
+                    tracker.mark_switch(index, "账号令牌失效后切换账号")
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
@@ -1546,13 +1654,19 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
+    if request.account_switch_tracker is None:
+        request.account_switch_tracker = ImageAccountSwitchTracker()
+
     if not 1 <= request.n <= 4:
         raise ImageGenerationError("n must be between 1 and 4", status_code=400, error_type="invalid_request_error")
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
-        outputs = _generate_single_image(request, 1, 1)
-        for output in outputs:
-            yield output
+        try:
+            outputs = _generate_single_image(request, 1, 1)
+            for output in outputs:
+                yield output
+        except ImageGenerationError as exc:
+            raise _attach_account_switch_summary(exc, request.account_switch_tracker)
         return
 
     # 多张图片：根据配置选择并行或串行执行
@@ -1562,10 +1676,13 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "n": request.n,
             "model": request.model,
         })
-        for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n)
-            for output in outputs:
-                yield output
+        try:
+            for index in range(1, request.n + 1):
+                outputs = _generate_single_image(request, index, request.n)
+                for output in outputs:
+                    yield output
+        except ImageGenerationError as exc:
+            raise _attach_account_switch_summary(exc, request.account_switch_tracker)
         return
 
     logger.info({
@@ -1625,7 +1742,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not emitted:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+        error = ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+        raise _attach_account_switch_summary(error, request.account_switch_tracker)
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
@@ -1633,7 +1751,10 @@ def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, An
         yield output.to_chunk()
 
 
-def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
+def collect_image_outputs(
+        outputs: Iterable[ImageOutput],
+        tracker: ImageAccountSwitchTracker | None = None,
+) -> dict[str, Any]:
     created = None
     data: list[dict[str, Any]] = []
     message = ""
@@ -1657,4 +1778,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if tracker:
+        result.update({f"_{key}": value for key, value in tracker.summary().items()})
     return result

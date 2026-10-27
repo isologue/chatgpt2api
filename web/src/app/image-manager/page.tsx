@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
+import { DataRetentionCard } from "@/components/data-retention-card";
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { Badge } from "@/components/ui/badge";
@@ -295,54 +296,6 @@ function ImageManagerContent() {
         </div>
       </div>
 
-      {allTags.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium text-stone-500">
-            <Tag className="mr-1 inline size-3.5" />
-            标签筛选：
-          </span>
-          {allTags.map((tag) => {
-            const isPressing = pressingTag === tag;
-            return (
-              <span
-                key={tag}
-                className="relative inline-flex items-center"
-                onMouseDown={() => startTagPress(tag)}
-                onMouseUp={stopTagPress}
-                onMouseLeave={stopTagPress}
-                onTouchStart={() => startTagPress(tag)}
-                onTouchEnd={stopTagPress}
-              >
-                <button
-                  type="button"
-                  onClick={() => toggleFilterTag(tag)}
-                >
-                  <Badge
-                    variant={selectedTags.includes(tag) ? "default" : "outline"}
-                    className={`cursor-pointer rounded-md transition-all hover:opacity-80 ${isPressing ? "ring-2 ring-red-400 ring-offset-1" : ""}`}
-                  >
-                    {tag}
-                  </Badge>
-                </button>
-                {isPressing ? (
-                  <span className="pointer-events-none absolute inset-0 overflow-hidden rounded-md">
-                    <span className="absolute inset-0 animate-[grow_800ms_linear_forwards] rounded-md bg-red-400/20" />
-                  </span>
-                ) : null}
-              </span>
-            );
-          })}
-          {selectedTags.length > 0 ? (
-            <button type="button" onClick={() => setSelectedTags([])}>
-              <Badge variant="secondary" className="cursor-pointer rounded-md">
-                <X className="mr-0.5 size-3" />
-                清除
-              </Badge>
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-
       {/* Storage Stats Panel */}
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">
         {storage ? (
@@ -402,6 +355,56 @@ function ImageManagerContent() {
           </div>
         )}
       </div>
+
+      <DataRetentionCard kind="images" onComplete={() => { void loadImages(); void loadStorage(); }} />
+
+      {allTags.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-stone-500">
+            <Tag className="mr-1 inline size-3.5" />
+            标签筛选：
+          </span>
+          {allTags.map((tag) => {
+            const isPressing = pressingTag === tag;
+            return (
+              <span
+                key={tag}
+                className="relative inline-flex items-center"
+                onMouseDown={() => startTagPress(tag)}
+                onMouseUp={stopTagPress}
+                onMouseLeave={stopTagPress}
+                onTouchStart={() => startTagPress(tag)}
+                onTouchEnd={stopTagPress}
+              >
+                <button
+                  type="button"
+                  onClick={() => toggleFilterTag(tag)}
+                >
+                  <Badge
+                    variant={selectedTags.includes(tag) ? "default" : "outline"}
+                    className={`cursor-pointer rounded-md transition-all hover:opacity-80 ${isPressing ? "ring-2 ring-red-400 ring-offset-1" : ""}`}
+                  >
+                    {tag}
+                  </Badge>
+                </button>
+                {isPressing ? (
+                  <span className="pointer-events-none absolute inset-0 overflow-hidden rounded-md">
+                    <span className="absolute inset-0 animate-[grow_800ms_linear_forwards] rounded-md bg-red-400/20" />
+                  </span>
+                ) : null}
+              </span>
+            );
+          })}
+          {selectedTags.length > 0 ? (
+            <button type="button" onClick={() => setSelectedTags([])}>
+              <Badge variant="secondary" className="cursor-pointer rounded-md">
+                <X className="mr-0.5 size-3" />
+                清除
+              </Badge>
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Delete by date dialog */}
       <Dialog open={deleteMode === "byDate"} onOpenChange={() => setDeleteMode(null)}>

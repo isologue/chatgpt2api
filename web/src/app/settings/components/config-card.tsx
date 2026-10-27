@@ -24,9 +24,14 @@ export function ConfigCard() {
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setAnyioThreadLimit = useSettingsStore((state) => state.setAnyioThreadLimit);
+  const setImageResponseFormat = useSettingsStore((state) => state.setImageResponseFormat);
+  const setImageAllowResponseFormatOverride = useSettingsStore((state) => state.setImageAllowResponseFormatOverride);
   const setImageWorkers = useSettingsStore((state) => state.setImageWorkers);
   const setImageQueueSize = useSettingsStore((state) => state.setImageQueueSize);
-  const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
+  const setImageAccountSelectionMaxAttempts = useSettingsStore((state) => state.setImageAccountSelectionMaxAttempts);
+  const setImagePollTimeoutAccountSwitchRetries = useSettingsStore((state) => state.setImagePollTimeoutAccountSwitchRetries);
+  const setImageTextReplyAccountSwitchRetries = useSettingsStore((state) => state.setImageTextReplyAccountSwitchRetries);
+  const setMonitoringRefreshIntervalSecs = useSettingsStore((state) => state.setMonitoringRefreshIntervalSecs);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
@@ -91,6 +96,23 @@ export function ConfigCard() {
       <CardContent className="space-y-4 p-6">
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
           管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
+        </div>
+        <div className="space-y-4 rounded-xl border border-stone-200 bg-stone-50/60 p-4">
+          <h3 className="text-sm font-semibold text-stone-800">图片返回格式</h3>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">默认 response_format</label>
+            <Select value={config?.image_response_format || "url"} onValueChange={(value) => setImageResponseFormat(value as "url" | "b64_json")}>
+              <SelectTrigger className="w-full sm:w-72"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="url">URL 图片链接</SelectItem>
+                <SelectItem value="b64_json">Base64（b64_json）</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <label className="flex items-start gap-3 text-sm text-stone-700">
+            <Checkbox checked={config?.image_allow_response_format_override !== false} onCheckedChange={(checked) => setImageAllowResponseFormatOverride(checked === true)} />
+            <span>允许调用方指定 response_format<span className="mt-1 block text-xs leading-5 text-stone-500">勾选后优先使用请求参数，兼容 base64、b64_json、b64 等写法；未传参数使用默认格式。取消勾选后统一使用系统默认格式。同步和异步均生效，已创建的异步任务保持创建时的格式。</span></span>
+          </label>
         </div>
         <div className="rounded-xl border border-sky-200 bg-sky-50/60 p-4">
           <div className="mb-3">
@@ -165,6 +187,72 @@ export function ConfigCard() {
                 className="h-10 rounded-xl border-stone-200 bg-white"
               />
               <p className="text-xs leading-5 text-stone-500">用于鉴权、参数处理、任务提交和日志等同步环节；不决定上游生图线程数，默认 40，最大 1000。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">监控页刷新间隔（秒）</label>
+              <Input
+                type="number"
+                min={1}
+                max={60}
+                step={1}
+                value={String(config?.monitoring_refresh_interval_secs ?? 3)}
+                onChange={(event) => setMonitoringRefreshIntervalSecs(event.target.value)}
+                placeholder="3"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">监控页自动拉取数据的间隔，范围 1 到 60 秒，保存后生效。</p>
+            </div>
+          </div>
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4">
+            <div className="mb-3">
+              <h4 className="text-sm font-semibold text-stone-800">图片账号故障切换</h4>
+              <p className="mt-1 text-xs leading-5 text-stone-600">
+                统一控制生图遇到账号不可用、轮询超时或上游未返回图片时的账号切换上限。这里不包含同一账号的 TLS 和连接超时重试；保存后立即生效。
+              </p>
+            </div>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">账号预检最大尝试数</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  step={1}
+                  value={String(config?.image_account_selection_max_attempts ?? 20)}
+                  onChange={(event) => setImageAccountSelectionMaxAttempts(event.target.value)}
+                  placeholder="20"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs leading-5 text-stone-500">每次生图预检账号时最多尝试多少个候选账号，至少为 1，最大 1000。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">轮询超时切号次数</label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={String(config?.image_poll_timeout_account_switch_retries ?? 4)}
+                  onChange={(event) => setImagePollTimeoutAccountSwitchRetries(event.target.value)}
+                  placeholder="4"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs leading-5 text-stone-500">图片轮询超时后最多切换多少次账号，设置为 0 表示不因该原因切号。</p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">未生成图片切号次数</label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={String(config?.image_text_reply_account_switch_retries ?? 3)}
+                  onChange={(event) => setImageTextReplyAccountSwitchRetries(event.target.value)}
+                  placeholder="3"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                />
+                <p className="text-xs leading-5 text-stone-500">上游返回文本但没有图片时最多切换多少次账号，设置为 0 表示不因该原因切号。</p>
+              </div>
             </div>
           </div>
         </div>
@@ -256,16 +344,6 @@ export function ConfigCard() {
               </SelectContent>
             </Select>
             <p className="text-xs text-stone-500">模型名称以 -standard、-extended 或 -max 结尾时，模型后缀优先。</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片自动清理</label>
-            <Input
-              value={String(config?.image_retention_days || "")}
-              onChange={(event) => setImageRetentionDays(event.target.value)}
-              placeholder="30"
-              className="h-10 rounded-xl border-stone-200 bg-white"
-            />
-            <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片轮询超时</label>

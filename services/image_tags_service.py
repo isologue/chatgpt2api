@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import json
+from functools import wraps
+from threading import RLock
 from pathlib import Path
 
 from services.config import DATA_DIR
 
 TAGS_FILE = DATA_DIR / "image_tags.json"
+_TAGS_LOCK = RLock()
+
+
+def _locked(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        with _TAGS_LOCK:
+            return function(*args, **kwargs)
+    return call
 
 
 def _ensure_file() -> None:
@@ -14,6 +25,7 @@ def _ensure_file() -> None:
         TAGS_FILE.write_text("{}", encoding="utf-8")
 
 
+@_locked
 def load_tags() -> dict[str, list[str]]:
     _ensure_file()
     try:
@@ -23,6 +35,7 @@ def load_tags() -> dict[str, list[str]]:
     return data if isinstance(data, dict) else {}
 
 
+@_locked
 def save_tags(data: dict[str, list[str]]) -> None:
     _ensure_file()
     TAGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -32,6 +45,7 @@ def get_tags(image_rel: str) -> list[str]:
     return load_tags().get(image_rel, [])
 
 
+@_locked
 def set_tags(image_rel: str, tags: list[str]) -> list[str]:
     data = load_tags()
     cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
@@ -43,12 +57,14 @@ def set_tags(image_rel: str, tags: list[str]) -> list[str]:
     return cleaned
 
 
+@_locked
 def remove_tags(image_rel: str) -> None:
     data = load_tags()
     if data.pop(image_rel, None) is not None:
         save_tags(data)
 
 
+@_locked
 def delete_tag(tag: str) -> int:
     """从所有图片中删除指定标签，返回受影响的图片数。"""
     data = load_tags()
@@ -74,3 +90,15 @@ def get_all_tags() -> list[str]:
                 seen.add(t)
                 result.append(t)
     return result
+
+
+@_locked
+def remove_tags_many(paths: list[str]) -> None:
+    data = load_tags()
+    changed = False
+    for rel in paths:
+        if rel in data:
+            del data[rel]
+            changed = True
+    if changed:
+        save_tags(data)
