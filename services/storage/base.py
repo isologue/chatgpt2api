@@ -19,6 +19,21 @@ class StorageBackend(ABC):
 
     supports_incremental_account_writes = False
 
+    def list_accounts_page(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        query: str = "",
+        account_type: str = "all",
+        status: str = "all",
+    ) -> dict[str, Any] | None:
+        """Return a database-backed account page when the backend supports it.
+
+        Backends that store accounts as a JSON snapshot return ``None`` and let
+        AccountService use its compatibility implementation.
+        """
+        return None
+
     def save_account(self, account: dict[str, Any]) -> None:
         """Optional single-account persistence for backends that support it."""
         raise NotImplementedError

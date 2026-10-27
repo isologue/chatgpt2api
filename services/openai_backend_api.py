@@ -9,7 +9,7 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -23,6 +23,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
+from services.thread_pool import account_info_executor
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -333,20 +334,24 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
+
+        def fetch_with_isolated_session(method_name: str):
+            # curl_cffi sessions carry mutable cookies/connection state and are
+            # not shared across the three parallel requests. Keep the latency
+            # benefit of parallel probing without racing one Session instance.
+            backend = OpenAIBackendAPI(self.access_token)
+            try:
+                return getattr(backend, method_name)()
+            finally:
+                backend.close()
+
+        futures = [account_info_executor.submit(fetch_with_isolated_session, method_name)
+                   for method_name in ("_get_me", "_get_conversation_init", "_get_default_account")]
         try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+            me_payload, init_payload, default_account = [future.result() for future in futures]
+        finally:
+            # Do not close the session while sibling requests are still using it.
+            wait(futures)
 
         plan_type = str(default_account.get("plan_type") or "free")
 

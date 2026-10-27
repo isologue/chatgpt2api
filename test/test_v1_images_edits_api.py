@@ -17,6 +17,9 @@ DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('as
 
 class ImagesEditsApiTests(unittest.TestCase):
     def setUp(self):
+        self.identity_patcher = mock.patch.object(ai_module, "require_identity", return_value={"id": "admin", "role": "admin"})
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         self.handle_calls = []
 
         def fake_handle(payload):

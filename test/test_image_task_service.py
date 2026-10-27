@@ -67,6 +67,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+            service.close(timeout=2)
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -85,6 +86,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(result["items"], [])
             self.assertEqual(result["missing_ids"], ["private-task"])
+            service.close(timeout=2)
 
     def test_success_task_persists_to_new_service_instance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -106,6 +108,8 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["missing_ids"], [])
             self.assertEqual(result["items"][0]["status"], "success")
             self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
+            reloaded.close(timeout=2)
+            service.close(timeout=2)
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -143,6 +147,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+            service.close(timeout=2)
 
 
 if __name__ == "__main__":

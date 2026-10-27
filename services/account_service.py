@@ -6,13 +6,15 @@ import re
 import secrets
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Lock, Thread, local
 from typing import Any
 from urllib.parse import urlencode
 
+from services.account_persistence import AccountWriter, persisted
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -20,6 +22,55 @@ from services.log_service import (
 )
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+
+
+class _RevisionDict(dict):
+    """Dict that invalidates read-side account indexes after mutations."""
+
+    def __init__(self, *args, on_change=None, **kwargs):
+        self._on_change = on_change
+        super().__init__(*args, **kwargs)
+
+    def _changed(self) -> None:
+        if self._on_change is not None:
+            self._on_change()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._changed()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._changed()
+
+    def pop(self, key, *args):
+        existed = key in self
+        result = super().pop(key, *args)
+        if existed:
+            self._changed()
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        self._changed()
+        return result
+
+    def clear(self):
+        if self:
+            super().clear()
+            self._changed()
+
+    def update(self, *args, **kwargs):
+        if args or kwargs:
+            super().update(*args, **kwargs)
+            self._changed()
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        result = super().setdefault(key, default)
+        self._changed()
+        return result
 
 
 class AccountService:
@@ -50,13 +101,66 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
-        self._token_refresh_lock = Lock()
+        self._token_refresh_locks = [Lock() for _ in range(256)]
+        self._verification_locks = [Lock() for _ in range(256)]
+        self._write_context = local()
+        self._writer = AccountWriter(storage_backend)
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
-        self._accounts = self._load_accounts()
+        self._account_revision = 0
+        self._account_view_cache = None
+        self._accounts = _RevisionDict(
+            self._load_accounts(), on_change=self._mark_account_revision
+        )
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
+        self._ready_buckets: dict[tuple, OrderedDict] = {}
+        self._available_buckets: dict[tuple, OrderedDict] = {}
+        self._bucket_for_token: dict[str, tuple] = {}
+        self._verified_at: dict[str, float] = {}
+        self._scheduler_concurrency = max(1, int(config.image_account_concurrency or 1))
+        for token in self._accounts:
+            self._sync_candidate_locked(token)
+
+    def _mark_account_revision(self) -> None:
+        self._account_revision += 1
+        self._account_view_cache = None
+
+    def _account_view_locked(self) -> dict[str, Any]:
+        """Build the immutable read index used by account pages and stats."""
+        cache = getattr(self, "_account_view_cache", None)
+        revision = getattr(self, "_account_revision", None)
+        if cache is not None and cache.get("revision") == revision:
+            return cache
+
+        snapshot = tuple(self._accounts.values())
+        buckets: dict[tuple[str, str], list[dict]] = {}
+        summary = dict(total=len(snapshot), active=0, limited=0, abnormal=0, disabled=0, quota=0,
+                       total_success=0, total_fail=0)
+        types = set()
+        status_keys = {"正常": "active", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}
+        for item in snapshot:
+            item_type = str(item.get("type") or "Free")
+            item_status = str(item.get("status") or "")
+            types.add(item_type)
+            buckets.setdefault((item_type, item_status), []).append(item)
+            if key := status_keys.get(item_status):
+                summary[key] += 1
+            if item_status == "正常":
+                summary["quota"] += max(0, int(item.get("quota") or 0))
+            summary["total_success"] += int(item.get("success") or 0)
+            summary["total_fail"] += int(item.get("fail") or 0)
+
+        cache = {
+            "revision": revision,
+            "snapshot": snapshot,
+            "buckets": {key: tuple(items) for key, items in buckets.items()},
+            "summary": summary,
+            "types": tuple(sorted(types)),
+        }
+        self._account_view_cache = cache
+        return cache
 
     def _get_cumulative_file(self) -> Path:
         from services.config import DATA_DIR
@@ -150,20 +254,66 @@ class AccountService:
             if (normalized := self._normalize_account(item)) is not None
         }
 
+    def _log(self, *args, **kwargs):
+        after = getattr(self._write_context, "after", None)
+        if after is None:
+            log_service.add(*args, **kwargs)
+        else:
+            after.append(lambda: log_service.add(*args, **kwargs))
+
+    def _queue_write(self, changes=None, *, snapshot=None) -> None:
+        future = self._writer.submit(changes, snapshot=snapshot)
+        pending = getattr(self._write_context, "pending", None)
+        if pending is None:
+            raise RuntimeError("account writes must run in a persisted mutation")
+        pending.append(future)
+
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+        self._queue_write(snapshot=list(self._accounts.values()))
 
     def _save_account(self, account: dict) -> None:
+        self._sync_candidate_locked(account["access_token"])
+        self._image_slot_condition.notify(1)
         if getattr(self.storage, "supports_incremental_account_writes", False):
-            self.storage.save_account(account)
+            self._queue_write({account["access_token"]: dict(account)})
         else:
             self._save_accounts()
 
     def _delete_account(self, access_token: str) -> None:
+        self._sync_candidate_locked(access_token)
+        self._verified_at.pop(access_token, None)
         if getattr(self.storage, "supports_incremental_account_writes", False):
-            self.storage.delete_account(access_token)
+            self._queue_write({access_token: None})
         else:
             self._save_accounts()
+
+    def _sync_candidate_locked(self, token: str) -> None:
+        old_bucket = self._bucket_for_token.pop(token, None)
+        if old_bucket is not None:
+            self._ready_buckets[old_bucket].pop(token, None)
+            self._available_buckets[old_bucket].pop(token, None)
+            if not self._ready_buckets[old_bucket]:
+                self._ready_buckets.pop(old_bucket)
+                self._available_buckets.pop(old_bucket)
+        account = self._accounts.get(token)
+        if not self._is_image_account_available(account):
+            return
+        bucket = (self._normalize_account_type(account.get("type")),
+                  self._normalize_source_type(account.get("source_type")))
+        self._bucket_for_token[token] = bucket
+        self._ready_buckets.setdefault(bucket, OrderedDict())[token] = None
+        available = self._available_buckets.setdefault(bucket, OrderedDict())
+        capacity = min(self._scheduler_concurrency, max(0, int(account.get("quota") or 0)))
+        if self._image_inflight.get(token, 0) < capacity:
+            available[token] = None
+
+    def _matching_buckets(self, plan_type, source_type, plan_types):
+        for bucket, ready in self._ready_buckets.items():
+            sample = {"type": bucket[0], "source_type": bucket[1]}
+            if (self._account_matches_plan_type(sample, plan_type)
+                    and self._account_matches_any_plan_type(sample, plan_types)
+                    and self._account_matches_source_type(sample, source_type)):
+                yield bucket, ready
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -338,6 +488,7 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
+    @persisted
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -352,7 +503,7 @@ class AccountService:
             if account is not None:
                 self._accounts[resolved] = account
                 self._save_account(account)
-        log_service.add(
+        self._log(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
             {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
@@ -425,6 +576,7 @@ class AccountService:
         finally:
             session.close()
 
+    @persisted
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
@@ -463,16 +615,13 @@ class AccountService:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
             if rotated and self._accounts.get(old_token) is None:
-                if getattr(self.storage, "supports_incremental_account_writes", False):
-                    self.storage.delete_account(old_token)
-                    self.storage.save_account(account)
-                else:
-                    self._save_accounts()
+                self._delete_account(old_token)
+                self._save_account(account)
             else:
                 self._save_account(account)
             self._image_slot_condition.notify_all()
 
-        log_service.add(
+        self._log(
             LOG_TYPE_ACCOUNT,
             "refresh_token 已刷新 access_token",
             {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
@@ -482,7 +631,10 @@ class AccountService:
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        resolved_token, initial = self._get_account_for_token(access_token)
+        # A stable account identity keeps token rotation on the same refresh lock.
+        identity = str((initial or {}).get("id") or (initial or {}).get("email") or resolved_token)
+        with self._token_refresh_locks[hash(identity) % len(self._token_refresh_locks)]:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -542,7 +694,7 @@ class AccountService:
                     "status": "正常",
                 }, quiet=True)
 
-                log_service.add(
+                self._log(
                     LOG_TYPE_ACCOUNT,
                     "更新账号",
                     {
@@ -559,7 +711,7 @@ class AccountService:
                 # 登录失败
                 error_type = result.get("error", "")
                 if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
-                    log_service.add(
+                    self._log(
                         LOG_TYPE_ACCOUNT,
                         "更新账号",
                         {
@@ -576,7 +728,7 @@ class AccountService:
                         # 账号已删除/停用 → 标记为禁用
                         self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
                         account = self.get_account(access_token) or {}
-                        log_service.add(
+                        self._log(
                             LOG_TYPE_ACCOUNT,
                             "账号已停用-标记禁用",
                             {
@@ -594,7 +746,7 @@ class AccountService:
                         if progress_id:
                             self.update_relogin_progress(progress_id, access_token, "异常", error_type)
                 else:
-                    log_service.add(
+                    self._log(
                         LOG_TYPE_ACCOUNT,
                         "更新账号",
                         {
@@ -611,7 +763,7 @@ class AccountService:
                     if progress_id:
                         self.update_relogin_progress(progress_id, access_token, "异常", error_type)
         except Exception as exc:
-            log_service.add(
+            self._log(
                 LOG_TYPE_ACCOUNT,
                 "更新账号",
                 {
@@ -971,32 +1123,50 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        excluded = excluded_tokens or set()
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                concurrency = max(1, int(config.image_account_concurrency or 1))
+                if concurrency != self._scheduler_concurrency:
+                    self._scheduler_concurrency = concurrency
+                    for token in tuple(self._accounts):
+                        self._sync_candidate_locked(token)
+                buckets = list(self._matching_buckets(plan_type, source_type, plan_types))
+                if not any(len(ready) > len(excluded) or any(t not in excluded for t in ready)
+                           for _, ready in buckets):
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
                     )
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-                if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
-                    self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
-                    return access_token
+                # Rotate across account categories as well as within each category.
+                for offset in range(len(buckets)):
+                    bucket, _ = buckets[(self._index + offset) % len(buckets)]
+                    available = self._available_buckets[bucket]
+                    token = next((t for t in available if t not in excluded), None)
+                    if token is None:
+                        continue
+                    self._index += offset + 1
+                    self._image_inflight[token] = self._image_inflight.get(token, 0) + 1
+                    self._sync_candidate_locked(token)
+                    return token
                 self._image_slot_condition.wait(timeout=1.0)
 
+    def _release_image_slot_locked(self, access_token: str) -> str:
+        token = self._resolve_access_token_locked(access_token)
+        current = self._image_inflight.get(token, 0)
+        if current <= 1:
+            self._image_inflight.pop(token, None)
+        else:
+            self._image_inflight[token] = current - 1
+        self._sync_candidate_locked(token)
+        # One released slot needs only one waiter, avoiding a thundering herd.
+        self._image_slot_condition.notify(1)
+        return token
+
     def release_image_slot(self, access_token: str) -> None:
-        if not access_token:
-            return
-        with self._image_slot_condition:
-            access_token = self._resolve_access_token_locked(access_token)
-            current_inflight = int(self._image_inflight.get(access_token, 0))
-            if current_inflight <= 1:
-                self._image_inflight.pop(access_token, None)
-            else:
-                self._image_inflight[access_token] = current_inflight - 1
-            self._image_slot_condition.notify_all()
+        if access_token:
+            with self._image_slot_condition:
+                self._release_image_slot_locked(access_token)
 
     def get_available_access_token(
             self,
@@ -1020,7 +1190,22 @@ class AccountService:
             )
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                # A short successful-verification cache avoids a network preflight per image.
+                # The per-token lock prevents concurrent requests from stampeding the same
+                # account when its cache entry expires.
+                verification_lock = self._verification_locks[
+                    hash(access_token) % len(self._verification_locks)
+                ]
+                with verification_lock:
+                    with self._lock:
+                        cached = time.monotonic() - self._verified_at.get(
+                            access_token, float("-inf")
+                        ) < 30.0
+                    account = (
+                        self.get_account(access_token)
+                        if cached
+                        else self.fetch_remote_info(access_token, "get_available_access_token")
+                    )
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1078,6 +1263,7 @@ class AccountService:
             self._index += 1
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
+    @persisted
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
@@ -1100,7 +1286,7 @@ class AccountService:
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
+            self._log(LOG_TYPE_ACCOUNT, "自动移除异常账号",
                             {"source": event, "token": anonymize_token(access_token)})
         elif access_token:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
@@ -1133,47 +1319,87 @@ class AccountService:
         self, page: int = 1, page_size: int = 20, query: str = "",
         account_type: str = "all", status: str = "all",
     ) -> dict[str, Any]:
-        """基于调度器的实时内存快照分页，只复制当前页，不读取上游或全量序列化。"""
+        """Return a bounded management page.
+
+        Database backends query PostgreSQL/SQL indexes directly. Snapshot
+        backends keep the existing in-memory compatibility path.
+        """
+        native_page = getattr(getattr(self, "storage", None), "list_accounts_page", None)
+        if callable(native_page):
+            result = native_page(page, page_size, query, account_type, status)
+            if result is not None:
+                return {
+                    **result,
+                    "items": [self._account_page_item(item) for item in result.get("items", [])],
+                }
+
         with self._lock:
-            snapshot = tuple(self._accounts.values())
+            view = self._account_view_locked() if hasattr(self, "_account_view_locked") else None
+            if view is None:
+                snapshot = tuple(self._accounts.values())
+                view = {"snapshot": snapshot, "buckets": {}, "summary": None, "types": ()}
         query = query.strip().lower()
-        summary = dict(total=len(snapshot), active=0, limited=0, abnormal=0, disabled=0, quota=0)
-        status_keys = {"正常": "active", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}
-        types = set()
+        summary = view["summary"]
+        if summary is None:
+            snapshot = view["snapshot"]
+            summary = dict(total=len(snapshot), active=0, limited=0, abnormal=0, disabled=0, quota=0)
+            status_keys = {"正常": "active", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}
+            for item in snapshot:
+                if key := status_keys.get(item.get("status")):
+                    summary[key] += 1
+                if item.get("status") == "正常":
+                    summary["quota"] += max(0, int(item.get("quota") or 0))
         matched = []
-        for item in snapshot:
-            item_type = str(item.get("type") or "Free")
-            item_status = item.get("status")
-            types.add(item_type)
-            if key := status_keys.get(item_status):
-                summary[key] += 1
-            if item_status == "正常":
-                summary["quota"] += max(0, int(item.get("quota") or 0))
-            if query and query not in str(item.get("email") or "").lower():
-                continue
-            if account_type != "all" and item_type != account_type:
-                continue
-            if status != "all" and item_status != status:
-                continue
-            matched.append(item)
+        if not query and account_type != "all" and status != "all":
+            candidates = view["buckets"].get((account_type, status), ())
+        elif not query and account_type != "all":
+            candidates = tuple(
+                item for (item_type, _), items in view["buckets"].items()
+                if item_type == account_type for item in items
+            )
+        elif not query and status != "all":
+            candidates = tuple(
+                item for (_, item_status), items in view["buckets"].items()
+                if item_status == status for item in items
+            )
+        else:
+            candidates = view["snapshot"]
+        if not query:
+            matched = candidates
+        else:
+            for item in candidates:
+                item_type = str(item.get("type") or "Free")
+                item_status = item.get("status")
+                if query not in str(item.get("email") or "").lower():
+                    continue
+                if account_type != "all" and item_type != account_type:
+                    continue
+                if status != "all" and item_status != status:
+                    continue
+                matched.append(item)
         total = len(matched)
         page = min(max(1, page), max(1, (total + page_size - 1) // page_size))
         start = (page - 1) * page_size
-        # 列表采用白名单，避免大段上游元数据和凭证进入列表响应。
+        with self._lock:
+            items = [self._account_page_item(item) for item in matched[start:start + page_size]]
+        page_summary = {
+            key: summary[key]
+            for key in ("total", "active", "limited", "abnormal", "disabled", "quota")
+        }
+        return dict(items=items, total=total, page=page, page_size=page_size,
+                    summary=page_summary, types=list(view["types"]))
+
+    def _account_page_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Keep page responses bounded and free of account credentials."""
         fields = (
             "access_token", "email", "type", "status", "quota", "success", "fail", "proxy",
             "source_type", "restore_at", "created_at", "updated_at", "refresh_token_status",
             "last_token_refresh_at", "last_token_refresh_error", "last_token_refresh_error_at",
         )
-        with self._lock:
-            items = []
-            for item in matched[start:start + page_size]:
-                account = {key: item[key] for key in fields if key in item}
-                account["has_refresh_token"] = bool(item.get("refresh_token") or item.get("has_refresh_token"))
-                account["image_inflight"] = int(self._image_inflight.get(item.get("access_token"), 0))
-                items.append(account)
-        return dict(items=items, total=total, page=page, page_size=page_size,
-                    summary=summary, types=sorted(types))
+        account = {key: item[key] for key in fields if key in item}
+        account["has_refresh_token"] = bool(item.get("refresh_token") or item.get("has_refresh_token"))
+        account["image_inflight"] = int(self._image_inflight.get(item.get("access_token"), 0))
+        return account
 
     def list_account_tokens(self, status: str = "all") -> list[str]:
         """显式批量操作才读取全池 token，普通列表加载不调用。"""
@@ -1241,6 +1467,7 @@ class AccountService:
             for token in tokens
         ], include_items=include_items)
 
+    @persisted
     def _add_account_payloads(self, payloads: list[dict], *, include_items: bool = True) -> dict:
         deduped: dict[str, dict] = {}
         for payload in payloads:
@@ -1287,16 +1514,20 @@ class AccountService:
                 )
                 if account is not None:
                     self._accounts[access_token] = account
-            self._save_cumulative_total()
-            if callable(batch_save := getattr(self.storage, "save_account_batch", None)):
-                batch_save([self._accounts[token] for token in deduped if token in self._accounts])
+            self._write_context.after.append(self._save_cumulative_total)
+            for token in deduped:
+                self._sync_candidate_locked(token)
+            if getattr(self.storage, "supports_incremental_account_writes", False):
+                self._queue_write({token: dict(self._accounts[token]) for token in deduped if token in self._accounts})
             else:
                 self._save_accounts()
+            self._image_slot_condition.notify_all()
             items = [dict(item) for item in self._accounts.values()] if include_items else []
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
+            self._log(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
         return {"added": added, "skipped": skipped, **({"items": items} if include_items else {})}
 
+    @persisted
     def delete_accounts(self, tokens: list[str], *, include_items: bool = True) -> dict:
         target_set = set(token for token in tokens if token)
         if not target_set:
@@ -1316,17 +1547,19 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                if callable(batch_delete := getattr(self.storage, "delete_account_batch", None)):
-                    batch_delete(list(target_set))
-                elif getattr(self.storage, "supports_incremental_account_writes", False):
-                    for token in target_set:
-                        self.storage.delete_account(token)
+                for token in target_set:
+                    self._sync_candidate_locked(token)
+                    self._verified_at.pop(token, None)
+                if getattr(self.storage, "supports_incremental_account_writes", False):
+                    self._queue_write({token: None for token in target_set})
                 else:
                     self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                self._image_slot_condition.notify_all()
+                self._log(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()] if include_items else []
         return {"removed": removed, **({"items": items} if include_items else {})}
 
+    @persisted
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
@@ -1341,12 +1574,12 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._delete_account(access_token)
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                self._log(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
             self._save_account(account)
             if not quiet:
-                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
+                self._log(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
             return dict(account)
         return None
@@ -1380,6 +1613,7 @@ class AccountService:
             return True
         return False
 
+    @persisted
     def _record_invalid_token_seen(
         self,
         access_token: str,
@@ -1404,7 +1638,7 @@ class AccountService:
                 self._accounts[access_token] = account
                 self._save_account(account)
             if should_defer:
-                log_service.add(
+                self._log(
                     LOG_TYPE_ACCOUNT,
                     "暂缓标记异常账号",
                     {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
@@ -1412,12 +1646,14 @@ class AccountService:
                 return False
         return True
 
+    @persisted
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
+        with self._image_slot_condition:
+            access_token = self._release_image_slot_locked(access_token)
+            if not success:
+                self._verified_at.pop(access_token, None)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
@@ -1439,7 +1675,7 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._delete_account(access_token)
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                self._log(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
             self._save_account(account)
@@ -1492,7 +1728,11 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        account = self.update_account(active_token, result, quiet=True)
+        if account:
+            with self._lock:
+                self._verified_at[account["access_token"]] = time.monotonic()
+        return account
 
     # ---- 刷新进度追踪 ----
 
@@ -1800,29 +2040,38 @@ class AccountService:
 
     def get_stats(self) -> dict:
         with self._lock:
-            items = list(self._accounts.values())
-        total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
-        abnormal = sum(1 for a in items if a.get("status") == "异常")
-        disabled = sum(1 for a in items if a.get("status") == "禁用")
-        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
-        total_success = sum(int(a.get("success") or 0) for a in items)
-        total_fail = sum(int(a.get("fail") or 0) for a in items)
-        by_type = {}
-        for a in items:
-            t = a.get("type", "unknown")
-            by_type[t] = by_type.get(t, 0) + 1
+            view = self._account_view_locked() if hasattr(self, "_account_view_locked") else None
+            if view is None:
+                items = list(self._accounts.values())
+                summary = {
+                    "total": len(items),
+                    "active": sum(1 for a in items if a.get("status") == "正常"),
+                    "limited": sum(1 for a in items if a.get("status") == "限流"),
+                    "abnormal": sum(1 for a in items if a.get("status") == "异常"),
+                    "disabled": sum(1 for a in items if a.get("status") == "禁用"),
+                    "quota": sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常"),
+                    "total_success": sum(int(a.get("success") or 0) for a in items),
+                    "total_fail": sum(int(a.get("fail") or 0) for a in items),
+                }
+                by_type = {}
+                for item in items:
+                    item_type = item.get("type", "unknown")
+                    by_type[item_type] = by_type.get(item_type, 0) + 1
+            else:
+                summary = view["summary"]
+                by_type = {}
+                for (item_type, _), items in view["buckets"].items():
+                    by_type[item_type] = by_type.get(item_type, 0) + len(items)
         return {
-            "total": total,
+            "total": summary["total"],
             "cumulative_total": self._cumulative_total,
-            "active": active,
-            "limited": limited,
-            "abnormal": abnormal,
-            "disabled": disabled,
-            "total_quota": total_quota,
-            "total_success": total_success,
-            "total_fail": total_fail,
+            "active": summary["active"],
+            "limited": summary["limited"],
+            "abnormal": summary["abnormal"],
+            "disabled": summary["disabled"],
+            "total_quota": summary["quota"],
+            "total_success": summary["total_success"],
+            "total_fail": summary["total_fail"],
             "by_type": by_type,
         }
 

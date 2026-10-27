@@ -25,7 +25,7 @@ from services.image_storage_service import ImageStorageError, image_storage_serv
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
-from services.thread_pool import apply_anyio_thread_limit
+from services.thread_pool import apply_anyio_thread_limit, configure_image_executors
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -93,6 +93,7 @@ def create_router(app_version: str) -> APIRouter:
         try:
             updated_config = config.update(body.model_dump(mode="python"))
             await apply_anyio_thread_limit(config.anyio_thread_limit)
+            configure_image_executors(config.image_workers, config.image_queue_size)
             return {"config": updated_config}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc

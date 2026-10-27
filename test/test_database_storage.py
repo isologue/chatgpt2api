@@ -203,6 +203,74 @@ def test_account_batch_chunking(tmp_path):
     assert len(backend.load_accounts()) == 100
 
 
+def test_account_page_filters_and_paginates_from_index_columns(tmp_path):
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'page.db'}")
+    backend.save_account_batch([
+        {
+            "access_token": f"token-{i}",
+            "email": f"user{i:04d}@example.test",
+            "type": "Plus" if i % 2 else "Free",
+            "status": "异常" if i % 4 == 0 else "正常",
+            "quota": 3,
+            "refresh_token": "secret",
+        }
+        for i in range(300)
+    ])
+
+    result = backend.list_accounts_page(
+        page=2,
+        page_size=10,
+        query="USER02",
+        account_type="Free",
+        status="异常",
+    )
+
+    assert result["total"] == 25
+    assert len(result["items"]) == 10
+    assert result["items"][0]["email"].startswith("user0240")
+    assert result["summary"] == {
+        "total": 300,
+        "active": 225,
+        "limited": 0,
+        "abnormal": 75,
+        "disabled": 0,
+        "quota": 675,
+    }
+    assert result["types"] == ["Free", "Plus"]
+
+
+def test_legacy_account_rows_are_backfilled_into_index_columns(tmp_path):
+    from sqlalchemy import text
+
+    database_url = f"sqlite:///{tmp_path / 'legacy.db'}"
+    backend = DatabaseStorageBackend(database_url)
+    backend.engine.dispose()
+    with backend.engine.begin() as connection:
+        connection.execute(text("DROP TABLE accounts"))
+        connection.execute(text(
+            "CREATE TABLE accounts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "access_token VARCHAR(2048) NOT NULL UNIQUE, "
+            "data TEXT NOT NULL)"
+        ))
+        connection.execute(text(
+            "INSERT INTO accounts (access_token, data) VALUES "
+            "('legacy-token', :data)"
+        ), {"data": json.dumps({
+            "access_token": "legacy-token",
+            "email": "legacy@example.test",
+            "type": "Plus",
+            "status": "正常",
+            "quota": 9,
+        })})
+
+    migrated = DatabaseStorageBackend(database_url)
+    result = migrated.list_accounts_page(query="legacy@example")
+    assert result["total"] == 1
+    assert result["items"][0]["type"] == "Plus"
+    assert result["items"][0]["quota"] == 9
+
+
 def test_service_import_and_delete_use_batch_without_full_snapshot(tmp_path):
     from unittest.mock import Mock, patch
     from services.account_service import AccountService

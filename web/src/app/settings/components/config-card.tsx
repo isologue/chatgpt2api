@@ -24,9 +24,12 @@ export function ConfigCard() {
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setAnyioThreadLimit = useSettingsStore((state) => state.setAnyioThreadLimit);
+  const setImageWorkers = useSettingsStore((state) => state.setImageWorkers);
+  const setImageQueueSize = useSettingsStore((state) => state.setImageQueueSize);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
   const setImageRemoveConversationAlways = useSettingsStore((state) => state.setImageRemoveConversationAlways);
@@ -89,6 +92,82 @@ export function ConfigCard() {
         <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
           管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
         </div>
+        <div className="rounded-xl border border-sky-200 bg-sky-50/60 p-4">
+          <div className="mb-3">
+            <h3 className="text-sm font-semibold text-stone-800">图片生成并发</h3>
+            <p className="mt-1 text-xs leading-5 text-stone-600">
+              控制图片任务同时执行和排队的数量。当前最多同时执行 {Number(config?.image_workers || 32)} 个任务，额外排队 {Number(config?.image_queue_size || 0)} 个；队列满后返回 429。保存后立即生效。
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">同时执行的图片任务</label>
+              <Input
+                type="number"
+                min={1}
+                max={10000}
+                step={1}
+                value={String(config?.image_workers ?? 32)}
+                onChange={(event) => setImageWorkers(event.target.value)}
+                placeholder="32"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">例如设置为 1000，表示最多允许 1000 个图片任务同时进入执行阶段。受服务器、账号数量和上游限制影响。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">图片任务等待队列</label>
+              <Input
+                type="number"
+                min={0}
+                max={10000}
+                step={1}
+                value={String(config?.image_queue_size ?? 128)}
+                onChange={(event) => setImageQueueSize(event.target.value)}
+                placeholder="128"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">执行线程全部占用后允许等待的任务数。设置为 0 表示没有等待队列，满载时直接返回 429。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">单账号图片并发</label>
+              <Input
+                type="number"
+                min={1}
+                max={10000}
+                step={1}
+                value={String(config?.image_account_concurrency ?? 1)}
+                onChange={(event) => setImageAccountConcurrency(event.target.value)}
+                placeholder="1"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">每个账号允许同时处理的图片请求数。账号数量少或设置为 1 时，会限制实际生图速度。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={Boolean(config?.image_parallel_generation !== false)}
+                  onCheckedChange={(checked) => setImageParallelGeneration(Boolean(checked))}
+                />
+                单次请求的多张图片并行生成
+              </label>
+              <p className="text-xs leading-5 text-stone-500">开启后，同一个请求中的多张图片会并行请求上游；关闭后会逐张生成。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">图片请求接入线程并发</label>
+              <Input
+                type="number"
+                min={1}
+                max={1000}
+                step={1}
+                value={String(config?.anyio_thread_limit ?? 40)}
+                onChange={(event) => setAnyioThreadLimit(event.target.value)}
+                placeholder="40"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">用于鉴权、参数处理、任务提交和日志等同步环节；不决定上游生图线程数，默认 40，最大 1000。</p>
+            </div>
+          </div>
+        </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
             <label className="text-sm text-stone-700">账号刷新间隔</label>
@@ -99,20 +178,6 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm text-stone-700">同步线程池并发上限</label>
-            <Input
-              type="number"
-              min={1}
-              max={1000}
-              step={1}
-              value={String(config?.anyio_thread_limit ?? 40)}
-              onChange={(event) => setAnyioThreadLimit(event.target.value)}
-              placeholder="40"
-              className="h-10 rounded-xl border-stone-200 bg-white"
-            />
-            <p className="text-xs leading-5 text-stone-500">默认 40，限制 FastAPI/Starlette 通过 AnyIO 执行的同步任务并发线程数；不限制纯异步请求或单独创建的线程池。最大 1000，调高会增加 CPU 和内存压力，保存后即时生效。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>
@@ -211,16 +276,6 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm text-stone-700">单账号图片并发</label>
-            <Input
-              value={String(config?.image_account_concurrency || "")}
-              onChange={(event) => setImageAccountConcurrency(event.target.value)}
-              placeholder="1"
-              className="h-10 rounded-xl border-stone-200 bg-white"
-            />
-            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

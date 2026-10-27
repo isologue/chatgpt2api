@@ -4,15 +4,17 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from services.storage.image_task_storage import ImageTaskStorage
+from services.thread_pool import image_executor
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, json_safe, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
-from api.image_task_response import serialize_task_status
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -107,20 +109,53 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        task_storage: ImageTaskStorage | None = None,
+        executor=None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
-        self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._store = task_storage or ImageTaskStorage(path)
+        self._executor = executor or image_executor
+        self._last_cleanup = 0.0
+        self._futures = set()
+        self._closed = False
+        self._store.import_legacy(path, self._load_locked)
+        self._store.recover(_now_iso(), time.time())
+        self._cleanup_locked()
+
+    def close(self, timeout: float | None = None) -> None:
+        """Stop accepting tasks and drain this service's jobs before closing storage."""
         with self._lock:
-            self._tasks = self._load_locked()
-            changed = self._recover_unfinished_locked()
-            changed = self._cleanup_locked() or changed
-            if changed:
-                self._save_locked()
+            self._closed = True
+            futures = tuple(self._futures)
+        _, pending = wait(futures, timeout=timeout)
+        if pending:
+            # Do not dispose a locally-owned SQLite engine while a worker can
+            # still be using it. The service remains closed and can be drained
+            # by a later shutdown call.
+            return
+        close_storage = getattr(self._store, "close", None)
+        if callable(close_storage):
+            close_storage()
+
+    def _schedule_reserved(self, handler, *args):
+        future = self._executor.submit_reserved(handler, *args)
+        # Register before attaching the callback. A very short task can finish
+        # between submit() and add_done_callback(), otherwise close() may wait
+        # on a stale future forever while the completed future remains tracked.
+        with self._lock:
+            self._futures.add(future)
+
+        def done(completed):
+            with self._lock:
+                self._futures.discard(completed)
+
+        future.add_done_callback(done)
+        return future
 
     def submit_generation(
         self,
@@ -179,26 +214,18 @@ class ImageTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
-        with self._lock:
-            if self._cleanup_locked():
-                self._save_locked()
-            items = []
-            missing_ids = []
-            for task_id in requested_ids:
-                task = self._tasks.get(_task_key(owner, task_id))
-                if task is None:
-                    missing_ids.append(task_id)
-                else:
-                    items.append(_public_task(task))
-            if not requested_ids:
-                items = [
-                    _public_task(task)
-                    for task in self._tasks.values()
-                    if task.get("owner_id") == owner
-                ]
-                items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-                missing_ids = []
-            return {"items": items, "missing_ids": missing_ids}
+        self._cleanup_locked()
+        items = []
+        missing_ids = []
+        for task_id in requested_ids:
+            task = self._store.get(_task_key(owner, task_id))
+            if task is None:
+                missing_ids.append(task_id)
+            else:
+                items.append(_public_task(task))
+        if not requested_ids:
+            items = [_public_task(task) for task in self._store.list_owner(owner)]
+        return {"items": items, "missing_ids": missing_ids}
 
     def _submit(
         self,
@@ -214,41 +241,60 @@ class ImageTaskService:
             raise ValueError("client_task_id is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
-        now = _now_iso()
-        should_start = False
+        self._cleanup_locked()
+        reserved = False
+        scheduling_started = False
         with self._lock:
-            cleaned = self._cleanup_locked()
-            task = self._tasks.get(key)
-            if task is not None:
-                if cleaned:
-                    self._save_locked()
-                return _public_task(task)
+            if self._closed:
+                raise RuntimeError("image task service is closed")
+            self._executor.reserve()
+            reserved = True
+        try:
+            # The database has its own idempotency constraint. Do not hold the
+            # service lock while waiting on a database transaction, so polling
+            # and unrelated task submissions remain responsive.
+            existing = self._store.get(key)
+            if existing is not None:
+                self._executor.release()
+                return _public_task(existing)
+            now = _now_iso()
             task = {
-                "id": task_id,
-                "owner_id": owner,
-                "status": TASK_STATUS_QUEUED,
-                "mode": mode,
-                "model": _clean(payload.get("model"), "gpt-image-2"),
-                "size": _clean(payload.get("size")),
-                "quality": _clean(payload.get("quality"), "auto"),
-                "created_at": now,
-                "updated_at": now,
-                "created_ts": time.time(),
+                "id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED,
+                "mode": mode, "model": _clean(payload.get("model"), "gpt-image-2"),
+                "size": _clean(payload.get("size")), "quality": _clean(payload.get("quality"), "auto"),
+                "created_at": now, "updated_at": now, "created_ts": time.time(),
+                "updated_ts": time.time(), "response_format": payload.get("response_format", "url"),
                 "request_body": json_safe(request_body) if request_body is not None else None,
             }
-            self._tasks[key] = task
-            self._save_locked()
-            should_start = True
-
-        if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2"), request_body),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
-            )
-            thread.start()
-        return _public_task(task)
+            created = self._store.create(key, task)
+            if not created:
+                self._executor.release()
+                return _public_task(self._store.get(key))
+            response = _public_task(task)
+            try:
+                # submit_reserved() releases the slot itself if executor.submit()
+                # fails; after it succeeds, the future callback owns the slot.
+                scheduling_started = True
+                self._schedule_reserved(
+                    self._run_task,
+                    key,
+                    mode,
+                    payload,
+                    dict(identity),
+                    task["model"],
+                    request_body,
+                )
+            except BaseException as exc:
+                self._update_task(key, status=TASK_STATUS_ERROR, error=str(exc))
+                raise
+        except BaseException:
+            # A failed create or scheduling attempt must not leak the queue slot.
+            # A full queue never reserved a slot, and submit_reserved() handles
+            # failures after scheduling has started.
+            if reserved and not scheduling_started:
+                self._executor.release()
+            raise
+        return response
 
     def _run_task(
         self,
@@ -259,13 +305,16 @@ class ImageTaskService:
         model: str,
         request_body: object = None,
     ) -> None:
+        from api.image_task_response import serialize_task_status
+
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
+            updates = {"progress": step}
             if step == "image_stream_resolve_start":
-                self._update_task(key, started_ts=time.time())
-            self._update_task(key, progress=step)
+                updates["started_ts"] = time.time()
+            self._update_task(key, **updates)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -330,9 +379,8 @@ class ImageTaskService:
             )
 
     def _task_for_log(self, key: str) -> dict[str, Any] | None:
-        with self._lock:
-            task = self._tasks.get(key)
-            return _public_task(task) if task is not None else None
+        task = self._store.get(key)
+        return _public_task(task) if task else None
 
     def _log_call(
         self,
@@ -384,22 +432,18 @@ class ImageTaskService:
             pass
 
     def _update_task(self, key: str, **updates: Any) -> None:
-        with self._lock:
-            task = self._tasks.get(key)
-            if task is None:
-                return
-            task.update(updates)
-            task["updated_at"] = _now_iso()
-            task["updated_ts"] = time.time()
-            self._save_locked()
+        self._store.update(key, {**updates, "updated_at": _now_iso(), "updated_ts": time.time()})
+
+    def export_tasks(self) -> dict[str, Any]:
+        return self._store.export()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise RuntimeError(f"cannot migrate legacy image tasks: {self.path.name}") from exc
         raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
         if not isinstance(raw_items, list):
             return {}
@@ -441,39 +485,23 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            for field in ("progress", "conversation_id", "request_body", "response_format"):
+                if field in item:
+                    task[field] = item[field]
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
-    def _save_locked(self) -> None:
-        items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
-
-    def _recover_unfinished_locked(self) -> bool:
-        changed = False
-        for task in self._tasks.values():
-            if task.get("status") in UNFINISHED_STATUSES:
-                task["status"] = TASK_STATUS_ERROR
-                task["error"] = "服务已重启，未完成的图片任务已中断"
-                task["updated_at"] = _now_iso()
-                changed = True
-        return changed
-
-    def _cleanup_locked(self) -> bool:
-        try:
-            retention_days = max(1, int(self.retention_days_getter()))
-        except Exception:
-            retention_days = 30
-        cutoff = time.time() - retention_days * 86400
-        removed_keys = [
-            key
-            for key, task in self._tasks.items()
-            if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
-        ]
-        for key in removed_keys:
-            self._tasks.pop(key, None)
-        return bool(removed_keys)
+    def _cleanup_locked(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last_cleanup < 60.0:
+                return
+            try:
+                retention_days = max(1, int(self.retention_days_getter()))
+            except Exception:
+                retention_days = 30
+            self._store.cleanup(time.time() - retention_days * 86400)
+            self._last_cleanup = now
 
     def resume_poll(
         self,
@@ -485,7 +513,7 @@ class ImageTaskService:
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
         with self._lock:
-            task = self._tasks.get(key)
+            task = self._store.get(key)
             if task is None:
                 raise ValueError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
@@ -498,18 +526,22 @@ class ImageTaskService:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
-            # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
-
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
-        )
-        thread.start()
-        return _public_task(task)
+            if self._closed:
+                raise RuntimeError("image task service is closed")
+            self._executor.reserve()
+            try:
+                self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            except BaseException:
+                self._executor.release()
+                raise
+            response = _public_task({**task, "status": TASK_STATUS_RUNNING, "error": ""})
+            try:
+                self._schedule_reserved(self._run_resume_poll, key, conversation_id,
+                    extra_timeout_secs, dict(identity), mode, model)
+            except BaseException as exc:
+                self._update_task(key, status=TASK_STATUS_ERROR, error=str(exc))
+                raise
+        return response
 
     def _run_resume_poll(
         self,
@@ -549,7 +581,7 @@ class ImageTaskService:
             ]
             # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
             with self._lock:
-                task = self._tasks.get(key)
+                task = self._store.get(key)
                 quality = _clean(task.get("quality"), "auto") if task else "auto"
                 size = _clean(task.get("size")) if task else None
             data = format_image_result(
@@ -587,4 +619,8 @@ class ImageTaskService:
                 backend.close()
 
 
-image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")
+_account_backend = config.get_storage_backend()
+image_task_service = ImageTaskService(
+    DATA_DIR / "image_tasks.json",
+    task_storage=ImageTaskStorage(DATA_DIR / "image_tasks.json", engine=getattr(_account_backend, "engine", None)),
+)

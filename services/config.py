@@ -106,6 +106,10 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
 
 DEFAULT_ANYIO_THREAD_LIMIT = 40
 MAX_ANYIO_THREAD_LIMIT = 1000
+DEFAULT_IMAGE_WORKERS = 32
+MAX_IMAGE_WORKERS = 10000
+DEFAULT_IMAGE_QUEUE_SIZE = 128
+MAX_IMAGE_QUEUE_SIZE = 10000
 
 
 def _normalize_anyio_thread_limit(value: object) -> int:
@@ -114,6 +118,22 @@ def _normalize_anyio_thread_limit(value: object) -> int:
     except (OverflowError, TypeError, ValueError):
         normalized = DEFAULT_ANYIO_THREAD_LIMIT
     return min(MAX_ANYIO_THREAD_LIMIT, max(1, normalized))
+
+
+def _normalize_image_workers(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = DEFAULT_IMAGE_WORKERS
+    return min(MAX_IMAGE_WORKERS, max(1, normalized))
+
+
+def _normalize_image_queue_size(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        normalized = DEFAULT_IMAGE_QUEUE_SIZE
+    return min(MAX_IMAGE_QUEUE_SIZE, max(0, normalized))
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -401,6 +421,18 @@ class ConfigStore:
         return _normalize_anyio_thread_limit(self.data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT))
 
     @property
+    def image_workers(self) -> int:
+        return _normalize_image_workers(
+            self.data.get("image_workers", os.getenv("CHATGPT2API_IMAGE_WORKERS", DEFAULT_IMAGE_WORKERS))
+        )
+
+    @property
+    def image_queue_size(self) -> int:
+        return _normalize_image_queue_size(
+            self.data.get("image_queue_size", os.getenv("CHATGPT2API_IMAGE_QUEUE_SIZE", DEFAULT_IMAGE_QUEUE_SIZE))
+        )
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -580,6 +612,8 @@ class ConfigStore:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["anyio_thread_limit"] = self.anyio_thread_limit
+        data["image_workers"] = self.image_workers
+        data["image_queue_size"] = self.image_queue_size
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
@@ -631,6 +665,12 @@ class ConfigStore:
         next_data.update(dict(data or {}))
         next_data["anyio_thread_limit"] = _normalize_anyio_thread_limit(
             next_data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT)
+        )
+        next_data["image_workers"] = _normalize_image_workers(
+            next_data.get("image_workers", self.image_workers)
+        )
+        next_data["image_queue_size"] = _normalize_image_queue_size(
+            next_data.get("image_queue_size", self.image_queue_size)
         )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))

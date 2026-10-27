@@ -58,6 +58,7 @@ class V1AsyncImageTaskApiTests(unittest.TestCase):
 
     def tearDown(self):
         self.release.set()
+        self.service.close()
         self.temp_dir.cleanup()
 
     def create_task(self, task_id: str, prompt: str):

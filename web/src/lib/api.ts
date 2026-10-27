@@ -176,6 +176,8 @@ export type SettingsConfig = {
   };
   refresh_account_interval_minute?: number | string;
   anyio_thread_limit?: number | string;
+  image_workers?: number | string;
+  image_queue_size?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;

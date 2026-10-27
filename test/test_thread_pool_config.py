@@ -1,16 +1,22 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 import anyio
+from fastapi import HTTPException
 
 from services.config import (
     DEFAULT_ANYIO_THREAD_LIMIT,
+    DEFAULT_IMAGE_QUEUE_SIZE,
+    DEFAULT_IMAGE_WORKERS,
     MAX_ANYIO_THREAD_LIMIT,
+    MAX_IMAGE_QUEUE_SIZE,
+    MAX_IMAGE_WORKERS,
     ConfigStore,
 )
-from services.thread_pool import apply_anyio_thread_limit
+from services.thread_pool import BoundedImageExecutor, apply_anyio_thread_limit
 
 
 class AnyIOThreadPoolConfigTests(unittest.TestCase):
@@ -52,6 +58,66 @@ class AnyIOThreadPoolConfigTests(unittest.TestCase):
             return anyio.to_thread.current_default_thread_limiter().total_tokens
 
         self.assertEqual(anyio.run(check_limit), 73)
+
+    def test_image_concurrency_defaults_and_bounds(self) -> None:
+        tmp_dir, store = self._make_store()
+        with tmp_dir:
+            self.assertEqual(store.image_workers, DEFAULT_IMAGE_WORKERS)
+            self.assertEqual(store.image_queue_size, DEFAULT_IMAGE_QUEUE_SIZE)
+
+            updated = store.update({"image_workers": 1000, "image_queue_size": 0})
+            self.assertEqual(updated["image_workers"], 1000)
+            self.assertEqual(updated["image_queue_size"], 0)
+
+            self.assertEqual(
+                store.update({"image_workers": MAX_IMAGE_WORKERS + 1})["image_workers"],
+                MAX_IMAGE_WORKERS,
+            )
+            self.assertEqual(
+                store.update({"image_queue_size": MAX_IMAGE_QUEUE_SIZE + 1})["image_queue_size"],
+                MAX_IMAGE_QUEUE_SIZE,
+            )
+
+    def test_image_executor_rejects_when_capacity_is_full(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_job() -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        executor = BoundedImageExecutor(workers=1, queue_size=1)
+        try:
+            first = executor.submit(blocking_job)
+            self.assertTrue(started.wait(timeout=1))
+            second = executor.submit(lambda: None)
+
+            with self.assertRaises(HTTPException) as context:
+                executor.submit(lambda: None)
+            self.assertEqual(context.exception.status_code, 429)
+            self.assertEqual(executor.stats()["inflight"], 2)
+            self.assertTrue(executor.stats()["full"])
+
+            release.set()
+            first.result(timeout=2)
+            second.result(timeout=2)
+            self.assertEqual(executor.stats()["inflight"], 0)
+            self.assertEqual(executor.stats()["available"], 2)
+        finally:
+            release.set()
+            executor.shutdown(wait=True)
+
+    def test_image_executor_reconfigure_updates_capacity(self) -> None:
+        executor = BoundedImageExecutor(workers=2, queue_size=3)
+        try:
+            self.assertEqual(executor.stats()["capacity"], 5)
+            executor.reconfigure(1000, 100)
+            stats = executor.stats()
+            self.assertEqual(stats["workers"], 1000)
+            self.assertEqual(stats["queue_size"], 100)
+            self.assertEqual(stats["capacity"], 1100)
+        finally:
+            executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

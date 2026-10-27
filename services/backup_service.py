@@ -629,8 +629,10 @@ class BackupService:
             if include.get("logs"):
                 self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
             if include.get("image_tasks"):
-                self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
-                self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+                from services.image_task_service import image_task_service
+                self._add_bytes_to_archive(archive, "data/image_tasks.json", _json_bytes(image_task_service.export_tasks()))
+                from services.image_storage_service import image_storage_service
+                self._add_bytes_to_archive(archive, "data/image_index.json", _json_bytes({"items": image_storage_service._load_index()}))
             if include.get("accounts_snapshot"):
                 self._add_bytes_to_archive(
                     archive,

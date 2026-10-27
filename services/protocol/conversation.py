@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import base64
+import pybase64 as base64
 import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -13,6 +13,7 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
+from services.thread_pool import image_cleanup_executor, image_part_executor
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
@@ -273,18 +274,21 @@ def format_image_result(
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
-            continue
+        image_data = item.get("_image_bytes")
+        if not isinstance(image_data, bytes):
+            if not b64_json:
+                continue
+            image_data = base64.b64decode(b64_json)
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "b64_json": b64_json or base64.b64encode(image_data).decode("ascii"),
+                "url": save_image_bytes(image_data, base_url),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_data, base_url),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -832,7 +836,11 @@ def _remove_image_conversation_later(
                 "error": str(exc),
             })
 
-    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
+    if image_cleanup_executor.submit(_run) is None:
+        logger.warning({
+            "event": "image_conversation_remove_queue_full",
+            "conversation_id": conversation_id,
+        })
 
 
 def stream_image_outputs(
@@ -1002,7 +1010,7 @@ def stream_image_outputs(
         if request.progress_callback:
             request.progress_callback("receiving_image")
         image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
+            {"_image_bytes": image_data}
             for image_data in backend.download_image_bytes(image_urls)
         ]
         data = format_image_result(
@@ -1099,7 +1107,7 @@ def stream_image_outputs(
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
                     image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                        {"_image_bytes": image_data}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
                     data = format_image_result(
@@ -1211,7 +1219,7 @@ def stream_image_outputs(
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
                 image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                    {"_image_bytes": image_data}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
                 data = format_image_result(
@@ -1326,6 +1334,13 @@ def _generate_single_image(
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
+        result_recorded = False
+        def record_result(success):
+            nonlocal result_recorded
+            if not result_recorded:
+                result_recorded = True
+                account_service.mark_image_result(token, success)
+
         emitted_for_token = False
         returned_message = False
         returned_result = False
@@ -1371,10 +1386,10 @@ def _generate_single_image(
             finally:
                 _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                record_result(False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
+                record_result(False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1386,10 +1401,10 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
-            account_service.mark_image_result(token, True)
+            record_result(True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            record_result(False)
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1415,7 +1430,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            record_result(False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1432,7 +1447,7 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            record_result(False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1474,7 +1489,7 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            record_result(False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1531,6 +1546,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
+    if not 1 <= request.n <= 4:
+        raise ImageGenerationError("n must be between 1 and 4", status_code=400, error_type="invalid_request_error")
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
         outputs = _generate_single_image(request, 1, 1)
@@ -1560,23 +1577,22 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
-        for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
-            futures[future] = index
+    for index in range(1, request.n + 1):
+        future = image_part_executor.submit(_generate_single_image, request, index, request.n)
+        futures[future] = index
 
-        # 按完成顺序收集结果
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception as exc:
-                errors[index] = exc
-                logger.warning({
-                    "event": "image_parallel_generation_error",
-                    "index": index,
-                    "error": str(exc)[:300],
-                })
+    # 按完成顺序收集结果
+    for future in as_completed(futures):
+        index = futures[future]
+        try:
+            results[index] = future.result()
+        except Exception as exc:
+            errors[index] = exc
+            logger.warning({
+                "event": "image_parallel_generation_error",
+                "index": index,
+                "error": str(exc)[:300],
+            })
 
     # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
     emitted = False
