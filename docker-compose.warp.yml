@@ -100,10 +100,11 @@ services:
       start_period: 30s
 
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: chatgpt2api:warp
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    # image: chatgpt2api:warp
+    image: milodk/chatgpt2api:latest
     container_name: chatgpt2api-warp
     restart: unless-stopped
     depends_on:
@@ -116,7 +117,7 @@ services:
       flaresolverr:
         condition: service_started
     ports:
-      - "${CHATGPT2API_PORT:-3000}:80"
+      - "${CHATGPT2API_PORT:-3005}:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
