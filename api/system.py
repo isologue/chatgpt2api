@@ -122,7 +122,8 @@ def create_router(app_version: str) -> APIRouter:
             account_service.verification.reconfigure()
             account_info_executor.reconfigure(config.image_account_verification["query_workers"])
             completion_executor.reconfigure(config.image_response_workers)
-            monitoring_cache.clear()
+            runtime_cache.clear()
+            image_stats_cache.clear()
             return {"config": updated_config}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc

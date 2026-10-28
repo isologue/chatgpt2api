@@ -11,6 +11,14 @@ class SnapshotCache:
         self.capacity, self.ttl, self.wait = capacity, ttl, wait
         self.entries = OrderedDict()
 
+    def clear(self):
+        """清空所有缓存条目，使下次采集立即重新收集（如保存设置后让监控反映新配置）。
+
+        仅移除条目；正在进行的刷新任务会自行跑完并被其 done_callback 消费异常，
+        随后的请求会创建新条目重新采集。调用方须在事件循环线程内调用。
+        """
+        self.entries.clear()
+
     async def get(self, key, collect):
         key = (asyncio.get_running_loop(), key)
         entry = self.entries.get(key)
