@@ -9,8 +9,7 @@ from services.log_service import LogService, json_safe
 
 class LogServiceTests(unittest.TestCase):
     def test_list_omits_bodies_but_detail_loads_them(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = LogService(Path(temp_dir) / "logs.jsonl")
+        with tempfile.TemporaryDirectory() as temp_dir, LogService(Path(temp_dir) / "logs.jsonl") as service:
             service.add(
                 "call",
                 "test call",

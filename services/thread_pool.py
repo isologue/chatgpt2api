@@ -12,6 +12,10 @@ async def apply_anyio_thread_limit(limit: int) -> None:
 # Image jobs have their own bounded executor, leaving AnyIO capacity for polling,
 # account management and health checks even while upstream generation is slow.
 import asyncio
+import time
+from contextvars import copy_context
+
+from services.image_metrics import current_metrics
 import os
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
@@ -98,11 +102,15 @@ class _ResizableThreadPool:
     def __init__(self, workers: int, thread_name_prefix: str):
         self._lock = Lock()
         self._thread_name_prefix = thread_name_prefix
+        self._workers = workers
+        self._closed = False
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=thread_name_prefix)
         self._pending: dict[ThreadPoolExecutor, int] = {self._pool: 0}
 
     def submit(self, handler, *args):
         with self._lock:
+            if self._closed:
+                raise RuntimeError("executor is closed")
             pool = self._pool
             self._pending[pool] = self._pending.get(pool, 0) + 1
         try:
@@ -117,7 +125,7 @@ class _ResizableThreadPool:
         retire = False
         with self._lock:
             remaining = max(0, self._pending.get(pool, 0) - 1)
-            if remaining:
+            if remaining or (pool is self._pool and not self._closed):
                 self._pending[pool] = remaining
             else:
                 self._pending.pop(pool, None)
@@ -128,6 +136,10 @@ class _ResizableThreadPool:
     def reconfigure(self, workers: int) -> None:
         workers = max(1, workers)
         with self._lock:
+            if workers == self._workers and not self._closed:
+                return
+            self._closed = False
+            self._workers = workers
             current = self._pool
             next_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=self._thread_name_prefix)
             self._pool = next_pool
@@ -138,7 +150,8 @@ class _ResizableThreadPool:
 
     def shutdown(self, wait=True, cancel_futures=False):
         with self._lock:
-            pools = list(self._pending)
+            self._closed = True
+            pools = list(set(self._pending) | {self._pool})
             self._pending.clear()
         for pool in pools:
             pool.shutdown(wait=wait, cancel_futures=cancel_futures)
@@ -172,7 +185,20 @@ image_executor = BoundedImageExecutor(
 
 
 async def run_image_in_threadpool(handler, *args):
-    return await asyncio.wrap_future(image_executor.submit(handler, *args))
+    submitted = time.perf_counter()
+    context = copy_context()
+    metrics = current_metrics.get()
+    if metrics is not None:
+        metrics.add("request_dispatch", submitted - metrics.started)
+
+    def execute():
+        metrics = current_metrics.get()
+        if metrics is not None:
+            metrics.add("image_queue_wait", time.perf_counter() - submitted)
+        return handler(*args)
+
+    from services.async_completion import await_worker
+    return await await_worker(image_executor.submit(context.run, execute), "image_worker")
 
 
 # Separate pools avoid parent jobs waiting for children in the same executor.
@@ -180,7 +206,7 @@ image_part_executor = _ResizableThreadPool(
     workers=_env_int("CHATGPT2API_IMAGE_WORKERS", 32, 1, 10000),
     thread_name_prefix="image-part",
 )
-account_info_executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="account-info")
+account_info_executor = _ResizableThreadPool(32, "account-info")
 image_cleanup_executor = BoundedBackgroundExecutor(
     _env_int("CHATGPT2API_IMAGE_CLEANUP_WORKERS", 4, 1, 32),
     _env_int("CHATGPT2API_IMAGE_CLEANUP_QUEUE_SIZE", 128, 0, 10000),

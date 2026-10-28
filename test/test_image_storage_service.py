@@ -67,7 +67,9 @@ class ImageStorageServiceTests(unittest.TestCase):
         FakeWebDAVClient.deleted = []
 
     def service(self) -> ImageStorageService:
-        return ImageStorageService(self.data_dir / "image_index.json")
+        service = ImageStorageService(self.data_dir / "image_index.json")
+        self.addCleanup(service._index_store.close)
+        return service
 
     def test_local_mode_saves_to_local_directory(self):
         stored = self.service().save(png_bytes(), "http://app.test")

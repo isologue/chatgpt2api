@@ -160,6 +160,17 @@ export type ThirdPartyAppsSettings = {
   };
 };
 
+export type ImageAccountVerificationSettings = {
+  cache_ttl_secs: number | string;
+  max_stale_secs: number | string;
+  background_refresh: boolean;
+  workers: number | string;
+  queue_size: number | string;
+  starts_per_second: number | string;
+  failure_backoff_secs: number | string;
+  query_workers: number | string;
+};
+
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
@@ -175,11 +186,14 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
+  account_refresh_startup_mode?: "deferred" | "full";
   anyio_thread_limit?: number | string;
   image_response_format?: "url" | "b64_json";
   image_allow_response_format_override?: boolean;
   image_workers?: number | string;
   image_queue_size?: number | string;
+  image_response_workers?: number | string;
+  image_account_verification?: ImageAccountVerificationSettings;
   image_account_selection_max_attempts?: number | string;
   image_poll_timeout_account_switch_retries?: number | string;
   image_text_reply_account_switch_retries?: number | string;
@@ -293,7 +307,40 @@ export type SystemLog = {
   [key: string]: unknown;
 };
 
+export type RuntimePhase = { active: number; completed: number; sample_count: number; p95_ms: number; last_ms: number; max_ms?: number };
+export type PersistenceBatch = { items: number; bytes: number; succeeded: boolean; wall_ms: number; thread_cpu_ms: number; stages: Record<string, number> };
+export type PersistenceQueue = {
+  capacity: number; queued: number; pending: number; failed: number; last_queue_wait_ms: number; last_write_ms: number;
+  active_items?: number; active_for_ms?: number; last_batch_items?: number; max_batch_items?: number;
+  last_batch?: PersistenceBatch | null; slowest_batch?: PersistenceBatch | null;
+};
+
+export type AccountRefreshCounts = {
+  total: number; completed: number; succeeded: number; failed: number; active: number; pending: number;
+};
+export type AccountRefreshFailures = {
+  round: number; kind: "refresh" | "keepalive"; total: number; retained: number;
+  max_retained: number; offset: number; limit: number;
+  items: { account: string; error: string; time: number }[];
+};
+export type AccountRefreshSnapshot = {
+  round: number;
+  status: "idle" | "running" | "completed" | "completed_with_errors" | "failed";
+  phase: "idle" | "preparing" | "refresh" | "keepalive" | "waiting";
+  started_at: number | null; finished_at: number | null; last_success_at: number | null;
+  last_full_refresh_finished_at: number | null; next_full_refresh_at: number | null;
+  next_run_at: number | null; interval_seconds: number; elapsed_seconds: number;
+  error: string | null;
+  refresh: AccountRefreshCounts; keepalive: AccountRefreshCounts;
+};
+
 export type MonitoringSnapshot = {
+  snapshot_state?: Record<string, { collected_at: number | null; age_ms: number; stale: boolean; refreshing: boolean; refresh_failed: boolean }>;
+  account_refresh?: AccountRefreshSnapshot;
+  phases?: Record<string, RuntimePhase>;
+  account_verification?: { active: number; waiting: number; background_pending: number; background_capacity: number; cache_hit_rate: number; completed: number; failed: number; background_rejected: number };
+  persistence?: { logs: PersistenceQueue; image_index: PersistenceQueue };
+  completion_executor?: { active: number; pending: number; queued: number };
   timestamp: number;
   refresh_interval_secs: number;
   server_date: string;
@@ -324,6 +371,9 @@ export type MonitoringSnapshot = {
     success_rate: number;
     success_images: number;
     excluded: number;
+    duration_samples?: number;
+    duration_p50_ms?: number | null;
+    duration_p95_ms?: number | null;
     start_date: string;
     end_date: string;
   };
@@ -816,6 +866,11 @@ export async function fetchLogKeyNames(filters: { type: string; start_date: stri
 
 export async function fetchSystemLog(id: string) {
   return httpRequest<{ item: SystemLog }>(`/api/logs/${encodeURIComponent(id)}`);
+}
+
+export async function fetchAccountRefreshFailures(round: number, kind: "refresh" | "keepalive", offset = 0, limit = 20) {
+  const query = new URLSearchParams({ round: String(round), kind, offset: String(offset), limit: String(limit) });
+  return httpRequest<AccountRefreshFailures>(`/api/monitoring/account-refresh/failures?${query.toString()}`);
 }
 
 export async function fetchMonitoring(startDate?: string, endDate?: string) {

@@ -28,9 +28,17 @@ from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.retention_service import CleanupBusyError, retention_service
 from services.account_service import account_service
+from services.account_refresh_monitor import account_refresh_monitor
 from services.monitoring import snapshot as monitoring_snapshot
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
-from services.thread_pool import apply_anyio_thread_limit, configure_image_executors
+from services.thread_pool import apply_anyio_thread_limit, configure_image_executors, account_info_executor
+from utils.log import logger
+from services.image_metrics import runtime_phases
+from services.monitoring_cache import SnapshotCache
+from services.isolated_executor import image_stats_executor
+from services.isolated_executor import completion_executor, monitoring_executor
+import asyncio
+import time
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -76,6 +84,8 @@ class BackupDeleteRequest(BaseModel):
 
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
+    runtime_cache = SnapshotCache(capacity=4)
+    image_stats_cache = SnapshotCache(capacity=32)
 
     @router.post("/auth/login")
     async def login(authorization: str | None = Header(default=None)):
@@ -109,6 +119,10 @@ def create_router(app_version: str) -> APIRouter:
             updated_config = config.update(body.model_dump(mode="python"))
             await apply_anyio_thread_limit(config.anyio_thread_limit)
             configure_image_executors(config.image_workers, config.image_queue_size)
+            account_service.verification.reconfigure()
+            account_info_executor.reconfigure(config.image_account_verification["query_workers"])
+            completion_executor.reconfigure(config.image_response_workers)
+            monitoring_cache.clear()
             return {"config": updated_config}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -127,15 +141,44 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "日期范围无效，请使用 YYYY-MM-DD，开始日期不能晚于结束日期"}) from exc
 
         def collect():
-            images = log_service.image_stats(start.isoformat(), end.isoformat())
             return {
-                **monitoring_snapshot(account_service.get_stats(), images),
+                **monitoring_snapshot(account_service.get_stats(), {}),
+                "persistence": {
+                    "logs": log_service.persistence_stats(),
+                    "image_index": image_storage_service._index_store._writer.stats(),
+                },
+                "account_verification": account_service.verification.stats(),
+                "account_refresh": account_refresh_monitor.snapshot(),
+                "phases": runtime_phases.snapshot(),
+                "runtime_logging": logger.stats(),
+                "completion_executor": completion_executor.stats(),
+                "monitoring_executor": monitoring_executor.stats(),
                 "refresh_interval_secs": config.monitoring_refresh_interval_secs,
                 "server_date": date.today().isoformat(),
                 "timezone": str(datetime.now().astimezone().tzinfo),
             }
 
-        return await run_in_threadpool(collect)
+        # 日期统计独立采集，不占实时指标执行池；刷新慢时明确返回旧快照及年龄。
+        async def collect_images():
+            return await image_stats_executor.run(log_service.image_stats, start.isoformat(), end.isoformat())
+
+        (runtime, runtime_state), (images, images_state) = await asyncio.gather(
+            runtime_cache.get("runtime", lambda: monitoring_executor.run(collect)),
+            image_stats_cache.get((start.isoformat(), end.isoformat()), collect_images),
+        )
+        return {**runtime, "images": images, "snapshot_state": {"runtime": runtime_state, "images": images_state}}
+
+    @router.get("/api/monitoring/account-refresh/failures")
+    async def get_account_refresh_failures(
+        round: int = Query(ge=0), kind: Literal["refresh", "keepalive"] = "refresh",
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=100),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return account_refresh_monitor.failures(round, kind, offset, limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):

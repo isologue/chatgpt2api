@@ -15,6 +15,8 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.thread_pool import image_cleanup_executor, image_part_executor
+from contextvars import copy_context
+from services.image_metrics import measured, phase
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
@@ -927,37 +929,38 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
+    with phase("upstream_generation"):
+        for event in conversation_events(
+                backend,
+                prompt=request.prompt,
                 model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
+                images=request.images or [],
+                size=request.size,
+                quality=request.quality,
+        ):
+            last = event
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
@@ -1351,12 +1354,13 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    images = _codex_response_images(list(backend.iter_codex_image_response_events(
-        prompt=request.prompt,
-        images=request.images or [],
-        size=request.size,
-        quality=request.quality,
-    )))
+    with phase("upstream_generation"):
+        images = _codex_response_images(list(backend.iter_codex_image_response_events(
+            prompt=request.prompt,
+            images=request.images or [],
+            size=request.size,
+            quality=request.quality,
+        )))
     if not images:
         raise ImageGenerationError("No image result found in response")
     data = format_image_result(
@@ -1372,6 +1376,7 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+@measured("generation_work")
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -1605,6 +1610,7 @@ def _generate_single_image_impl(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
+                account_service.invalidate_verification(token)
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -1695,7 +1701,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
     for index in range(1, request.n + 1):
-        future = image_part_executor.submit(_generate_single_image, request, index, request.n)
+        future = image_part_executor.submit(copy_context().run, _generate_single_image, request, index, request.n)
         futures[future] = index
 
     # 按完成顺序收集结果
@@ -1746,14 +1752,22 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         raise _attach_account_switch_summary(error, request.account_switch_tracker)
 
 
-def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
+def stream_image_chunks(outputs: Iterable[ImageOutput], max_images: int | None = None) -> Iterator[dict[str, Any]]:
+    emitted = 0
     for output in outputs:
-        yield output.to_chunk()
+        chunk = output.to_chunk()
+        if output.kind == "result" and max_images is not None:
+            chunk["data"] = output.data[:max(0, max_images - emitted)]
+            emitted += len(chunk["data"])
+            if not chunk["data"]:
+                continue
+        yield chunk
 
 
 def collect_image_outputs(
         outputs: Iterable[ImageOutput],
         tracker: ImageAccountSwitchTracker | None = None,
+        max_images: int | None = None,
 ) -> dict[str, Any]:
     created = None
     data: list[dict[str, Any]] = []
@@ -1769,7 +1783,7 @@ def collect_image_outputs(
         elif output.kind == "message":
             message = output.text
         elif output.kind == "result":
-            data.extend(output.data)
+            data.extend(output.data if max_images is None else output.data[:max(0, max_images - len(data))])
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:

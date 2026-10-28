@@ -7,13 +7,18 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread, local
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
+from services.image_metrics import measured, phase, current_metrics, runtime_phases
+from services.account_verification import AccountVerification
+from services.account_refresh_monitor import refresh_failure_item
+from services.keyed_locks import KeyedLocks
 from services.account_persistence import AccountWriter, persisted
 from services.config import config
 from services.log_service import (
@@ -25,52 +30,52 @@ from utils.helper import anonymize_token
 
 
 class _RevisionDict(dict):
-    """Dict that invalidates read-side account indexes after mutations."""
+    """账号修改同时维护轻量统计，分页读索引仍按版本失效。"""
 
     def __init__(self, *args, on_change=None, **kwargs):
         self._on_change = on_change
         super().__init__(*args, **kwargs)
 
-    def _changed(self) -> None:
+    def _changed(self, previous, current):
         if self._on_change is not None:
-            self._on_change()
+            self._on_change(previous, current)
 
     def __setitem__(self, key, value):
+        previous = self.get(key)
         super().__setitem__(key, value)
-        self._changed()
+        self._changed(previous, value)
 
     def __delitem__(self, key):
+        previous = self[key]
         super().__delitem__(key)
-        self._changed()
+        self._changed(previous, None)
 
     def pop(self, key, *args):
         existed = key in self
-        result = super().pop(key, *args)
+        previous = super().pop(key, *args)
         if existed:
-            self._changed()
-        return result
+            self._changed(previous, None)
+        return previous
 
     def popitem(self):
-        result = super().popitem()
-        self._changed()
-        return result
+        key, value = super().popitem()
+        self._changed(value, None)
+        return key, value
 
     def clear(self):
-        if self:
-            super().clear()
-            self._changed()
+        previous = tuple(self.values())
+        super().clear()
+        for value in previous:
+            self._changed(value, None)
 
     def update(self, *args, **kwargs):
-        if args or kwargs:
-            super().update(*args, **kwargs)
-            self._changed()
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
 
     def setdefault(self, key, default=None):
-        if key in self:
-            return self[key]
-        result = super().setdefault(key, default)
-        self._changed()
-        return result
+        if key not in self:
+            self[key] = default
+        return self[key]
 
 
 class AccountService:
@@ -79,6 +84,7 @@ class AccountService:
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
+    _IMAGE_TOKEN_REFRESH_SKEW_SECONDS = 5 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
@@ -101,8 +107,8 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
-        self._token_refresh_locks = [Lock() for _ in range(256)]
-        self._verification_locks = [Lock() for _ in range(256)]
+        self._token_refresh_locks = KeyedLocks()
+        self.verification = AccountVerification(lambda: config.image_account_verification)
         self._write_context = local()
         self._writer = AccountWriter(storage_backend)
         self._image_slot_condition = Condition(self._lock)
@@ -112,6 +118,11 @@ class AccountService:
         self._accounts = _RevisionDict(
             self._load_accounts(), on_change=self._mark_account_revision
         )
+        self._stats_summary = dict(total=0, active=0, limited=0, abnormal=0, disabled=0,
+                                   quota=0, total_success=0, total_fail=0)
+        self._stats_by_type = {}
+        for account in self._accounts.values():
+            self._apply_stats_delta(None, account)
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -119,13 +130,35 @@ class AccountService:
         self._available_buckets: dict[tuple, OrderedDict] = {}
         self._bucket_for_token: dict[str, tuple] = {}
         self._verified_at: dict[str, float] = {}
+        self._verification_versions: dict[str, int] = {}
         self._scheduler_concurrency = max(1, int(config.image_account_concurrency or 1))
         for token in self._accounts:
             self._sync_candidate_locked(token)
 
-    def _mark_account_revision(self) -> None:
+    def _mark_account_revision(self, previous=None, current=None) -> None:
         self._account_revision += 1
         self._account_view_cache = None
+        if hasattr(self, "_stats_summary"):
+            self._apply_stats_delta(previous, current)
+
+    def _apply_stats_delta(self, previous, current):
+        for account, sign in ((previous, -1), (current, 1)):
+            if account is None:
+                continue
+            summary = self._stats_summary
+            summary["total"] += sign
+            status = account.get("status")
+            for name, value in (("active", "正常"), ("limited", "限流"), ("abnormal", "异常"), ("disabled", "禁用")):
+                summary[name] += sign * int(status == value)
+            summary["quota"] += sign * (max(0, int(account.get("quota") or 0)) if status == "正常" else 0)
+            summary["total_success"] += sign * int(account.get("success") or 0)
+            summary["total_fail"] += sign * int(account.get("fail") or 0)
+            kind = account.get("type", "unknown")
+            count = self._stats_by_type.get(kind, 0) + sign
+            if count:
+                self._stats_by_type[kind] = count
+            else:
+                self._stats_by_type.pop(kind, None)
 
     def _account_view_locked(self) -> dict[str, Any]:
         """Build the immutable read index used by account pages and stats."""
@@ -219,6 +252,7 @@ class AccountService:
         patterns = (
             r"\binvalid_grant\b",
             r"\binvalid_refresh_token\b",
+            r"\brefresh_token_(?:reused|expired|revoked|invalid)\b",
             r"\brefresh[\s_-]*token\b.{0,24}\b(?:is|has\s+been|was)?\s*(?:expired|revoked|invalid|reused)\b",
             r"\b(?:expired|revoked|invalid|reused)\s+refresh[\s_-]*token\b",
         )
@@ -262,7 +296,7 @@ class AccountService:
             after.append(lambda: log_service.add(*args, **kwargs))
 
     def _queue_write(self, changes=None, *, snapshot=None) -> None:
-        future = self._writer.submit(changes, snapshot=snapshot)
+        future = self._writer.submit(changes, snapshot=snapshot, deferred=True)
         pending = getattr(self._write_context, "pending", None)
         if pending is None:
             raise RuntimeError("account writes must run in a persisted mutation")
@@ -282,30 +316,39 @@ class AccountService:
     def _delete_account(self, access_token: str) -> None:
         self._sync_candidate_locked(access_token)
         self._verified_at.pop(access_token, None)
+        self.verification.forget(access_token)
         if getattr(self.storage, "supports_incremental_account_writes", False):
             self._queue_write({access_token: None})
         else:
             self._save_accounts()
 
     def _sync_candidate_locked(self, token: str) -> None:
-        old_bucket = self._bucket_for_token.pop(token, None)
-        if old_bucket is not None:
+        account = self._accounts.get(token)
+        bucket = None
+        if self._is_image_account_available(account):
+            bucket = (self._normalize_account_type(account.get("type")),
+                      self._normalize_source_type(account.get("source_type")))
+        old_bucket = self._bucket_for_token.get(token)
+        if old_bucket is not None and old_bucket != bucket:
+            self._bucket_for_token.pop(token, None)
             self._ready_buckets[old_bucket].pop(token, None)
             self._available_buckets[old_bucket].pop(token, None)
             if not self._ready_buckets[old_bucket]:
                 self._ready_buckets.pop(old_bucket)
                 self._available_buckets.pop(old_bucket)
-        account = self._accounts.get(token)
-        if not self._is_image_account_available(account):
+        if bucket is None:
             return
-        bucket = (self._normalize_account_type(account.get("type")),
-                  self._normalize_source_type(account.get("source_type")))
         self._bucket_for_token[token] = bucket
-        self._ready_buckets.setdefault(bucket, OrderedDict())[token] = None
+        ready = self._ready_buckets.setdefault(bucket, OrderedDict())
+        ready[token] = None
+        ready.move_to_end(token)
         available = self._available_buckets.setdefault(bucket, OrderedDict())
         capacity = min(self._scheduler_concurrency, max(0, int(account.get("quota") or 0)))
         if self._image_inflight.get(token, 0) < capacity:
             available[token] = None
+            available.move_to_end(token)
+        else:
+            available.pop(token, None)
 
     def _matching_buckets(self, plan_type, source_type, plan_types):
         for bucket, ready in self._ready_buckets.items():
@@ -479,23 +522,26 @@ class AccountService:
     def resolve_access_token(self, access_token: str) -> str:
         if not access_token:
             return ""
-        with self._lock:
+        with self._timed_account_lock("account_resolve_access_token_lock"):
             return self._resolve_access_token_locked(access_token)
 
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
-        with self._lock:
+        with self._timed_account_lock("account_get_account_for_token_lock"):
             resolved = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
     @persisted
-    def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
+    def _record_token_refresh_error(self, access_token: str, event: str, error: str,
+                                    *, expected_refresh_token: str | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
+        with self._timed_account_lock("account_record_token_refresh_error_lock"):
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
                 return
+            if expected_refresh_token is not None and current.get("refresh_token") != expected_refresh_token:
+                return  # 旧 RT 的远程结果不能污染并发导入的新凭证。
             next_item = dict(current)
             next_item["last_token_refresh_error"] = str(error or "refresh token failed")
             next_item["last_token_refresh_error_at"] = now
@@ -531,7 +577,7 @@ class AccountService:
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
         if not str(account.get("refresh_token") or "").strip():
             return None
-        if account.get("status") == "禁用":
+        if account.get("status") == "禁用" or self._refresh_token_status(account) == "invalid":
             return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
@@ -577,12 +623,15 @@ class AccountService:
             session.close()
 
     @persisted
-    def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
+    def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str,
+                                *, expected_refresh_token: str | None = None) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
+                return old_token
+            if expected_refresh_token is not None and current.get("refresh_token") != expected_refresh_token:
                 return old_token
             new_token = str(token_data.get("access_token") or old_token).strip()
             if not new_token:
@@ -594,6 +643,8 @@ class AccountService:
                 next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
             if token_data.get("id_token"):
                 next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            if new_token != old_token:
+                next_item["remote_verified_at"] = None
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
@@ -628,13 +679,20 @@ class AccountService:
         )
         return new_token
 
-    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token",
+                             retry_terminal: bool = False) -> str:
         if not access_token:
             return ""
         resolved_token, initial = self._get_account_for_token(access_token)
+        if initial and not force:
+            active = str(initial.get("access_token") or resolved_token)
+            if (not initial.get("refresh_token") or not self._token_needs_refresh(active)
+                    or self._refresh_token_status(initial) == "invalid"
+                    or self._recent_token_refresh_error(initial)):
+                return active
         # A stable account identity keeps token rotation on the same refresh lock.
         identity = str((initial or {}).get("id") or (initial or {}).get("email") or resolved_token)
-        with self._token_refresh_locks[hash(identity) % len(self._token_refresh_locks)]:
+        with self._token_refresh_locks.hold(identity):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -644,13 +702,17 @@ class AccountService:
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
                 return active_token
+            # 认证失败恢复的 force 也不重试已明确永久失效的 RT。
+            # 仅显式维护调用可用 retry_terminal=True 重新验证同一 RT。
+            if self._refresh_token_status(account) == "invalid" and not retry_terminal:
+                return active_token
             if not force and self._recent_token_refresh_error(account):
                 return active_token
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
                 error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
+                self._record_token_refresh_error(active_token, event, error_str, expected_refresh_token=refresh_token)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
                 if "app_session_terminated" in error_str.lower():
                     # 获取账号信息（email, password）
@@ -665,7 +727,7 @@ class AccountService:
                         )
                         t.start()
                 return active_token
-            return self._apply_refreshed_tokens(active_token, token_data, event)
+            return self._apply_refreshed_tokens(active_token, token_data, event, expected_refresh_token=refresh_token)
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1031,56 +1093,77 @@ class AccountService:
             session.close()
 
     def list_expiring_access_tokens(self) -> list[str]:
-        with self._lock:
-            return [
-                token
-                for account in self._accounts.values()
-                if str(account.get("refresh_token") or "").strip()
-                and (token := str(account.get("access_token") or "").strip())
-                and self._token_needs_refresh(token)
-            ]
+        with self._timed_account_lock("account_list_expiring_access_tokens_lock"):
+            accounts = tuple(self._accounts.values())
+        # 账号字典以替换方式更新；快照引用稳定，JWT/错误解析不占调度锁。
+        return [
+            token for account in accounts
+            if str(account.get("refresh_token") or "").strip()
+            and account.get("status") != "禁用"
+            and self._refresh_token_status(account) != "invalid"
+            and (token := str(account.get("access_token") or "").strip())
+            and self._token_needs_refresh(token)
+        ]
 
     def list_refresh_token_keepalive_tokens(self) -> list[str]:
         now = datetime.now(timezone.utc)
         due_items: list[tuple[datetime, str]] = []
-        with self._lock:
-            for account in self._accounts.values():
-                due_at = self._refresh_token_keepalive_due_at(account, now)
-                token = str(account.get("access_token") or "").strip()
-                if due_at is not None and token:
-                    due_items.append((due_at, token))
+        with self._timed_account_lock("account_list_refresh_token_keepalive_tokens_lock"):
+            accounts = tuple(self._accounts.values())
+        for account in accounts:
+            due_at = self._refresh_token_keepalive_due_at(account, now)
+            token = str(account.get("access_token") or "").strip()
+            if due_at is not None and token:
+                due_items.append((due_at, token))
         due_items.sort(key=lambda item: item[0])
         return [token for _, token in due_items[: self._REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE]]
 
-    def keepalive_refresh_tokens(self, access_tokens: list[str]) -> dict[str, Any]:
+    def keepalive_refresh_tokens(self, access_tokens: list[str], *, include_items: bool = True,
+                                 on_progress: Callable | None = None,
+                                 on_failure: Callable | None = None) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
+            return {"refreshed": 0, "errors": [], **({"items": self.list_accounts()} if include_items else {})}
 
         refreshed = 0
         errors = []
         for access_token in access_tokens:
-            before = self.resolve_access_token(access_token)
-            after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
-            account = self.get_account(after)
-            if account and str(account.get("last_token_refresh_error") or "").strip():
-                errors.append({
-                    "token": anonymize_token(before),
-                    "error": str(account.get("last_token_refresh_error") or "refresh token failed"),
-                })
-                continue
-            if account:
-                refreshed += 1
+            success = False
+            failure_account = self.get_account(access_token) if on_failure else None
+            failure_reason = "保活未返回账号信息（账号可能已被移除）"
+            if on_progress:
+                on_progress("started")
+            try:
+                before = self.resolve_access_token(access_token)
+                after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
+                account = self.get_account(after)
+                if account and str(account.get("last_token_refresh_error") or "").strip():
+                    failure_reason = str(account["last_token_refresh_error"])
+                    errors.append({
+                        "token": anonymize_token(before),
+                        "error": str(account.get("last_token_refresh_error") or "refresh token failed"),
+                    })
+                elif account:
+                    refreshed += 1
+                    success = True
+            except Exception as exc:
+                failure_reason = str(exc) or type(exc).__name__
+                raise
+            finally:
+                if not success and on_failure:
+                    on_failure(refresh_failure_item(access_token, failure_account, failure_reason))
+                if on_progress:
+                    on_progress("finished", success)
 
         return {
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
+            **({"items": self.list_accounts()} if include_items else {}),
             "relogined": 0,
         }
 
     def list_tokens(self) -> list[str]:
-        with self._lock:
+        with self._timed_account_lock("account_list_tokens_lock"):
             return list(self._accounts)
 
     def _list_ready_candidate_tokens(
@@ -1116,6 +1199,25 @@ class AccountService:
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
+    @contextmanager
+    def _timed_account_lock(self, name):
+        # 不在持账号锁期间更新指标，避免指标锁或线程调度延长共享临界区。
+        started = time.perf_counter()
+        self._lock.acquire()
+        acquired = time.perf_counter()
+        cpu_started = time.thread_time()
+        try:
+            yield
+        finally:
+            held = time.perf_counter() - acquired
+            cpu = time.thread_time() - cpu_started
+            self._lock.release()
+            metrics = current_metrics.get()
+            for suffix, elapsed in (("_wait", acquired - started), ("_hold", held), ("_hold_cpu", cpu)):
+                runtime_phases.observe(name + suffix, elapsed)
+                if metrics is not None:
+                    metrics.add(name + suffix, elapsed)
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1124,9 +1226,9 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
         excluded = excluded_tokens or set()
-        with self._image_slot_condition:
-            while True:
-                concurrency = max(1, int(config.image_account_concurrency or 1))
+        while True:
+            concurrency = max(1, int(config.image_account_concurrency or 1))
+            with self._timed_account_lock("account_selection_lock"):
                 if concurrency != self._scheduler_concurrency:
                     self._scheduler_concurrency = concurrency
                     for token in tuple(self._accounts):
@@ -1149,16 +1251,22 @@ class AccountService:
                     self._image_inflight[token] = self._image_inflight.get(token, 0) + 1
                     self._sync_candidate_locked(token)
                     return token
-                self._image_slot_condition.wait(timeout=1.0)
+                # Condition.wait 会释放锁；不把等待槽位时间算作持锁时间。
+            with phase("account_slot_wait"):
+                with self._image_slot_condition:
+                    self._image_slot_condition.wait_for(
+                        lambda: any(t not in excluded for bucket, _ in buckets
+                                   for t in self._available_buckets.get(bucket, ())), timeout=1.0)
 
-    def _release_image_slot_locked(self, access_token: str) -> str:
+    def _release_image_slot_locked(self, access_token: str, *, sync_candidate=True) -> str:
         token = self._resolve_access_token_locked(access_token)
         current = self._image_inflight.get(token, 0)
         if current <= 1:
             self._image_inflight.pop(token, None)
         else:
             self._image_inflight[token] = current - 1
-        self._sync_candidate_locked(token)
+        if sync_candidate:
+            self._sync_candidate_locked(token)
         # One released slot needs only one waiter, avoiding a thundering herd.
         self._image_slot_condition.notify(1)
         return token
@@ -1168,6 +1276,7 @@ class AccountService:
             with self._image_slot_condition:
                 self._release_image_slot_locked(access_token)
 
+    @measured("account_lookup")
     def get_available_access_token(
             self,
             plan_type: str | None = None,
@@ -1190,22 +1299,7 @@ class AccountService:
             )
             attempted_tokens.add(access_token)
             try:
-                # A short successful-verification cache avoids a network preflight per image.
-                # The per-token lock prevents concurrent requests from stampeding the same
-                # account when its cache entry expires.
-                verification_lock = self._verification_locks[
-                    hash(access_token) % len(self._verification_locks)
-                ]
-                with verification_lock:
-                    with self._lock:
-                        cached = time.monotonic() - self._verified_at.get(
-                            access_token, float("-inf")
-                        ) < 30.0
-                    account = (
-                        self.get_account(access_token)
-                        if cached
-                        else self.fetch_remote_info(access_token, "get_available_access_token")
-                    )
+                account = self._image_account_with_verification(access_token)
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1227,6 +1321,66 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
+    def _image_account_with_verification(self, access_token: str) -> dict | None:
+        # 热路径仅在 AT 即将过期时同步续期，提前一天的维护留给后台。
+        # 读取账号与校验缓存共用一次短锁；正常命中无需再次 get_account。
+        active = access_token
+        settings = config.image_account_verification
+        now = time.monotonic()
+        with self._timed_account_lock("account_cache_lock"):
+            active = self._resolve_access_token_locked(active)
+            account = self._accounts.get(active)
+            if not account or not self._is_image_account_available(account):
+                return dict(account) if account else None
+            verified = self._verified_at.get(active)
+            if verified is None:
+                # 缓存恢复与失效使用同一账号锁，旧快照不能重新写回失效缓存。
+                try:
+                    persisted_at = float(account.get("remote_verified_at") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    persisted_at = 0
+                age = time.time() - persisted_at
+                if persisted_at > 0 and 0 <= age <= settings["max_stale_secs"]:
+                    verified = now - age
+                    self._verified_at[active] = verified
+            snapshot = dict(account)
+        with phase("account_token_inspection"):
+            remaining = self._token_expires_in(active)
+        refresh_window = max(self._IMAGE_TOKEN_REFRESH_SKEW_SECONDS, config.image_poll_timeout_secs + 60)
+        if (snapshot.get("refresh_token") and snapshot.get("refresh_token_status") != "invalid"
+                and (remaining is None or remaining <= refresh_window)):
+            with phase("account_token_refresh"):
+                refreshed = self.refresh_access_token(active, event="image_selection") or active
+            if refreshed != active:
+                # 轮换使旧缓存失效；按新 token 重新读取，不使用旧额度快照。
+                active = refreshed
+                snapshot = self.get_account(active)
+                verified = None
+        age = now - verified if verified is not None else float("inf")
+        if age < settings["cache_ttl_secs"]:
+            self.verification.cache_hit()
+            return snapshot
+        if settings["background_refresh"] and age < settings["max_stale_secs"]:
+            self.verification.cache_hit(stale=True)
+            self.verification.run(active, lambda: self._fetch_remote_info(
+                active, "image_background_verification"), background=True)
+            return snapshot
+        with phase("account_foreground_verification"):
+            self.fetch_remote_info(active, "get_available_access_token")
+        return self.get_account(active)
+
+    @persisted
+    def invalidate_verification(self, access_token: str) -> None:
+        with self._timed_account_lock("account_invalidate_verification_lock"):
+            active = self._resolve_access_token_locked(access_token)
+            self._verified_at.pop(active, None)
+            self._verification_versions[active] = self._verification_versions.get(active, 0) + 1
+            current = self._accounts.get(active)
+            if current and current.get("remote_verified_at"):
+                account = {**current, "remote_verified_at": None}
+                self._accounts[active] = account
+                self._save_account(account)
+
     def get_text_access_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1239,7 +1393,7 @@ class AccountService:
             from services.model_service import model_catalog_service
 
             route = model_catalog_service.route_for_model(requested_model)
-        with self._lock:
+        with self._timed_account_lock("account_get_text_access_token_lock"):
             candidates = [
                 token
                 for account in self._accounts.values()
@@ -1267,7 +1421,7 @@ class AccountService:
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
-        with self._lock:
+        with self._timed_account_lock("account_mark_text_used_lock"):
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -1295,7 +1449,7 @@ class AccountService:
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
             return None
-        with self._lock:
+        with self._timed_account_lock("account_read_lock"):
             access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token)
             return dict(account) if account else None
@@ -1306,14 +1460,11 @@ class AccountService:
         image_inflight 为内存态并发计数(账号正在生成、尚未结束的图片数)。号池空闲时
         若某账号该值持续 > 0，说明其并发槽位泄漏、已被静默排除出调度，可借此在 UI 上诊断。
         """
-        with self._lock:
-            result = []
-            for item in self._accounts.values():
-                account = dict(item)
-                token = account.get("access_token") or ""
-                account["image_inflight"] = int(self._image_inflight.get(token, 0))
-                result.append(account)
-            return result
+        with self._timed_account_lock("account_list_accounts_lock"):
+            items = tuple(self._accounts.values())
+            inflight = dict(self._image_inflight)
+        return [{**item, "image_inflight": int(inflight.get(item.get("access_token") or "", 0))}
+                for item in items]
 
     def list_accounts_page(
         self, page: int = 1, page_size: int = 20, query: str = "",
@@ -1333,7 +1484,7 @@ class AccountService:
                     "items": [self._account_page_item(item) for item in result.get("items", [])],
                 }
 
-        with self._lock:
+        with self._timed_account_lock("account_list_accounts_page_lock"):
             view = self._account_view_locked() if hasattr(self, "_account_view_locked") else None
             if view is None:
                 snapshot = tuple(self._accounts.values())
@@ -1380,7 +1531,7 @@ class AccountService:
         total = len(matched)
         page = min(max(1, page), max(1, (total + page_size - 1) // page_size))
         start = (page - 1) * page_size
-        with self._lock:
+        with self._timed_account_lock("account_list_accounts_page_lock"):
             items = [self._account_page_item(item) for item in matched[start:start + page_size]]
         page_summary = {
             key: summary[key]
@@ -1403,24 +1554,26 @@ class AccountService:
 
     def list_account_tokens(self, status: str = "all") -> list[str]:
         """显式批量操作才读取全池 token，普通列表加载不调用。"""
-        with self._lock:
+        with self._timed_account_lock("account_list_account_tokens_lock"):
             return [token for token, item in self._accounts.items()
                     if status == "all" or item.get("status") == status]
 
     def list_limited_tokens(self) -> list[str]:
-        with self._lock:
-            return [
+        with self._timed_account_lock("account_list_limited_tokens_lock"):
+            accounts = tuple(self._accounts.values())
+        return [
                 token
-                for item in self._accounts.values()
+                for item in accounts
                 if item.get("status") == "限流"
                    and (token := item.get("access_token") or "")
             ]
 
     def list_normal_tokens(self) -> list[str]:
-        with self._lock:
-            return [
+        with self._timed_account_lock("account_list_normal_tokens_lock"):
+            accounts = tuple(self._accounts.values())
+        return [
                 token
-                for item in self._accounts.values()
+                for item in accounts
                 if item.get("status") == "正常"
                    and (token := item.get("access_token") or "")
             ]
@@ -1482,7 +1635,7 @@ class AccountService:
         if not deduped:
             return {"added": 0, "skipped": 0, **({"items": self.list_accounts()} if include_items else {})}
 
-        with self._lock:
+        with self._timed_account_lock("account_add_account_payloads_lock"):
             added = 0
             skipped = 0
             for access_token, payload in deduped.items():
@@ -1532,7 +1685,7 @@ class AccountService:
         target_set = set(token for token in tokens if token)
         if not target_set:
             return {"removed": 0, **({"items": self.list_accounts()} if include_items else {})}
-        with self._lock:
+        with self._timed_account_lock("account_delete_accounts_lock"):
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
@@ -1560,14 +1713,28 @@ class AccountService:
         return {"removed": removed, **({"items": items} if include_items else {})}
 
     @persisted
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(self, access_token: str, updates: dict, quiet: bool = False, *, remote_success_before: int | None = None, remote_verification_version: int | None = None) -> dict | None:
         if not access_token:
             return None
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
+        with self._timed_account_lock("account_update_account_lock"):
+            resolved = self._resolve_access_token_locked(access_token)
+            if remote_verification_version is not None and resolved != access_token:
+                raise RuntimeError("account token rotated while verification was in progress")
+            access_token = resolved
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            if remote_verification_version is not None and self._verification_versions.get(access_token, 0) != remote_verification_version:
+                raise RuntimeError("account verification was invalidated while in progress")
+            if remote_success_before is not None:
+                # 后台校验期间可能有图片完成；保守扣除这段时间的本地成功量。
+                consumed = max(0, int(current.get("success") or 0) - remote_success_before)
+                updates = dict(updates)
+                updates["quota"] = max(0, int(updates.get("quota") or 0) - consumed)
+                if current.get("status") == "禁用":
+                    updates["status"] = "禁用"
+                elif updates["quota"] == 0:
+                    updates["status"] = "限流"
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
@@ -1577,6 +1744,8 @@ class AccountService:
                 self._log(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
+            if remote_verification_version is not None:
+                self._verified_at[access_token] = time.monotonic()
             self._save_account(account)
             if not quiet:
                 self._log(LOG_TYPE_ACCOUNT, "更新账号",
@@ -1585,7 +1754,7 @@ class AccountService:
         return None
 
     def _record_refresh_success(self, access_token: str) -> None:
-        with self._lock:
+        with self._timed_account_lock("account_record_refresh_success_lock"):
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -1622,7 +1791,7 @@ class AccountService:
         defer_invalid_removal: bool = True,
     ) -> bool:
         now = datetime.now(timezone.utc)
-        with self._lock:
+        with self._timed_account_lock("account_record_invalid_token_seen_lock"):
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -1630,6 +1799,9 @@ class AccountService:
             should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+            self._verified_at.pop(access_token, None)
+            self._verification_versions[access_token] = self._verification_versions.get(access_token, 0) + 1
+            next_item["remote_verified_at"] = None
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
@@ -1651,9 +1823,8 @@ class AccountService:
         if not access_token:
             return None
         with self._image_slot_condition:
-            access_token = self._release_image_slot_locked(access_token)
-            if not success:
-                self._verified_at.pop(access_token, None)
+            # 最终账号状态将在_save_account/_delete_account同步索引，避免旧状态再旋转一遍。
+            access_token = self._release_image_slot_locked(access_token, sync_candidate=False)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
@@ -1691,7 +1862,19 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
+        active = self.resolve_access_token(access_token)
+        return self.verification.run(active, lambda: self._fetch_remote_info(
+            active, event, defer_invalid_removal))
+
+    def _fetch_remote_info(self, access_token: str, event: str, defer_invalid_removal: bool = True):
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+
+        def baseline(token):
+            with self._timed_account_lock("account_fetch_remote_info_lock"):
+                account = self._accounts.get(token) or {}
+                return int(account.get("success") or 0), self._verification_versions.get(token, 0)
+
+        success_before, verification_version = baseline(active_token)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             backend = OpenAIBackendAPI(active_token)
@@ -1702,6 +1885,7 @@ class AccountService:
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
+                success_before, verification_version = baseline(refreshed_token)
                 try:
                     backend = OpenAIBackendAPI(refreshed_token)
                     try:
@@ -1727,11 +1911,10 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
-        self._record_refresh_success(active_token)
-        account = self.update_account(active_token, result, quiet=True)
-        if account:
-            with self._lock:
-                self._verified_at[account["access_token"]] = time.monotonic()
+        result = {**result, "remote_verified_at": time.time(), "invalid_count": 0,
+                  "last_invalid_at": None, "last_refresh_error": None, "last_refresh_error_at": None}
+        account = self.update_account(active_token, result, quiet=True, remote_success_before=success_before,
+                                      remote_verification_version=verification_version)
         return account
 
     # ---- 刷新进度追踪 ----
@@ -1844,6 +2027,8 @@ class AccountService:
         defer_invalid_removal: bool = True,
         result_metadata: dict[str, Any] | None = None,
         include_items: bool = True,
+        on_progress: Callable | None = None,
+        on_failure: Callable | None = None,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
@@ -1860,10 +2045,31 @@ class AccountService:
         if progress_id:
             self.init_refresh_progress(progress_id, len(access_tokens))
 
+        def refresh_one(token):
+            # 计数的是已进入刷新 worker 的账号，包含远程校验限速/并发等待。
+            # 异常也计入本轮失败；不改变账号失效判定及错误响应的既有策略。
+            success = False
+            failure_account = self.get_account(token) if on_failure else None
+            failure_reason = "刷新未返回账号信息（账号可能已被移除）"
+            if on_progress:
+                on_progress("started")
+            try:
+                account = self.fetch_remote_info(token, "refresh_accounts", defer_invalid_removal)
+                success = account is not None
+                return account
+            except Exception as exc:
+                failure_reason = str(exc) or type(exc).__name__
+                raise
+            finally:
+                if not success and on_failure:
+                    on_failure(refresh_failure_item(token, failure_account, failure_reason))
+                if on_progress:
+                    on_progress("finished", success)
+
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
+                executor.submit(refresh_one, token): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
@@ -1990,7 +2196,7 @@ class AccountService:
 
     def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
         target_tokens = set(token for token in (access_tokens or []) if token)
-        with self._lock:
+        with self._timed_account_lock("account_build_export_items_lock"):
             accounts = [
                 dict(item)
                 for item in self._accounts.values()
@@ -2039,29 +2245,24 @@ class AccountService:
         return items
 
     def get_stats(self) -> dict:
-        with self._lock:
-            view = self._account_view_locked() if hasattr(self, "_account_view_locked") else None
-            if view is None:
-                items = list(self._accounts.values())
-                summary = {
-                    "total": len(items),
-                    "active": sum(1 for a in items if a.get("status") == "正常"),
-                    "limited": sum(1 for a in items if a.get("status") == "限流"),
-                    "abnormal": sum(1 for a in items if a.get("status") == "异常"),
-                    "disabled": sum(1 for a in items if a.get("status") == "禁用"),
-                    "quota": sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常"),
-                    "total_success": sum(int(a.get("success") or 0) for a in items),
-                    "total_fail": sum(int(a.get("fail") or 0) for a in items),
-                }
+        with self._timed_account_lock("account_get_stats_lock"):
+            if hasattr(self, "_stats_summary"):
+                summary = dict(self._stats_summary)
+                by_type = dict(self._stats_by_type)
+            else:
+                # 兼容未调用构造器的旧测试替身。
+                items = tuple(self._accounts.values())
+                summary = dict(total=len(items), active=0, limited=0, abnormal=0, disabled=0,
+                               quota=0, total_success=0, total_fail=0)
                 by_type = {}
                 for item in items:
-                    item_type = item.get("type", "unknown")
-                    by_type[item_type] = by_type.get(item_type, 0) + 1
-            else:
-                summary = view["summary"]
-                by_type = {}
-                for (item_type, _), items in view["buckets"].items():
-                    by_type[item_type] = by_type.get(item_type, 0) + len(items)
+                    for name, status in (("active", "正常"), ("limited", "限流"), ("abnormal", "异常"), ("disabled", "禁用")):
+                        summary[name] += int(item.get("status") == status)
+                    summary["quota"] += max(0, int(item.get("quota") or 0)) if item.get("status") == "正常" else 0
+                    summary["total_success"] += int(item.get("success") or 0)
+                    summary["total_fail"] += int(item.get("fail") or 0)
+                    kind = item.get("type", "unknown")
+                    by_type[kind] = by_type.get(kind, 0) + 1
         return {
             "total": summary["total"],
             "cumulative_total": self._cumulative_total,

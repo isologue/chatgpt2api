@@ -33,7 +33,7 @@ def test_daily_statistics_persist_filter_and_never_rescan_on_refresh(tmp_path):
     path.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8")
     service = LogService(path)
     stats = service.image_stats("2026-10-20", "2026-10-21")
-    assert stats == {"success": 2, "failed": 3, "excluded": 3, "success_images": 5, "total": 5, "success_rate": 40.0, "start_date": "2026-10-20", "end_date": "2026-10-21"}
+    assert stats == {"success": 2, "failed": 3, "excluded": 3, "success_images": 5, "total": 5, "success_rate": 40.0, "start_date": "2026-10-20", "end_date": "2026-10-21", "duration_samples": 0, "duration_p50_ms": None, "duration_p95_ms": None}
     assert service.image_stats("2026-10-20", "2026-10-20")["success_images"] == 2
     assert service.image_stats("2026-10-22", "2026-10-22")["total"] == 0
 

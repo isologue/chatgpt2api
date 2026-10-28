@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
+import anyio
 import json
 import itertools
 import base64
@@ -9,7 +11,7 @@ import sqlite3
 import shutil
 import os
 from contextlib import contextmanager
-from threading import RLock
+from threading import RLock, Lock
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,14 +23,17 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
-from services.image_statistics import call_log_status, image_result_counts
+from services.image_metrics import current_metrics, phase, measured
+from services.isolated_executor import completion_executor
+from services.storage.batch_writer import BatchWriter
+from services.image_statistics import call_log_status, image_result_counts, image_result_duration_ms
 from services.thread_pool import run_image_in_threadpool
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id", "_switch_count", "_account_time_ms", "_account_switch_trace"}
 
 
 class LogService:
@@ -38,6 +43,13 @@ class LogService:
         self._lock = RLock()
         self._maintenance_lock = RLock()
         self._index_path = path.with_suffix(".index.sqlite3")
+        self._schema_lock = RLock()
+        self._schema_ready = False
+        self._known_fingerprint = None
+        self._write_connection = None
+        self._batch_stats_lock = Lock()
+        self._last_batch = self._slowest_batch = None
+        self._writer = BatchWriter(self._write_batch, name="call-log-writer", close=self._close_connection)
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -71,29 +83,77 @@ class LogService:
             return False
         return True
 
+    def _ensure_schema(self):
+        if self._schema_ready:
+            return
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            connection = sqlite3.connect(self._index_path, timeout=30)
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("CREATE TABLE IF NOT EXISTS entries (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, type TEXT, day TEXT, offset INTEGER, length INTEGER, summary TEXT)")
+                connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_seq ON entries(type, seq)")
+                connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_day_seq ON entries(type, day, seq)")
+                connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_day_seq ON entries(day, seq)")
+                connection.execute("CREATE TABLE IF NOT EXISTS entry_filters (seq INTEGER PRIMARY KEY, key_name TEXT, is_async INTEGER, response_format TEXT, status TEXT)")
+                for column in ("key_name", "is_async", "response_format", "status"):
+                    connection.execute(f"CREATE INDEX IF NOT EXISTS ix_entry_filters_{column}_seq ON entry_filters({column}, seq)")
+                connection.execute("CREATE TABLE IF NOT EXISTS log_filters_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS source (id INTEGER PRIMARY KEY, size INTEGER, mtime TEXT, lines INTEGER)")
+                connection.execute("CREATE TABLE IF NOT EXISTS image_stats_daily (day TEXT PRIMARY KEY, success INTEGER NOT NULL, failed INTEGER NOT NULL, excluded INTEGER NOT NULL, success_images INTEGER NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS image_stats_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS image_latency_daily (day TEXT NOT NULL, duration_ms REAL NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(day, duration_ms)) WITHOUT ROWID")
+                connection.execute("CREATE TABLE IF NOT EXISTS image_latency_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
+                connection.commit()
+                self._schema_ready = True
+            finally:
+                connection.close()
+
     @contextmanager
     def _index(self, *, write: bool = False):
+        self._ensure_schema()
         connection = sqlite3.connect(self._index_path, timeout=30)
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("CREATE TABLE IF NOT EXISTS entries (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, type TEXT, day TEXT, offset INTEGER, length INTEGER, summary TEXT)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_seq ON entries(type, seq)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_type_day_seq ON entries(type, day, seq)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_entries_day_seq ON entries(day, seq)")
-            connection.execute("CREATE TABLE IF NOT EXISTS entry_filters (seq INTEGER PRIMARY KEY, key_name TEXT, is_async INTEGER, response_format TEXT, status TEXT)")
-            for column in ("key_name", "is_async", "response_format", "status"):
-                connection.execute(f"CREATE INDEX IF NOT EXISTS ix_entry_filters_{column}_seq ON entry_filters({column}, seq)")
-            connection.execute("CREATE TABLE IF NOT EXISTS log_filters_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
-            connection.execute("CREATE TABLE IF NOT EXISTS source (id INTEGER PRIMARY KEY, size INTEGER, mtime TEXT, lines INTEGER)")
-            connection.execute("CREATE TABLE IF NOT EXISTS image_stats_daily (day TEXT PRIMARY KEY, success INTEGER NOT NULL, failed INTEGER NOT NULL, excluded INTEGER NOT NULL, success_images INTEGER NOT NULL)")
-            connection.execute("CREATE TABLE IF NOT EXISTS image_stats_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
             with connection:
-                # Reads only need a deferred transaction. BEGIN IMMEDIATE here
-                # made log listing/detail compete with every image completion.
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                if not write:
+                    # 立即建立 WAL 快照，读者不与后续追加争锁。
+                    connection.execute("SELECT size FROM source WHERE id=1").fetchone()
                 yield connection
         finally:
             connection.close()
+
+    def initialize(self):
+        self._ensure_current_index()
+
+    def _ensure_current_index(self):
+        self._ensure_schema()
+        if self._known_fingerprint == self._fingerprint():
+            return
+        # 正常写入期间直接读上一次已提交快照。仅首次初始化需要等待。
+        if not self._lock.acquire(blocking=self._known_fingerprint is None):
+            return
+        try:
+            with self._index(write=True) as connection:
+                self._sync_index(connection)
+            self._known_fingerprint = self._fingerprint()
+        finally:
+            self._lock.release()
+
+    def _close_connection(self):
+        if self._write_connection is not None:
+            self._write_connection.close()
+            self._write_connection = None
+
+    def close(self):
+        self._writer.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def _fingerprint(self):
         if not self.path.exists():
@@ -120,11 +180,85 @@ class LogService:
         return summary
 
     def _index_line(self, connection, item, number, offset, length):
+        summary = self._summary(item)
         connection.execute("INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)",
             (number, item["id"], str(item.get("type") or ""), str(item.get("time") or "")[:10],
-             offset, length, self._serialize_item(self._summary(item))))
-        self._index_filters(connection, number, self._summary(item))
+             offset, length, self._serialize_item(summary)))
+        self._index_filters(connection, number, summary)
         self._index_image_stats(connection, item)
+        self._index_image_latency(connection, item)
+
+    def _prepare_index_row(self, item, offset, length, number):
+        # 摘要与统计在追加锁外准备，保留正文原样及原有统计口径。
+        summary = self._summary(item)
+        detail = summary.get("detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        day = str(item.get("time") or "")[:10]
+        is_async = detail.get("is_async")
+        return (
+            (number, item["id"], str(item.get("type") or ""), day, offset, length,
+             self._serialize_item(summary)),
+            (number, str(detail.get("key_name") or ""),
+             int(is_async) if isinstance(is_async, bool) else None,
+             str(detail.get("response_format") or ""), str(detail.get("status") or "")),
+            day, image_result_counts(item), image_result_duration_ms(item),
+        )
+
+    @staticmethod
+    def _insert_rows(connection, sql, columns, rows, suffix=""):
+        # 每次最多700个绑定参数，兼容SQLite旧版999变量限制。
+        # 一条多值SQL替代逐条execute，减少高线程数时反复释放/争抢GIL。
+        for start in range(0, len(rows), 100):
+            chunk = rows[start:start + 100]
+            placeholders = ",".join(["(" + ",".join(["?"] * columns) + ")"] * len(chunk))
+            connection.execute(sql + placeholders + suffix, tuple(v for row in chunk for v in row))
+
+    def _index_batch(self, connection, prepared, number, offset):
+        entries, filters, daily, latency = [], [], {}, {}
+        for entry, filter_row, day, counts, duration in prepared:
+            entries.append((number, *entry[1:4], offset + entry[4], *entry[5:]))
+            filters.append((number, *filter_row[1:]))
+            if any(counts):
+                totals = daily.setdefault(day, [0, 0, 0, 0])
+                for index, count in enumerate(counts):
+                    totals[index] += count
+            if duration is not None:
+                key = (day, duration)
+                latency[key] = latency.get(key, 0) + 1
+            number += 1
+        self._insert_rows(connection, "INSERT OR REPLACE INTO entries VALUES ", 7, entries)
+        self._insert_rows(connection, "INSERT OR REPLACE INTO entry_filters VALUES ", 5, filters)
+        self._insert_rows(connection, "INSERT INTO image_stats_daily VALUES ", 5,
+                          [(day, *counts) for day, counts in daily.items()],
+                          " ON CONFLICT(day) DO UPDATE SET success=success+excluded.success, "
+                          "failed=failed+excluded.failed, excluded=excluded+excluded.excluded, "
+                          "success_images=success_images+excluded.success_images")
+        self._insert_rows(connection, "INSERT INTO image_latency_daily VALUES ", 3,
+                          [(day, duration, count) for (day, duration), count in latency.items()],
+                          " ON CONFLICT(day, duration_ms) DO UPDATE SET count=count+excluded.count")
+        return number
+
+    @staticmethod
+    def _body_chunks(lines, max_bytes=1024 * 1024):
+        # 小正文合并写，大Base64行直接写；避免整批拼接再复制数百MB。
+        pending, size = [], 0
+        for line in lines:
+            if size and size + len(line) > max_bytes:
+                yield b"".join(pending)
+                pending, size = [], 0
+            if len(line) >= max_bytes:
+                yield line
+            else:
+                pending.append(line)
+                size += len(line)
+        if pending:
+            yield b"".join(pending)
+
+    def persistence_stats(self):
+        with self._batch_stats_lock:
+            batches = {"last_batch": self._last_batch, "slowest_batch": self._slowest_batch}
+        return {**self._writer.stats(), **batches}
 
     @staticmethod
     def _index_image_stats(connection, item):
@@ -136,6 +270,23 @@ class LogService:
                 "excluded=excluded+excluded.excluded, success_images=success_images+excluded.success_images",
                 (str(item.get("time") or "")[:10], *counts),
             )
+
+    @staticmethod
+    def _index_image_latency(connection, item):
+        duration = image_result_duration_ms(item)
+        if duration is not None:
+            connection.execute(
+                "INSERT INTO image_latency_daily VALUES (?, ?, 1) ON CONFLICT(day, duration_ms) "
+                "DO UPDATE SET count=count+1", (str(item.get("time") or "")[:10], duration))
+
+    def _sync_latency_index(self, connection):
+        if connection.execute("SELECT version FROM image_latency_meta WHERE id=1").fetchone() == (1,):
+            return
+        # 升级只遍历已有摘要，不重读请求体、响应体或 Base64；后续增量维护。
+        connection.execute("DELETE FROM image_latency_daily")
+        for (summary,) in connection.execute("SELECT summary FROM entries"):
+            self._index_image_latency(connection, json.loads(summary))
+        connection.execute("INSERT OR REPLACE INTO image_latency_meta VALUES (1, 1)")
 
     @staticmethod
     def _index_filters(connection, number, item):
@@ -179,12 +330,14 @@ class LogService:
                                        [(day, *counts) for day, counts in daily.items()])
                 connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
             self._sync_filter_index(connection)
+            self._sync_latency_index(connection)
             return saved[2]
         # Rebuild once for legacy logs or externally restored/edited files.
         # Stream the source: historical Base64 bodies never accumulate in RAM.
         connection.execute("DELETE FROM entries")
         connection.execute("DELETE FROM entry_filters")
         connection.execute("DELETE FROM image_stats_daily")
+        connection.execute("DELETE FROM image_latency_daily")
         number = 0
         if self.path.exists():
             with self.path.open("rb") as source:
@@ -200,24 +353,97 @@ class LogService:
         connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, number))
         connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
         connection.execute("INSERT OR REPLACE INTO log_filters_meta VALUES (1, 1)")
+        connection.execute("INSERT OR REPLACE INTO image_latency_meta VALUES (1, 1)")
         return number
 
+    @staticmethod
+    def _new_item(type, summary, detail, data):
+        return {"id": uuid4().hex, "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": type, "summary": summary, "detail": detail or data}
+
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
-        item = {
-            "id": uuid4().hex,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "type": type, "summary": summary, "detail": detail or data,
-        }
-        # Serialization of potentially large bodies occurs outside the append lock.
-        line = (self._serialize_item(item) + "\n").encode("utf-8")
-        with self._lock, self._index(write=True) as connection:
-            number = self._sync_index(connection)
-            with self.path.open("ab") as target:
-                offset = target.tell()
-                target.write(line)
-            self._index_line(connection, item, number, offset, len(line))
-            size, mtime = self._fingerprint()
-            connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, number + 1))
+        self._writer.submit(self._new_item(type, summary, detail, data)).result()
+
+    async def add_async(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
+        await self._writer.submit_async(self._new_item(type, summary, detail, data))
+
+    @measured("log_write")
+    def _write_batch(self, items):
+        started, cpu_started = time.perf_counter(), time.thread_time()
+        timings = {}
+        payload_bytes = 0
+        succeeded = False
+
+        @contextmanager
+        def stage(name):
+            begin = time.perf_counter()
+            try:
+                with phase(name):
+                    yield
+            finally:
+                timings[name + "_ms"] = round((time.perf_counter() - begin) * 1000, 3)
+
+        try:
+            with stage("log_encode"):
+                lines, prepared, relative_offset = [], [], 0
+                for number, item in enumerate(items):
+                    line = (self._serialize_item(item) + "\n").encode("utf-8")
+                    prepared.append(self._prepare_index_row(item, relative_offset, len(line), number))
+                    lines.append(line)
+                    relative_offset += len(line)
+                payloads = list(self._body_chunks(lines))
+                payload_bytes = relative_offset
+                del lines
+            self._ensure_schema()
+            if self._write_connection is None:
+                self._write_connection = sqlite3.connect(self._index_path, timeout=30)
+            connection = self._write_connection
+            with stage("log_append_lock_wait"):
+                self._lock.acquire()
+            try:
+                original_size = None
+                try:
+                    with connection:
+                        with stage("log_transaction_wait"):
+                            connection.execute("BEGIN IMMEDIATE")
+                        with stage("log_index_sync"):
+                            number = self._sync_index(connection)
+                        with self.path.open("ab") as target:
+                            original_size = target.tell()
+                            with stage("log_body_append"):
+                                for payload in payloads:
+                                    target.write(payload)
+                                target.flush()
+                            with stage("log_index_update"):
+                                number = self._index_batch(connection, prepared, number, original_size)
+                            # 正文与索引仍有序持久化，整批成功之前不确认任何调用。
+                            with stage("log_body_fsync"):
+                                os.fsync(target.fileno())
+                        size, mtime = self._fingerprint()
+                        connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, number))
+                        with stage("log_index_commit"):
+                            connection.commit()
+                except BaseException:
+                    self._known_fingerprint = None
+                    if original_size is not None:
+                        with self.path.open("r+b") as target:
+                            target.truncate(original_size)
+                            target.flush()
+                            os.fsync(target.fileno())
+                    raise
+                self._known_fingerprint = self._fingerprint()
+                succeeded = True
+            finally:
+                self._lock.release()
+        finally:
+            sample = {"items": len(items), "bytes": payload_bytes, "succeeded": succeeded,
+                      "wall_ms": round((time.perf_counter() - started) * 1000, 3),
+                      "thread_cpu_ms": round((time.thread_time() - cpu_started) * 1000, 3),
+                      "stages": timings}
+            with self._batch_stats_lock:
+                self._last_batch = sample
+                if self._slowest_batch is None or sample["wall_ms"] > self._slowest_batch["wall_ms"]:
+                    self._slowest_batch = sample
 
     @staticmethod
     def _list_conditions(type="", start_date="", end_date=""):
@@ -245,8 +471,8 @@ class LogService:
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200,
              *, key_name: str | None = None, is_async: bool | None = None,
              response_format: str = "", status: str = "") -> list[dict[str, Any]]:
-        with self._lock, self._index() as connection:
-            self._sync_index(connection)
+        self._ensure_current_index()
+        with self._index() as connection:
             source, where, params = self._query_scope(type, start_date, end_date, key_name, is_async, response_format, status)
             rows = connection.execute(
                 "SELECT summary FROM " + source + where + " ORDER BY seq DESC LIMIT ?",
@@ -256,9 +482,8 @@ class LogService:
 
     def list_page(self, *, page: int = 1, page_size: int = 20, **filters) -> dict[str, Any]:
         page_size = max(1, min(100, page_size))
+        self._ensure_current_index()
         with self._index() as connection:
-            with self._lock:
-                self._sync_index(connection)
             # WAL 快照查询不持有追加锁，避免翻页阻塞图片完成日志写入。
             source, where, params = self._query_scope(**filters)
             total = connection.execute("SELECT COUNT(*) FROM " + source + where, params).fetchone()[0]
@@ -274,9 +499,8 @@ class LogService:
 
     def storage_stats(self) -> dict[str, int]:
         # 仅复用索引计数、读取文件元数据，不扫描历史请求体或响应体。
+        self._ensure_current_index()
         with self._index() as connection:
-            with self._lock:
-                self._sync_index(connection)
             count = connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
 
         def size(path: Path) -> int:
@@ -303,9 +527,8 @@ class LogService:
 
     def list_key_names(self, type: str = "", start_date: str = "", end_date: str = "",
                        query: str = "", limit: int = 50) -> list[str]:
+        self._ensure_current_index()
         with self._index() as connection:
-            with self._lock:
-                self._sync_index(connection)
             # WAL 快照查询不持有追加锁，避免翻页阻塞图片完成日志写入。
             clauses, params = self._list_conditions(type, start_date, end_date)
             if query:
@@ -319,12 +542,22 @@ class LogService:
             )]
 
     def image_stats(self, start_date: str, end_date: str) -> dict[str, Any]:
-        """增量维护日汇总；正常刷新只读日期范围内的少量汇总行。"""
-        with self._lock, self._index() as connection:
-            self._sync_index(connection)
+        """日计数与耗时频次增量维护；分位数不加载日志正文或摘要。"""
+        self._ensure_current_index()
+        with self._index() as connection:
             row = connection.execute(
                 "SELECT SUM(success), SUM(failed), SUM(excluded), SUM(success_images) "
                 "FROM image_stats_daily WHERE day >= ? AND day <= ?", (start_date, end_date),
+            ).fetchone()
+            latency = connection.execute(
+                "WITH frequencies AS (SELECT duration_ms, SUM(count) AS n FROM image_latency_daily "
+                "WHERE day >= ? AND day <= ? GROUP BY duration_ms), "
+                "ranked AS (SELECT duration_ms, SUM(n) OVER (ORDER BY duration_ms) AS cumulative, "
+                "SUM(n) OVER () AS total FROM frequencies) "
+                "SELECT COALESCE(MAX(total), 0), "
+                "MIN(CASE WHEN cumulative >= (total + 1) / 2 THEN duration_ms END), "
+                "MIN(CASE WHEN cumulative >= (total * 95 + 99) / 100 THEN duration_ms END) FROM ranked",
+                (start_date, end_date),
             ).fetchone()
         success, failed, excluded, success_images = (int(value or 0) for value in row)
         total = success + failed
@@ -333,11 +566,12 @@ class LogService:
             "success_images": success_images, "total": total,
             "success_rate": round(success * 100 / total, 2) if total else 0.0,
             "start_date": start_date, "end_date": end_date,
+            "duration_samples": int(latency[0]), "duration_p50_ms": latency[1], "duration_p95_ms": latency[2],
         }
 
     def get(self, log_id: str) -> dict[str, Any] | None:
-        with self._lock, self._index(write=True) as connection:
-            self._sync_index(connection)
+        self._ensure_current_index()
+        with self._lock, self._index() as connection:
             row = connection.execute("SELECT seq, offset, length FROM entries WHERE id=?", (log_id,)).fetchone()
             if row is None:
                 return None
@@ -351,9 +585,8 @@ class LogService:
 
         # 先查轻量摘要；没有过期日志时不读取/重写请求体和响应体。
         with self._maintenance_lock:
+            self._ensure_current_index()
             with self._index() as connection:
-                with self._lock:
-                    self._sync_index(connection)
                 cutoff_day = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d")
                 ids = set()
                 for log_id, summary in connection.execute("SELECT id, summary FROM entries WHERE day <= ?", (cutoff_day,)):
@@ -376,8 +609,8 @@ class LogService:
         source = target = None
         try:
             # 只在取得快照边界和最终替换时持追加锁，主体压缩在锁外流式完成。
-            with self._lock, self._index() as connection:
-                self._sync_index(connection)
+            self._ensure_current_index()
+            with self._lock:
                 boundary = self.path.stat().st_size
                 source = self.path.open("rb")
             target = temporary.open("wb")
@@ -425,19 +658,22 @@ class LogService:
                         # 元数据整体交换无需再扫描大正文。WAL 读者继续使用旧快照。
                         with self._index(write=True) as connection:
                             connection.execute("ATTACH DATABASE ? AS compacted", (str(staged._index_path),))
-                            for table in ("entries", "entry_filters", "image_stats_daily"):
+                            for table in ("entries", "entry_filters", "image_stats_daily", "image_latency_daily"):
                                 connection.execute(f"DELETE FROM {table}")
                                 connection.execute(f"INSERT INTO {table} SELECT * FROM compacted.{table}")
                             connection.execute("INSERT OR REPLACE INTO image_stats_meta VALUES (1, 1)")
                             connection.execute("INSERT OR REPLACE INTO log_filters_meta VALUES (1, 1)")
+                            connection.execute("INSERT OR REPLACE INTO image_latency_meta VALUES (1, 1)")
                             temporary.replace(self.path)
                             size, mtime = self._fingerprint()
                             connection.execute("INSERT OR REPLACE INTO source VALUES (1, ?, ?, ?)", (size, mtime, new_number))
+                        self._known_fingerprint = self._fingerprint()
                         return {"removed": removed, "reclaimed_bytes": max(0, end - size)}
                 # 锁外追赶清理期间追加的日志，不阻塞生图完成写日志。
                 with staged._index(write=True) as connection:
                     copy_until(end, connection)
         finally:
+            staged.close()
             if source is not None:
                 source.close()
             if target is not None:
@@ -595,29 +831,29 @@ class LoggedCall:
             for key in ("switch_count", "account_time_ms", "account_switch_trace"):
                 if hasattr(exc, key):
                     self.log_context[key] = getattr(exc, key)
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+            await self.log_async("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""), response_body=_response_body(response))
             return response
         except HTTPException as exc:
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc.detail), response_body={"detail": exc.detail})
+            await self.log_async("调用失败", status="failed", error=str(exc.detail), response_body={"detail": exc.detail})
             raise
         except Exception as exc:
             if self.endpoint.startswith("/v1/images"):
                 response = _image_error_response(exc)
             else:
                 response = _protocol_error_response(exc, 502, sse)
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc),
+            await self.log_async("调用失败", status="failed", error=str(exc),
                      account_email=getattr(exc, "account_email", ""), response_body=_response_body(response))
             return response
 
         if isinstance(result, dict):
-            response = dict(result)
-            response.pop("_account_email", None)
+            response = _strip_internal_response_fields(result)
             if response_transform is not None:
                 response = response_transform(response)
-            await run_in_threadpool(self.log, "调用完成", result, response_body=response)
+            await self.log_async("调用完成", result, response_body=response)
             if self.endpoint.startswith("/v1/images"):
-                return await run_in_threadpool(JSONResponse, response)
+                with phase("response_serialization"):
+                    return await completion_executor.run(JSONResponse, response)
             return response
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
@@ -625,19 +861,19 @@ class LoggedCall:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
             self.log_context["error_code"] = exc.code
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+            await self.log_async("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc.detail))
+            await self.log_async("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            await run_in_threadpool(self.log, "调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            await self.log_async("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            await run_in_threadpool(self.log, "流式调用结束")
+            await self.log_async("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
@@ -673,7 +909,35 @@ class LoggedCall:
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
-    def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
+    def log(self, *args, **kwargs) -> None:
+        with phase("log_persistence"):
+            log_service.add(**self._log_item(*args, **kwargs))
+
+    async def log_async(self, *args, **kwargs) -> None:
+        async def persist():
+            with phase("log_persistence"):
+                item = await completion_executor.run(self._prepare_log_item, *args, **kwargs)
+                with phase("log_confirmation"):
+                    await log_service.add_async(**item)
+
+        # 完成阶段即使调用方断开，也确认整条日志；不会只做完构造而丢掉写入。
+        with anyio.CancelScope(shield=True):
+            task = asyncio.create_task(persist())
+            cancellation = None
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+            task.result()
+            if cancellation is not None:
+                raise cancellation
+
+    def _prepare_log_item(self, *args, **kwargs):
+        with phase("log_prepare"):
+            return self._log_item(*args, **kwargs)
+
+    def _log_item(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
             response_body: object = None) -> None:
         detail = {
@@ -687,6 +951,10 @@ class LoggedCall:
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
+        metrics = current_metrics.get()
+        if metrics is not None:
+            detail["timing_id"] = metrics.id
+            detail["phase_timings_ms"] = metrics.snapshot()
         detail.update(self.log_context)
         if self.request_body is not None:
             detail["request_body"] = self.request_body
@@ -718,4 +986,4 @@ class LoggedCall:
             for key in ("_switch_count", "_account_time_ms", "_account_switch_trace"):
                 if key in result:
                     detail[key[1:]] = result[key]
-        log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
+        return {"type": LOG_TYPE_CALL, "summary": f"{self.summary}{suffix}", "detail": detail}

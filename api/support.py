@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event, Thread
+import time
 
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
+from services.account_refresh_monitor import account_refresh_monitor
 from services.auth_service import auth_service
 from services.config import config
 
@@ -81,33 +83,71 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
+    startup_mode = config.account_refresh_startup_mode
 
     def worker() -> None:
+        first_round = True
         while not stop_event.is_set():
+            startup_round = first_round
+            first_round = False
+            full_refresh_round = not (startup_round and startup_mode == "deferred")
+            if not full_refresh_round and account_refresh_monitor.full_refresh_due(interval_seconds):
+                full_refresh_round = True
+            round_id = account_refresh_monitor.start(interval_seconds)
+            round_error = None
             try:
-                limited_tokens = account_service.list_limited_tokens()
-                normal_tokens = account_service.list_normal_tokens()
-                expiring_tokens = account_service.list_expiring_access_tokens()
+                if not full_refresh_round:
+                    # 启动时优先恢复本地账号索引；只处理临期令牌，完整刷新延后到下一轮。
+                    limited_tokens = []
+                    normal_tokens = []
+                    expiring_tokens = account_service.list_expiring_access_tokens()
+                    print(
+                        "[account-watcher] startup deferred: "
+                        f"checking {len(expiring_tokens)} expiring access tokens; "
+                        f"full refresh scheduled at {account_refresh_monitor.next_full_refresh_at(interval_seconds) or '未设置'}"
+                    )
+                else:
+                    limited_tokens = account_service.list_limited_tokens()
+                    normal_tokens = account_service.list_normal_tokens()
+                    expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
                 tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+                account_refresh_monitor.plan(round_id, len(tokens), len(keepalive_tokens))
                 if tokens:
-                    print(
-                        "[account-watcher] checking "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(normal_tokens)} normal accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
-                    )
-                    account_service.refresh_accounts(tokens)
+                    account_refresh_monitor.set_phase(round_id, "refresh")
+                    if full_refresh_round:
+                        print(
+                            "[account-watcher] checking "
+                            f"{len(limited_tokens)} limited accounts, "
+                            f"{len(normal_tokens)} normal accounts, "
+                            f"{len(expiring_tokens)} expiring access tokens"
+                        )
+                    account_service.refresh_accounts(tokens, include_items=False,
+                        on_progress=lambda event, success=None, round_id=round_id: account_refresh_monitor.update(
+                            round_id, "refresh", event, success),
+                        on_failure=lambda item, round_id=round_id: account_refresh_monitor.add_failure(
+                            round_id, "refresh", item))
                 if keepalive_tokens:
+                    account_refresh_monitor.set_phase(round_id, "keepalive")
                     print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
-                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
+                    result = account_service.keepalive_refresh_tokens(keepalive_tokens, include_items=False,
+                        on_progress=lambda event, success=None, round_id=round_id: account_refresh_monitor.update(
+                            round_id, "keepalive", event, success),
+                        on_failure=lambda item, round_id=round_id: account_refresh_monitor.add_failure(
+                            round_id, "keepalive", item))
                     if result.get("errors"):
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
             except Exception as exc:
+                # 不向监控暴露原始异常中的凭证/账号信息。
+                round_error = f"后台刷新中断（{type(exc).__name__}），请检查运行日志"
                 print(f"[account-watcher] fail {exc}")
-            stop_event.wait(interval_seconds)
+            finally:
+                account_refresh_monitor.finish(round_id, round_error, full_refresh=full_refresh_round)
+            next_run_at = account_refresh_monitor.snapshot().get("next_run_at")
+            wait_seconds = max(0, next_run_at - time.time()) if next_run_at else interval_seconds
+            stop_event.wait(wait_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()

@@ -19,6 +19,8 @@ def persisted(method):
         finally:
             self._write_context.pending = None
             self._write_context.after = None
+            if pending:
+                self._writer.ensure_running()
             for future in pending:
                 future.result()
             for callback in after:
@@ -34,14 +36,29 @@ class AccountWriter:
         self._queue = deque()
         self._running = False
 
-    def submit(self, changes=None, *, snapshot=None):
+    def submit(self, changes=None, *, snapshot=None, deferred=False):
         future = Future()
         with self._lock:
             self._queue.append((changes, snapshot, future))
-            if not self._running:
-                self._running = True
-                Thread(target=self._run, name="account-writer", daemon=True).start()
+        if not deferred:
+            self.ensure_running()
         return future
+
+    def ensure_running(self):
+        with self._lock:
+            if self._running or not self._queue:
+                return
+            self._running = True
+        try:
+            Thread(target=self._run, name="account-writer", daemon=True).start()
+        except BaseException as exc:
+            with self._lock:
+                self._running = False
+                batch = list(self._queue)
+                self._queue.clear()
+            for _, _, future in batch:
+                future.set_exception(exc)
+            raise
 
     def _run(self):
         while True:

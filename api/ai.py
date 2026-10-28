@@ -11,6 +11,9 @@ from api.image_inputs import _parse_response_format, parse_image_edit_request, r
 from api.image_task_response import serialize_task_creation, strip_revised_prompt
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
+from services.config import config
+from services.image_metrics import phase
+import time
 from services.editable_file_task_service import editable_file_task_service
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall, json_safe
@@ -77,9 +80,22 @@ class EditableFileTaskRequest(BaseModel):
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
-        await run_in_threadpool(check_request, text)
+        with phase("request_filter"):
+            if config.ai_review.get("enabled") or config.sensitive_words:
+                submitted = time.perf_counter()
+                def check():
+                    from services.image_metrics import current_metrics
+                    metrics = current_metrics.get()
+                    if metrics is not None:
+                        metrics.add("request_filter_queue", time.perf_counter() - submitted)
+                    with phase("request_filter_work"):
+                        return check_request(text)
+                await run_in_threadpool(check)
+            else:
+                # 没有启用审核和关键词规则时，不提交空工作到通用线程池。
+                pass
     except HTTPException as exc:
-        await run_in_threadpool(call.log, "调用失败", status="failed", error=str(exc.detail))
+        await call.log_async("调用失败", status="failed", error=str(exc.detail))
         raise
 
 
@@ -107,7 +123,8 @@ def create_router() -> APIRouter:
             request: Request,
             authorization: str | None = Header(default=None),
     ):
-        identity = await run_in_threadpool(require_identity, authorization)
+        with phase("request_auth"):
+            identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         payload["response_format"] = _parse_response_format(body.response_format)
         payload["base_url"] = resolve_image_base_url(request)
@@ -148,7 +165,8 @@ def create_router() -> APIRouter:
             request: Request,
             authorization: str | None = Header(default=None),
     ):
-        identity = await run_in_threadpool(require_identity, authorization)
+        with phase("request_auth"):
+            identity = require_identity(authorization)
         request_body = await request_body_for_log(request)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         prompt = str(payload["prompt"])

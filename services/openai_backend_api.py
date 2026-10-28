@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlparse
 from curl_cffi import requests
 from PIL import Image
 
+from services.image_metrics import current_metrics, measured, phase
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
@@ -212,6 +213,12 @@ class OpenAIBackendAPI:
                 session.close()
             except Exception:
                 pass
+            finally:
+                # curl_cffi 0.15的Session.close只关curl，不关stream=True懒建的线程池。
+                # 已关闭的backend不会再提交请求；不等待网络退出、不取消已提交的流任务。
+                executor = getattr(session, "_executor", None)
+                if executor is not None:
+                    executor.shutdown(wait=False)
 
     def __del__(self):
         self.close()
@@ -2537,13 +2544,35 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
+    @measured("image_download")
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            response = None
+            metrics = current_metrics.get()
+            try:
+                # 先取得响应头，再单独读取正文，才能区分上游等待首字节和正文传输。
+                with phase("image_download_http"):
+                    response = self.session.get(url, timeout=120, stream=True)
+                ensure_ok(response, "image_download")
+                elapsed = getattr(response, "elapsed", None)
+                ttfb = elapsed.total_seconds() if elapsed is not None else 0.0
+                if metrics is not None and ttfb > 0:
+                    metrics.add("image_download_ttfb", ttfb)
+                with phase("image_download_body"):
+                    content = response.content
+                if metrics is not None:
+                    metrics.add_count("image_download_count")
+                    metrics.add_count("image_download_bytes", len(content))
+                if content not in images:
+                    images.append(content)
+            except Exception:
+                if metrics is not None:
+                    metrics.add_count("image_download_failures")
+                raise
+            finally:
+                if response is not None:
+                    response.close()
         return images
 
     def stream_conversation(

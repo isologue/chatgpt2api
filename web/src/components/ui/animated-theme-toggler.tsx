@@ -184,7 +184,10 @@ export const AnimatedThemeToggler = ({
       localStorage.setItem("chatgpt2api-theme", newTheme ? "dark" : "light")
     }
 
-    if (typeof document.startViewTransition !== "function") {
+    const transitionDocument = document as Document & {
+      startViewTransition?: (callback: () => void) => { ready: Promise<void>; finished: Promise<void> }
+    }
+    if (typeof transitionDocument.startViewTransition !== "function") {
       applyTheme()
       return
     }
@@ -213,7 +216,7 @@ export const AnimatedThemeToggler = ({
       root.style.removeProperty("--magicui-theme-vt-clip-from")
     }
 
-    const transition = document.startViewTransition(() => {
+    const transition = transitionDocument.startViewTransition(() => {
       flushSync(applyTheme)
     })
     if (typeof transition?.finished?.finally === "function") {

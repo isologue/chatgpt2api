@@ -24,6 +24,7 @@ import {
   type CPAPool,
   type CPARemoteFile,
   type ImageStorageMode,
+  type ImageAccountVerificationSettings,
   type ImageStorageSettings,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
@@ -31,6 +32,11 @@ import {
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
+
+export const DEFAULT_IMAGE_ACCOUNT_VERIFICATION: ImageAccountVerificationSettings = {
+  cache_ttl_secs: 300, max_stale_secs: 1800, background_refresh: true,
+  workers: 8, queue_size: 128, starts_per_second: 8, failure_backoff_secs: 30, query_workers: 32,
+};
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
@@ -169,10 +175,13 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
+    account_refresh_startup_mode: config.account_refresh_startup_mode === "full" ? "full" : "deferred",
     anyio_thread_limit: Number(config.anyio_thread_limit || 40),
     image_response_format: config.image_response_format === "b64_json" ? "b64_json" : "url",
     image_allow_response_format_override: config.image_allow_response_format_override !== false,
     image_workers: Number(config.image_workers || 32),
+    image_response_workers: Number(config.image_response_workers || 16),
+    image_account_verification: { ...DEFAULT_IMAGE_ACCOUNT_VERIFICATION, ...config.image_account_verification },
     image_queue_size: Number(config.image_queue_size ?? 128),
     image_account_selection_max_attempts: Number(config.image_account_selection_max_attempts || 20),
     image_poll_timeout_account_switch_retries: Number(config.image_poll_timeout_account_switch_retries ?? 4),
@@ -301,10 +310,13 @@ type SettingsStore = {
   removeBackup: (key: string) => Promise<void>;
   testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
+  setAccountRefreshStartupMode: (value: "deferred" | "full") => void;
   setAnyioThreadLimit: (value: string) => void;
   setImageResponseFormat: (value: "url" | "b64_json") => void;
   setImageAllowResponseFormatOverride: (value: boolean) => void;
   setImageWorkers: (value: string) => void;
+  setImageResponseWorkers: (value: string) => void;
+  setImageAccountVerificationField: (field: keyof ImageAccountVerificationSettings, value: string | boolean) => void;
   setImageQueueSize: (value: string) => void;
   setImageAccountSelectionMaxAttempts: (value: string) => void;
   setImagePollTimeoutAccountSwitchRetries: (value: string) => void;
@@ -440,6 +452,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const data = await updateSettingsConfig({
         ...generalConfig,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
+        account_refresh_startup_mode: config.account_refresh_startup_mode === "full" ? "full" : "deferred",
         anyio_thread_limit: Math.min(1000, Math.max(1, Number(config.anyio_thread_limit) || 40)),
         image_response_format: config.image_response_format === "b64_json" ? "b64_json" : "url",
         image_allow_response_format_override: config.image_allow_response_format_override !== false,
@@ -552,6 +565,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
+  setAccountRefreshStartupMode: (value) => {
+    set((state) => state.config ? { config: { ...state.config, account_refresh_startup_mode: value } } : {});
+  },
+
   setAnyioThreadLimit: (value) => {
     set((state) => state.config ? { config: { ...state.config, anyio_thread_limit: value } } : {});
   },
@@ -562,6 +579,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setImageAllowResponseFormatOverride: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_allow_response_format_override: value } } : {});
   },
+  setImageResponseWorkers: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_response_workers: value } } : {});
+  },
+
+  setImageAccountVerificationField: (field, value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_verification: {
+      ...DEFAULT_IMAGE_ACCOUNT_VERIFICATION, ...state.config.image_account_verification, [field]: value,
+    } } } : {});
+  },
+
   setImageWorkers: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_workers: value } } : {});
   },

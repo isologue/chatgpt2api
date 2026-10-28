@@ -35,7 +35,7 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
     except HTTPException as exc:
-        await run_in_threadpool(call.log, "调用失败", status="failed", error=str(exc.detail))
+        await call.log_async("调用失败", status="failed", error=str(exc.detail))
         raise
 
 

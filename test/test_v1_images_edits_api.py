@@ -76,9 +76,10 @@ class ImagesEditsApiTests(unittest.TestCase):
         with mock.patch.object(
             ai_module.openai_v1_image_generations,
             "handle",
-            return_value={"created": 1, "data": [{"url": "https://example.test/image.png", "revised_prompt": "internal"}]},
+            return_value={"created": 1, "data": [{"url": "https://example.test/image.png", "revised_prompt": "internal"}],
+                          "_switch_count": 2, "_account_time_ms": 50, "_account_switch_trace": [{"account": "fixture"}]},
         ), mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()), mock.patch(
-            "services.log_service.log_service.add"
+            "services.log_service.log_service.add_async"
         ) as add_log:
             response = self.client.post(
                 "/v1/images/generations",
@@ -88,10 +89,14 @@ class ImagesEditsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["data"], [{"url": "https://example.test/image.png"}])
-        detail = add_log.call_args.args[2]
+        detail = add_log.call_args.kwargs["detail"]
         self.assertEqual(detail["request_body"], request_body)
         self.assertEqual(detail["response_body"], response.json())
         self.assertNotIn("base_url", detail["request_body"])
+        self.assertEqual(detail["switch_count"], 2)
+        self.assertEqual(detail["account_time_ms"], 50)
+        self.assertEqual(detail["account_switch_trace"], [{"account": "fixture"}])
+        self.assertFalse(any(key.startswith("_") for key in response.json()))
 
 
 if __name__ == "__main__":

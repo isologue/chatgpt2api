@@ -21,6 +21,7 @@ class RetentionService:
         self.clock = clock
         self._lock = RLock()
         self._policies = {}
+        self._workers: dict[str, Thread] = {}
         self._states = {kind: {"running": False, "last_started_at": None, "last_finished_at": None,
                               "last_result": None, "last_error": None, "next_run_at": None} for kind in KINDS}
 
@@ -68,6 +69,7 @@ class RetentionService:
                          retention_hours=retention_hours, cutoff=self._date(cutoff))
             state["next_run_at"] = now + policy["interval_minutes"] * 60 if policy["enabled"] else None
             worker = Thread(target=self._execute, args=(kind, cutoff), daemon=True, name=f"{kind}-retention")
+            self._workers[kind] = worker
             try:
                 worker.start()
             except Exception:
@@ -105,6 +107,14 @@ class RetentionService:
                 due = policy["enabled"] and not state["running"] and state["next_run_at"] <= self.clock()
                 if due:
                     self.run(kind, policy["retention_hours"], automatic=True)
+
+    def drain(self):
+        # 调度器停止且 HTTP 请求排空后，等待在途清理完成再关闭索引写入器。
+        with self._lock:
+            workers = tuple(self._workers.values())
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join()
 
     def start_scheduler(self, stop_event: Event) -> Thread:
         def watch():

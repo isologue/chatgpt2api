@@ -5,7 +5,8 @@ import hmac
 import secrets
 import uuid
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Event, Lock, Thread
+import time
 from typing import Literal
 
 from services.config import config
@@ -27,7 +28,16 @@ class AuthService:
         self.storage = storage
         self._lock = Lock()
         self._items = self._load()
-        self._last_used_flush_at: dict[str, datetime] = {}
+        # 授权索引只在管理变更后整体替换；鉴权不等待存储 I/O 或管理锁。
+        self._usage_lock = Lock()
+        self._usage: dict[str, str] = {}
+        self._usage_dirty = False
+        self._usage_event = Event()
+        self._usage_thread = None
+        self._usage_closed = False
+        self._usage_flush_interval = 60.0
+        self._usage_flush_at = 0.0
+        self._publish_index()
 
     @staticmethod
     def _clean(value: object) -> str:
@@ -69,11 +79,82 @@ class AuthService:
             return []
         return [normalized for item in items if (normalized := self._normalize_item(item)) is not None]
 
+    def _publish_index(self) -> None:
+        self._auth_index = {str(item["key_hash"]): dict(item) for item in self._items if item.get("enabled")}
+        live_ids = {str(item["id"]) for item in self._items}
+        with self._usage_lock:
+            self._usage = {key: value for key, value in self._usage.items() if key in live_ids}
+
+    def _merge_usage(self) -> None:
+        with self._usage_lock:
+            usage = dict(self._usage)
+        self._items = [{**item, "last_used_at": max(str(item.get("last_used_at") or ""), usage.get(str(item["id"]), "")) or None}
+                       for item in self._items]
+
     def _save(self) -> None:
+        self._merge_usage()
         self.storage.save_auth_keys(self._items)
+        self._publish_index()
 
     def _reload_locked(self) -> None:
         self._items = self._load()
+        self._merge_usage()
+        self._publish_index()
+
+    def _flush_usage(self) -> None:
+        # 与增删改共用管理锁，旧统计快照绝不能覆盖密钥禁用/删除/轮换。
+        with self._lock:
+            with self._usage_lock:
+                if not self._usage_dirty:
+                    return
+                self._usage_dirty = False
+            try:
+                self._save()
+            except Exception:
+                with self._usage_lock:
+                    self._usage_dirty = True
+            finally:
+                self._usage_flush_at = time.monotonic()
+
+    def _usage_worker(self) -> None:
+        while True:
+            self._usage_event.wait()
+            self._usage_event.clear()
+            while True:
+                with self._usage_lock:
+                    closed = self._usage_closed
+                delay = self._usage_flush_interval - (time.monotonic() - self._usage_flush_at)
+                if closed or delay <= 0:
+                    break
+                self._usage_event.wait(delay)
+                self._usage_event.clear()
+            self._flush_usage()
+            with self._usage_lock:
+                if self._usage_closed:
+                    return
+                if self._usage_dirty:
+                    self._usage_event.set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def start(self) -> None:
+        # 支持应用 lifespan 在同一进程内重新进入。
+        with self._usage_lock:
+            if self._usage_closed:
+                self._usage_closed = False
+                self._usage_thread = None
+
+    def close(self) -> None:
+        with self._usage_lock:
+            self._usage_closed = True
+            thread = self._usage_thread
+        self._usage_event.set()
+        if thread is not None:
+            thread.join()
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
@@ -227,27 +308,26 @@ class AuthService:
         if not candidate:
             return None
         candidate_hash = _hash_key(candidate)
-        with self._lock:
-            for index, item in enumerate(self._items):
-                if not bool(item.get("enabled", True)):
-                    continue
-                stored_hash = self._clean(item.get("key_hash"))
-                if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):
-                    continue
-                next_item = dict(item)
-                now = datetime.now(timezone.utc)
-                next_item["last_used_at"] = now.isoformat()
-                self._items[index] = next_item
-                item_id = self._clean(next_item.get("id"))
-                last_flush_at = self._last_used_flush_at.get(item_id)
-                if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
+        item = self._auth_index.get(candidate_hash)
+        if item is None or not hmac.compare_digest(str(item["key_hash"]), candidate_hash):
+            return None
+        now = _now_iso()
+        wake = False
+        with self._usage_lock:
+            if not self._usage_closed:
+                self._usage[str(item["id"])] = now
+                wake = not self._usage_dirty
+                self._usage_dirty = True
+                if self._usage_thread is None:
+                    self._usage_thread = Thread(target=self._usage_worker, name="auth-usage-writer", daemon=True)
                     try:
-                        self._save()
-                        self._last_used_flush_at[item_id] = now
-                    except Exception:
-                        pass
-                return self._public_item(next_item)
-        return None
+                        self._usage_thread.start()
+                    except RuntimeError:
+                        # 使用时间是尽力统计，后台线程启动失败也不能拒绝有效密钥。
+                        self._usage_thread = None
+        if wake:
+            self._usage_event.set()
+        return self._public_item({**item, "last_used_at": now})
 
 
 auth_service = AuthService(config.get_storage_backend())

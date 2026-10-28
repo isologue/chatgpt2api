@@ -157,8 +157,9 @@ class TokenLogTests(unittest.TestCase):
 
 class AuthServiceTests(unittest.TestCase):
     def test_create_authenticate_disable_and_delete_user_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+        with tempfile.TemporaryDirectory() as tmp_dir, AuthService(
+            JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json")
+        ) as service:
 
             item, raw_key = service.create_key(role="user", name="Alice")
 
@@ -183,8 +184,9 @@ class AuthServiceTests(unittest.TestCase):
             self.assertEqual(service.list_keys(role="user"), [])
 
     def test_authenticate_ignores_last_used_save_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+        with tempfile.TemporaryDirectory() as tmp_dir, AuthService(
+            JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json")
+        ) as service:
             item, raw_key = service.create_key(role="user", name="Alice")
 
             def fail_save() -> None:
@@ -199,8 +201,9 @@ class AuthServiceTests(unittest.TestCase):
             self.assertIsNotNone(authed["last_used_at"])
 
     def test_update_user_key_replaces_raw_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+        with tempfile.TemporaryDirectory() as tmp_dir, AuthService(
+            JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json")
+        ) as service:
             item, raw_key = service.create_key(role="user", name="Alice")
 
             updated = service.update_key(item["id"], {"key": "sk-user-custom-key"}, role="user")
@@ -213,8 +216,9 @@ class AuthServiceTests(unittest.TestCase):
             self.assertEqual(authed["id"], item["id"])
 
     def test_user_key_name_must_be_unique(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+        with tempfile.TemporaryDirectory() as tmp_dir, AuthService(
+            JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json")
+        ) as service:
             first, _ = service.create_key(role="user", name="Alice")
             second, _ = service.create_key(role="user", name="Bob")
 

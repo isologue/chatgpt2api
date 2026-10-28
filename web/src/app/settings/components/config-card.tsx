@@ -15,6 +15,16 @@ import { testProxy, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
 
+const verificationFields = [
+  { key: "cache_ttl_secs", label: "校验缓存有效期（秒）", min: 0, max: 86400, fallback: 300, hint: "有效期内直接使用本地账号信息；0 表示每次选中都需重新校验或进入后台刷新。" },
+  { key: "max_stale_secs", label: "校验信息最大使用期限（秒）", min: 0, max: 604800, fallback: 1800, hint: "从上次成功校验开始计时，至少等于缓存有效期；超过后必须先校验再生成。" },
+  { key: "workers", label: "账号校验并发", min: 1, max: 64, fallback: 8, hint: "限制同时校验的账号数，前台和后台共用；不等于生图并发。" },
+  { key: "queue_size", label: "后台校验等待队列", min: 0, max: 10000, fallback: 128, hint: "队列满时跳过本次后台刷新，后续选号再尝试；不丢弃生图请求。" },
+  { key: "starts_per_second", label: "每秒最多启动账号校验", min: 1, max: 1000, fallback: 8, hint: "平滑启动速率，每个账号校验通常还会产生三个子查询。" },
+  { key: "failure_backoff_secs", label: "校验失败退避基数（秒）", min: 1, max: 3600, fallback: 30, hint: "连续失败按倍数延长等待，最长一小时；避免反复查询异常账号。" },
+  { key: "query_workers", label: "账号信息子查询并发", min: 1, max: 192, fallback: 32, hint: "账号信息查询线程上限。请结合校验并发与上游承载能力调整。" },
+] as const;
+
 export function ConfigCard() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
@@ -23,9 +33,12 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
+  const setAccountRefreshStartupMode = useSettingsStore((state) => state.setAccountRefreshStartupMode);
   const setAnyioThreadLimit = useSettingsStore((state) => state.setAnyioThreadLimit);
   const setImageResponseFormat = useSettingsStore((state) => state.setImageResponseFormat);
   const setImageAllowResponseFormatOverride = useSettingsStore((state) => state.setImageAllowResponseFormatOverride);
+  const setImageResponseWorkers = useSettingsStore((state) => state.setImageResponseWorkers);
+  const setImageAccountVerificationField = useSettingsStore((state) => state.setImageAccountVerificationField);
   const setImageWorkers = useSettingsStore((state) => state.setImageWorkers);
   const setImageQueueSize = useSettingsStore((state) => state.setImageQueueSize);
   const setImageAccountSelectionMaxAttempts = useSettingsStore((state) => state.setImageAccountSelectionMaxAttempts);
@@ -203,6 +216,36 @@ export function ConfigCard() {
               <p className="text-xs leading-5 text-stone-500">监控页自动拉取数据的间隔，范围 1 到 60 秒，保存后生效。</p>
             </div>
           </div>
+          <div className="mt-4 space-y-4 rounded-xl border border-stone-200 bg-white/70 p-4">
+            <div>
+              <h4 className="text-sm font-semibold text-stone-800">账号校验与结果返回</h4>
+              <p className="mt-1 text-xs leading-5 text-stone-600">减少生图前的重复查询。成功校验时间会保存并在重启后恢复；首次使用、令牌轮换和认证异常仍需重新校验。保存后立即生效。</p>
+            </div>
+            <label className="flex items-center gap-3 text-sm text-stone-700">
+              <Checkbox checked={config?.image_account_verification?.background_refresh !== false}
+                onCheckedChange={(checked) => setImageAccountVerificationField("background_refresh", Boolean(checked))} />
+              缓存过期后允许使用本地状态并后台刷新（不超过最大使用期限）
+            </label>
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {verificationFields.map((field) => (
+                <div className="space-y-2" key={field.key}>
+                  <label className="text-sm text-stone-700" htmlFor={`verification-${field.key}`}>{field.label}</label>
+                  <Input id={`verification-${field.key}`} type="number" min={field.min} max={field.max} step={1}
+                    value={String(config?.image_account_verification?.[field.key] ?? field.fallback)}
+                    onChange={(event) => setImageAccountVerificationField(field.key, event.target.value)}
+                    className="h-10 rounded-xl border-stone-200 bg-white" />
+                  <p className="text-xs leading-5 text-stone-500">{field.hint}</p>
+                </div>
+              ))}
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700" htmlFor="image-response-workers">结果处理线程并发</label>
+                <Input id="image-response-workers" type="number" min={1} max={128} step={1}
+                  value={String(config?.image_response_workers ?? 16)} onChange={(event) => setImageResponseWorkers(event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white" />
+                <p className="text-xs leading-5 text-stone-500">独立处理日志详情构造和响应编码，避免与图片接入、管理接口争抢通用线程。</p>
+              </div>
+            </div>
+          </div>
           <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4">
             <div className="mb-3">
               <h4 className="text-sm font-semibold text-stone-800">图片账号故障切换</h4>
@@ -266,6 +309,22 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">容器启动时账号刷新策略</label>
+            <Select
+              value={config?.account_refresh_startup_mode === "full" ? "full" : "deferred"}
+              onValueChange={(value) => setAccountRefreshStartupMode(value as "deferred" | "full")}
+            >
+              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="deferred">延后全量刷新（推荐）</SelectItem>
+                <SelectItem value="full">启动立即全量刷新</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-stone-500">下次容器启动生效。延后模式只处理临期账号和 Token 保活，完整账号池刷新等待一个刷新间隔；全量模式保留旧行为。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>

@@ -14,6 +14,7 @@ from curl_cffi import requests
 from fastapi import HTTPException
 from PIL import Image
 
+from services.image_metrics import measured
 from services.config import DATA_DIR, config
 from services.storage.image_index_storage import ImageIndexStorage
 
@@ -200,6 +201,7 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
+    @measured("image_save")
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
         # Historical cleanup runs in the scheduler, never on a generation request.
         rel = self.make_relative_path(image_data)
@@ -235,8 +237,8 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
-        with self._index_lock:
-            self._index_store.put(rel, item)
+        # 有界写入器合并并发元数据写入，等待同一批事务提交。
+        self._index_store.put(rel, item)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -266,7 +268,8 @@ class ImageStorageService:
 
     def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
         with self._index_lock:
-            indexed = self._load_clean_index()
+            before = self._load_index()
+            indexed = {rel: dict(item) for rel, item in before.items() if _is_image_rel(rel)}
             root = config.images_dir
             changed = False
             for path in root.rglob("*"):
@@ -327,7 +330,7 @@ class ImageStorageService:
                     "url": self._public_url(rel, base_url),
                 })
             if changed:
-                self._save_index(indexed)
+                self._index_store.reconcile(before, indexed)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import math
 
 # 使用明确的拒绝语句，审核服务超时/不可用及一般的无图回复仍属于技术失败。
 _POLICY_PATTERNS = (
@@ -61,3 +62,18 @@ def call_log_status(detail: dict) -> str:
     if codes.intersection({"content_policy_violation", "content_filter", "content_blocked", "moderation_blocked", "safety_violation"}) or is_content_policy_rejection(error):
         return "safety_rejected"
     return status
+
+
+def image_result_duration_ms(item: dict) -> float | None:
+    """与结果总请求口径一致；旧记录缺失/非法耗时不当作 0。"""
+    success, failed, _, _ = image_result_counts(item)
+    if not (success or failed):
+        return None
+    value = item["detail"].get("duration_ms")
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return duration if math.isfinite(duration) and 0 <= duration <= 9e15 else None

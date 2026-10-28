@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from services.image_metrics import current_metrics, phase, queued_since, traced_image_task
 from services.storage.image_task_storage import ImageTaskStorage
 from services.thread_pool import image_executor
 from services.config import DATA_DIR, config
@@ -143,7 +144,16 @@ class ImageTaskService:
             close_storage()
 
     def _schedule_reserved(self, handler, *args):
-        future = self._executor.submit_reserved(handler, *args)
+        submitted = time.perf_counter()
+
+        def execute():
+            token = queued_since.set(submitted)
+            try:
+                return handler(*args)
+            finally:
+                queued_since.reset(token)
+
+        future = self._executor.submit_reserved(execute)
         # Register before attaching the callback. A very short task can finish
         # between submit() and add_done_callback(), otherwise close() may wait
         # on a stale future forever while the completed future remains tracked.
@@ -296,6 +306,7 @@ class ImageTaskService:
             raise
         return response
 
+    @traced_image_task
     def _run_task(
         self,
         key: str,
@@ -442,7 +453,12 @@ class ImageTaskService:
         detail["account_time_ms"] = max(0, int(account_time_ms))
         detail["account_switch_trace"] = account_switch_trace if isinstance(account_switch_trace, list) else []
         try:
-            log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
+            metrics = current_metrics.get()
+            if metrics is not None:
+                detail["timing_id"] = metrics.id
+                detail["phase_timings_ms"] = metrics.snapshot()
+            with phase("log_persistence"):
+                log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
             pass
 
