@@ -2563,7 +2563,16 @@ class OpenAIBackendAPI:
                 if metrics is not None and ttfb > 0:
                     metrics.add("image_download_ttfb", ttfb)
                 with phase("image_download_body"):
-                    content = response.content
+                    # curl_cffi 的流式响应不会自动填充 content，必须消费完整响应流。
+                    content = b"".join(response.iter_content())
+                if not content:
+                    raise RuntimeError("image download returned an empty body")
+                # 防止 HTTP 200 的错误页或损坏数据被当作成功图片保存/返回。
+                try:
+                    with Image.open(BytesIO(content)) as image:
+                        image.verify()
+                except Exception as exc:
+                    raise RuntimeError("image download returned invalid image data") from exc
                 if metrics is not None:
                     metrics.add_count("image_download_count")
                     metrics.add_count("image_download_bytes", len(content))

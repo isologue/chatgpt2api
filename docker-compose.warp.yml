@@ -100,11 +100,11 @@ services:
       start_period: 30s
 
   app:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    # image: chatgpt2api:warp
-    image: milodk/chatgpt2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:warp
+    # image: milodk/chatgpt2api:latest
     container_name: chatgpt2api-warp
     restart: unless-stopped
     depends_on:

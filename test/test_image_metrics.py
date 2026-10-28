@@ -44,6 +44,13 @@ def test_metrics_accumulate_parallel_work_and_keep_context():
 def test_download_metrics_separate_headers_body_and_bytes():
     from services.openai_backend_api import OpenAIBackendAPI
 
+    from io import BytesIO
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), "red").save(buffer, format="PNG")
+    payload = buffer.getvalue()
+
     class Session:
         def __init__(self):
             self.calls = []
@@ -54,7 +61,8 @@ def test_download_metrics_separate_headers_body_and_bytes():
                 status_code=200,
                 headers={},
                 elapsed=timedelta(milliseconds=25),
-                content=b"png-bytes",
+                content=b"",  # stream=True 的真实行为：不能直接读取此字段。
+                iter_content=lambda **_kwargs: iter([payload[:10], payload[10:]]),
                 close=lambda: None,
             )
 
@@ -63,14 +71,14 @@ def test_download_metrics_separate_headers_body_and_bytes():
     backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
     backend.session = Session()
     try:
-        assert backend.download_image_bytes(["https://image.example/a.png"]) == [b"png-bytes"]
+        assert backend.download_image_bytes(["https://image.example/a.png"]) == [payload]
     finally:
         current_metrics.reset(token)
 
     snapshot = metrics.snapshot()
     assert backend.session.calls[0][1]["stream"] is True
     assert snapshot["image_download_count"] == 1
-    assert snapshot["image_download_bytes"] == len(b"png-bytes")
+    assert snapshot["image_download_bytes"] == len(payload)
     assert snapshot["image_download_ttfb_ms"] >= 25
     assert snapshot["image_download_body_ms"] >= 0
     assert snapshot["image_download_bytes_per_sec"] >= 0

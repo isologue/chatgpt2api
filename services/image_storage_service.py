@@ -203,6 +203,8 @@ class ImageStorageService:
 
     @measured("image_save")
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+        if not image_data:
+            raise ImageStorageError("cannot save an empty image")
         # Historical cleanup runs in the scheduler, never on a generation request.
         rel = self.make_relative_path(image_data)
         mode = self.mode()
