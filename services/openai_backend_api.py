@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlparse
 from curl_cffi import requests
 from PIL import Image
 
+from services import cpu_pool
 from services.image_metrics import current_metrics, measured, phase
 from services.account_service import account_service
 from services.config import config
@@ -397,13 +398,15 @@ class OpenAIBackendAPI:
         proof_token = ""
         proof_info = data.get("proofofwork") or {}
         if proof_info.get("required"):
-            proof_token = build_proof_token(
-                proof_info.get("seed", ""),
-                proof_info.get("difficulty", ""),
-                self.user_agent,
-                script_sources=self.pow_script_sources,
-                data_build=self.pow_data_build,
-            )
+            with phase("pow_solve"):
+                proof_token = cpu_pool.run(
+                    build_proof_token,
+                    proof_info.get("seed", ""),
+                    proof_info.get("difficulty", ""),
+                    self.user_agent,
+                    self.pow_script_sources,
+                    self.pow_data_build,
+                )
 
         turnstile_token = ""
         turnstile_info = data.get("turnstile") or {}
@@ -2702,13 +2705,15 @@ class OpenAIBackendAPI:
         proof_token = ""
         proof_info = prepare_data.get("proofofwork") or {}
         if proof_info.get("required"):
-            proof_token = build_proof_token(
-                proof_info.get("seed", ""),
-                proof_info.get("difficulty", ""),
-                self.user_agent,
-                script_sources=self.pow_script_sources,
-                data_build=self.pow_data_build,
-            )
+            with phase("pow_solve"):
+                proof_token = cpu_pool.run(
+                    build_proof_token,
+                    proof_info.get("seed", ""),
+                    proof_info.get("difficulty", ""),
+                    self.user_agent,
+                    self.pow_script_sources,
+                    self.pow_data_build,
+                )
 
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}

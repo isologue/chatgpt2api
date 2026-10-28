@@ -25,6 +25,7 @@ from services.retention_service import retention_service
 from services.thread_pool import apply_anyio_thread_limit, configure_image_executors, account_info_executor
 from services.account_service import account_service
 from services.isolated_executor import completion_executor
+from services import cpu_pool
 
 
 def create_app() -> FastAPI:
@@ -38,6 +39,8 @@ def create_app() -> FastAPI:
         account_service.verification.reconfigure()
         account_info_executor.reconfigure(config.image_account_verification["query_workers"])
         completion_executor.reconfigure(config.image_response_workers)
+        # 预热 CPU 进程池：PoW 等纯 CPU 任务改到子进程并行执行，避免占满主进程 GIL 饿死事件循环。
+        await run_in_threadpool(cpu_pool.warmup)
         await run_in_threadpool(log_service.initialize)
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
@@ -64,6 +67,7 @@ def create_app() -> FastAPI:
             await run_in_threadpool(log_service.close)
             await run_in_threadpool(image_storage_service._index_store.close)
             await run_in_threadpool(auth_service.close)
+            await run_in_threadpool(cpu_pool.shutdown)
             await run_in_threadpool(logger.flush)
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)

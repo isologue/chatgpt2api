@@ -127,6 +127,9 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-chatgpt2api}:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatgpt2api}}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      # CPU 进程池并发（PoW 等纯 CPU 任务）。默认 24，给同机其他程序留出余量。
+      # 设为 0 则回退为使用全部 CPU 核数。可在 .env 中覆盖。
+      CHATGPT2API_CPU_POOL_WORKERS: ${CHATGPT2API_CPU_POOL_WORKERS:-24}
 
 volumes:
   postgres16_data:

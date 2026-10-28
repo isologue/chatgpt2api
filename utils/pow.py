@@ -3,6 +3,7 @@ import json
 import random
 import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Sequence
@@ -10,7 +11,12 @@ from typing import Any, Sequence
 import pybase64
 
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
-from utils.helper import new_uuid
+
+
+# 保持本模块只依赖标准库 + pybase64，便于在 spawn 子进程(CPU 进程池)里安全导入，
+# 避免因 `utils.helper` 的重依赖链（curl_cffi / services.*）拖慢或拖垮子进程启动。
+def new_uuid() -> str:
+    return str(uuid.uuid4())
 
 
 CORES = [8, 16, 24, 32]

@@ -20,12 +20,20 @@ class AccountVerification:
         self._condition = Condition()
         self._flights = {}
         self._retry = {}
-        self._active = self._waiting = self._background = 0
-        self._next_start = 0.0
+        # 前台(生图选号校验)与后台(全量刷新)各自独立的在途计数与启动速率闸门。
+        # 否则后台全量刷新会占满共享的并发/速率额度，把前台生图校验挤进长队列
+        # (压测实测 account_verification_queue 尾部排队到 ~100s)。
+        self._active_fg = self._active_bg = self._waiting = self._background = 0
+        self._next_start_fg = self._next_start_bg = 0.0
         self._closed = False
         self._hits = self._stale_hits = self._misses = self._joined = 0
         self._completed = self._failed = self._rejected = 0
         self._pool = _ResizableThreadPool(settings()["workers"], "account-refresh")
+
+    @staticmethod
+    def _background_workers(settings) -> int:
+        # 后台全量刷新只用一部分并发额度，为前台生图校验让出主路；前台独享完整 workers。
+        return max(1, settings["workers"] // 2)
 
     def reconfigure(self):
         if self._closed:
@@ -88,11 +96,23 @@ class AccountVerification:
                 with self._condition:
                     while True:
                         settings = self._settings()
-                        delay = self._next_start - time.monotonic()
-                        if self._active < settings["workers"] and delay <= 0:
-                            self._active += 1
+                        if background:
+                            limit = self._background_workers(settings)
+                            active = self._active_bg
+                            delay = self._next_start_bg - time.monotonic()
+                        else:
+                            limit = settings["workers"]
+                            active = self._active_fg
+                            delay = self._next_start_fg - time.monotonic()
+                        if active < limit and delay <= 0:
+                            next_start = time.monotonic() + 1.0 / settings["starts_per_second"]
+                            if background:
+                                self._active_bg += 1
+                                self._next_start_bg = next_start
+                            else:
+                                self._active_fg += 1
+                                self._next_start_fg = next_start
                             self._waiting -= 1
-                            self._next_start = time.monotonic() + 1.0 / settings["starts_per_second"]
                             started = True
                             break
                         self._condition.wait(timeout=max(0.001, delay) if delay > 0 else None)
@@ -105,7 +125,10 @@ class AccountVerification:
     def _finish(self, key, future, result, error, background, *, started):
         with self._condition:
             if started:
-                self._active -= 1
+                if background:
+                    self._active_bg -= 1
+                else:
+                    self._active_fg -= 1
             else:
                 self._waiting -= 1
             self._background -= int(background)
@@ -134,7 +157,10 @@ class AccountVerification:
         settings = self._settings()
         with self._condition:
             requests = self._hits + self._misses + self._joined
-            return {**settings, "active": self._active, "waiting": self._waiting,
+            return {**settings, "active": self._active_fg + self._active_bg,
+                    "active_foreground": self._active_fg, "active_background": self._active_bg,
+                    "background_workers": self._background_workers(settings),
+                    "waiting": self._waiting,
                     "background_pending": self._background,
                     "background_capacity": settings["workers"] + settings["queue_size"],
                     "cache_hits": self._hits, "stale_hits": self._stale_hits,

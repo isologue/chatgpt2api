@@ -33,3 +33,9 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+
+# 压测产物目录（逐请求/监控/Docker 采样等，含账号邮箱，勿提交）
+/output/
+
+# 下划线前缀的临时压测/诊断脚本（保留正式的 test_*.py 与 __init__.py）
+test/_[a-z]*.py

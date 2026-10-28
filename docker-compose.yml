@@ -51,5 +51,8 @@ services:
       # 基础 URL (可选)
       # - CHATGPT2API_BASE_URL=https://your-domain.com
 
+      # CPU 进程池并发（PoW 等纯 CPU 任务）。默认 24，给同机其他程序留出余量；设为 0 则使用全部核数。
+      - CHATGPT2API_CPU_POOL_WORKERS=${CHATGPT2API_CPU_POOL_WORKERS:-24}
+
 volumes:
   postgres16_data:
