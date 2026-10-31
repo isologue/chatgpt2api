@@ -119,7 +119,7 @@ def test_refresh_callbacks_include_network_errors_missing_accounts_and_dedup(ser
         if token == "invalid":
             raise ValueError("invalid access token")
         return None if token == "missing" else {"email": "test@example.com"}
-    monkeypatch.setattr(service, "fetch_remote_info", fetch)
+    monkeypatch.setattr(service, "_fetch_remote_info", fetch)
     monkeypatch.setattr(service, "list_accounts", Mock(side_effect=AssertionError("must not scan pool")))
     result = service.refresh_accounts(["ok", "network", "invalid", "missing", "ok"], include_items=False,
         on_progress=lambda event, success=None: monitor.update(round_id, "refresh", event, success))
@@ -131,6 +131,8 @@ def test_refresh_callbacks_include_network_errors_missing_accounts_and_dedup(ser
 
 def test_live_active_and_pending_counts(service, monkeypatch):
     entered, release = Event(), Event()
+    monkeypatch.setitem(config.data, "image_account_verification", {"workers": 3})
+    service.verification.reconfigure()
     monitor = AccountRefreshMonitor()
     round_id = monitor.start(60)
     monitor.plan(round_id, 15, 0)
@@ -138,16 +140,16 @@ def test_live_active_and_pending_counts(service, monkeypatch):
         entered.set()
         assert release.wait(5)
         return {}
-    monkeypatch.setattr(service, "fetch_remote_info", fetch)
+    monkeypatch.setattr(service, "_fetch_remote_info", fetch)
     with ThreadPoolExecutor(1) as pool:
         task = pool.submit(service.refresh_accounts, list(map(str, range(15))), include_items=False,
             on_progress=lambda event, success=None: monitor.update(round_id, "refresh", event, success))
         try:
             assert entered.wait(2)
             counts = monitor.snapshot()["refresh"]
-            assert 1 <= counts["active"] <= 10
+            assert 1 <= counts["active"] <= 3
             assert counts["active"] + counts["pending"] == 15
-            assert counts["pending"] >= 5
+            assert counts["pending"] >= 12
             assert counts["completed"] == 0
         finally:
             release.set()
@@ -187,102 +189,46 @@ def test_keepalive_unexpected_exception_finishes_active_item(service, monkeypatc
 
 
 @pytest.mark.parametrize("broken", [False, True])
-def test_watcher_round_and_next_run(monkeypatch, broken):
+def test_watcher_only_maintains_credentials_never_full_pool(monkeypatch, broken):
     import api.support as support
+    import services.account_pool_maintenance as maintenance
     monitor = AccountRefreshMonitor()
-    stop = Event()
     class StopAfterRound(Event):
         def wait(self, timeout=None):
             self.set()
             return True
-    stop = StopAfterRound()
-    fake = SimpleNamespace(
-        list_limited_tokens=lambda: ["a"], list_normal_tokens=lambda: ["a", "b"],
-        list_expiring_access_tokens=lambda: ["b"],
-        list_refresh_token_keepalive_tokens=lambda: ["b", "c"],
-    )
-    def refresh(tokens, *, include_items, on_progress, on_failure):
-        assert tokens == ["a", "b"] and not include_items
-        for ok in [True, False]:
-            on_progress("started")
-            if not ok:
-                on_failure(dict(account="failed@example.com", error="HTTP 429", time=1))
-            on_progress("finished", ok)
-        if broken:
-            raise RuntimeError("secret must never appear in snapshot")
-    def keepalive(tokens, *, include_items, on_progress, on_failure):
-        assert tokens == ["c"] and not include_items
-        on_progress("started")
-        assert monitor.snapshot()["phase"] == "keepalive"
-        assert monitor.snapshot()["status"] == "running"
-        on_progress("finished", True)
-        return {"errors": []}
-    fake.refresh_accounts = refresh
-    fake.keepalive_refresh_tokens = keepalive
-    monkeypatch.setattr(support, "account_service", fake)
-    monkeypatch.setattr(support, "account_refresh_monitor", monitor)
-    monkeypatch.setitem(config.data, "refresh_account_interval_minute", 5)
-    monkeypatch.setitem(config.data, "account_refresh_startup_mode", "full")
-    thread = support.start_limited_account_watcher(stop)
-    thread.join(5)
-    assert not thread.is_alive()
-    state = monitor.snapshot()
-    assert state["status"] == ("failed" if broken else "completed_with_errors")
-    assert state["interval_seconds"] == 300
-    assert state["refresh"]["total"] == 2
-    assert state["next_run_at"] >= state["finished_at"]
-    assert "secret" not in str(state)
-    assert monitor.failures(state["round"], "refresh")["items"][0]["account"] == "failed@example.com"
-
-
-def test_watcher_startup_deferred_refreshes_only_expiring_and_keepalive(monkeypatch):
-    import api.support as support
-
-    monitor = AccountRefreshMonitor()
-
-    class StopAfterRound(Event):
-        def wait(self, timeout=None):
-            self.set()
-            return True
-
     stop = StopAfterRound()
     calls = []
-    fake = SimpleNamespace(
-        list_limited_tokens=lambda: (_ for _ in ()).throw(AssertionError("limited accounts must be deferred")),
-        list_normal_tokens=lambda: (_ for _ in ()).throw(AssertionError("normal accounts must be deferred")),
-        list_expiring_access_tokens=lambda: ["expiring"],
-        list_refresh_token_keepalive_tokens=lambda: ["expiring", "keepalive"],
-    )
-
-    def refresh(tokens, *, include_items, on_progress, on_failure):
-        calls.append(("refresh", tokens))
-        assert tokens == ["expiring"] and not include_items
-        on_progress("started")
-        on_progress("finished", True)
-
+    def forbidden():
+        raise AssertionError("must not perform full pool refresh")
+    def renew(token, **kwargs):
+        calls.append(("renew", token))
+        if broken:
+            raise RuntimeError("secret must never appear in snapshot")
+        return token
     def keepalive(tokens, *, include_items, on_progress, on_failure):
         calls.append(("keepalive", tokens))
-        assert tokens == ["keepalive"] and not include_items
+        assert tokens == ["c"] and not include_items
         on_progress("started")
         on_progress("finished", True)
         return {"errors": []}
-
-    fake.refresh_accounts = refresh
-    fake.keepalive_refresh_tokens = keepalive
+    fake = SimpleNamespace(list_limited_tokens=forbidden, list_normal_tokens=forbidden,
+        refresh_accounts=forbidden, list_expiring_access_tokens=lambda: ["b"],
+        list_refresh_token_keepalive_tokens=lambda: ["b", "c"],
+        refresh_access_token=renew, get_account=lambda _: {"quota": 3},
+        keepalive_refresh_tokens=keepalive)
     monkeypatch.setattr(support, "account_service", fake)
     monkeypatch.setattr(support, "account_refresh_monitor", monitor)
+    monkeypatch.setattr(maintenance, "pool_maintenance", SimpleNamespace(run=lambda _: None, wake=Event()))
     monkeypatch.setitem(config.data, "refresh_account_interval_minute", 5)
-    monkeypatch.setitem(config.data, "account_refresh_startup_mode", "deferred")
-
     thread = support.start_limited_account_watcher(stop)
     thread.join(5)
-
     assert not thread.is_alive()
     state = monitor.snapshot()
-    assert state["status"] == "completed"
-    assert state["refresh"] == dict(total=1, completed=1, succeeded=1, failed=0, active=0, pending=0)
-    assert state["keepalive"] == dict(total=1, completed=1, succeeded=1, failed=0, active=0, pending=0)
-    assert calls == [("refresh", ["expiring"]), ("keepalive", ["keepalive"])]
+    assert state["status"] == ("failed" if broken else "completed")
+    assert state["refresh"]["total"] == 1
+    assert "secret" not in str(state)
+    assert calls == ([("renew", "b")] if broken else [("renew", "b"), ("keepalive", ["c"])])
 
 
 def test_monitoring_api_exposes_refresh_snapshot(monkeypatch, tmp_path):
@@ -351,7 +297,7 @@ def test_refresh_failure_callback_retains_identity_before_removal(service, monke
     def fetch(*args):
         monkeypatch.setattr(service, "get_account", lambda token: None)
         raise RuntimeError("HTTP 401 invalid token secret-token-123")
-    monkeypatch.setattr(service, "fetch_remote_info", fetch)
+    monkeypatch.setattr(service, "_fetch_remote_info", fetch)
     result = service.refresh_accounts(["secret-token-123"], include_items=False, on_failure=failures.append)
     assert result["refreshed"] == 0
     assert len(failures) == 1

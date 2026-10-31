@@ -55,6 +55,15 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
+def parse_pow_resources_bytes(content: bytes, encoding: str) -> tuple[list[str], str]:
+    """与 Response.text 相同的解码规则，解码和解析一起在 CPU worker 执行。"""
+    try:
+        text = content.decode(encoding, errors="replace")
+    except (UnicodeDecodeError, LookupError):
+        text = content.decode("utf-8-sig")
+    return parse_pow_resources(text)
+
+
 def _legacy_parse_time() -> str:
     now = datetime.now(timezone(timedelta(hours=-5)))
     return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"

@@ -186,6 +186,6 @@ def test_account_cache_and_selection_have_separate_timing(service):
         current_metrics.reset(context)
         value.release_image_slot(token)
     timings = metrics.snapshot()
-    for name in ("account_selection_lock_wait_ms", "account_cache_lock_wait_ms",
+    for name in ("account_selection_lock_wait_ms",
                  "account_read_lock_wait_ms", "account_token_inspection_ms"):
         assert timings[name] >= 0

@@ -5,7 +5,7 @@ from contextvars import copy_context
 from threading import BoundedSemaphore, Lock
 
 from services.image_metrics import phase
-from services.async_completion import await_worker
+from services.async_completion import await_worker, submit_off_loop
 from services.thread_pool import _ResizableThreadPool
 
 
@@ -54,15 +54,19 @@ class IsolatedExecutor:
                 with self._lock:
                     self._active -= 1
 
-        try:
-            future = self._pool.submit(context.run, execute)
-        except BaseException:
-            finish_queue()
-            self._finish(None)
-            raise
-        # 取消尚未执行的任务也要结束排队计时、释放容量。
-        future.add_done_callback(lambda _: finish_queue())
-        future.add_done_callback(self._finish)
+        def schedule():
+            # 提交和回调注册整体在后台完成，取消提交协程也不会泄漏许可。
+            try:
+                future = self._pool.submit(context.run, execute)
+            except BaseException:
+                finish_queue()
+                self._finish(None)
+                raise
+            future.add_done_callback(lambda _: finish_queue())
+            future.add_done_callback(self._finish)
+            return future
+
+        future = await submit_off_loop(schedule)
         return await await_worker(future, self._name)
 
     def _finish(self, _):

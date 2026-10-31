@@ -1,3 +1,5 @@
+from services.image_async import blocking, cooperative
+
 import base64
 import json
 import mimetypes
@@ -9,7 +11,6 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import wait
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -21,14 +22,27 @@ from curl_cffi import requests
 from PIL import Image
 
 from services import cpu_pool
+from services.image_diagnostics import (
+    ImageDeadlineExceeded,
+    ImageTaskError,
+    ImageStreamHardTimeoutError,
+    ImagePollTimeoutError,
+    ImageResultResolveError,
+    image_poll_budget,
+    ImageDownloadError,
+    ImageRequestCancelled,
+    remaining_image_budget,
+    wait_with_image_budget,
+)
 from services.image_metrics import current_metrics, measured, phase
+from services.image_transport import ImageBackendSession
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from services.thread_pool import account_info_executor
+from services.account_info_queries import account_info_queries
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
-from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
+from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources, parse_pow_resources_bytes
 from utils.turnstile import solve_turnstile_token
 
 
@@ -36,25 +50,8 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImageTaskError(RuntimeError):
-    """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
-
-    def __init__(self, message: str = "", conversation_id: str = "") -> None:
-        super().__init__(message)
-        self.conversation_id = conversation_id
-
-
-class ImagePollTimeoutError(ImageTaskError):
-    pass
-
-
 class ImageContentPolicyError(ImageTaskError):
     """Raised when image generation is blocked by content policy moderation."""
-    pass
-
-
-class ImageStreamHardTimeoutError(RuntimeError):
-    """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
 
 
@@ -170,7 +167,7 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self.session = ImageBackendSession(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
@@ -329,23 +326,25 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required")
 
-        def fetch_with_isolated_session(method_name: str):
-            # curl_cffi sessions carry mutable cookies/connection state and are
-            # not shared across the three parallel requests. Keep the latency
-            # benefit of parallel probing without racing one Session instance.
-            backend = OpenAIBackendAPI(self.access_token)
-            try:
-                return getattr(backend, method_name)()
-            finally:
-                backend.close()
-
-        futures = [account_info_executor.submit(fetch_with_isolated_session, method_name)
-                   for method_name in ("_get_me", "_get_conversation_init", "_get_default_account")]
-        try:
-            me_payload, init_payload, default_account = [future.result() for future in futures]
-        finally:
-            # Do not close the session while sibling requests are still using it.
-            wait(futures)
+        paths = ("/backend-api/me", "/backend-api/conversation/init",
+                 "/backend-api/accounts/check/v4-2023-04-27")
+        specs = [
+            {"method": "GET", "url": self.base_url + paths[0], "headers": self._headers(paths[0])},
+            {"method": "POST", "url": self.base_url + paths[1],
+             "headers": self._headers(paths[1], {"Content-Type": "application/json"}),
+             "json": {"gizmo_id": None, "requested_default_model": None,
+                      "conversation_id": None, "timezone_offset_min": -480}},
+            {"method": "GET", "url": self.base_url + paths[2] + "?timezone_offset_min=-480",
+             "headers": self._headers(paths[2])},
+        ]
+        responses = account_info_queries.run(proxy_settings.build_session_kwargs(
+            account=self.account, impersonate=self.fp["impersonate"], verify=True),
+            dict(self.session.headers), specs)
+        for path, response in zip(paths, responses):
+            if response.status_code != 200:
+                self._raise_on_error(response, path)
+        me_payload, init_payload, account_payload = [response.json() for response in responses]
+        default_account = ((account_payload.get("accounts") or {}).get("default") or {}).get("account") or {}
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -411,7 +410,7 @@ class OpenAIBackendAPI:
         turnstile_token = ""
         turnstile_info = data.get("turnstile") or {}
         if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
+            turnstile_token = cpu_pool.compute(solve_turnstile_token, turnstile_info["dx"], source_p) or ""
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -896,6 +895,7 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
 
+    @blocking
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
         if (
@@ -1042,6 +1042,7 @@ class OpenAIBackendAPI:
             json=payload,
             timeout=300,
             stream=True,
+            image_stream_timeout=float(config.image_sse_timeout_secs),
         )
         ensure_ok(response, path)
         return response
@@ -2126,25 +2127,27 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
-    def _poll_image_results(
+    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 10.0,
+                            initial_file_ids: list[str] | None = None,
+                            initial_sediment_ids: list[str] | None = None) -> tuple[list[str], list[str]]:
+        with image_poll_budget(timeout_secs, conversation_id), phase("result_poll"):
+            return self._poll_image_results_impl(conversation_id, timeout_secs,
+                                                 initial_file_ids, initial_sediment_ids)
+
+    def _poll_image_results_impl(
             self,
             conversation_id: str,
-            timeout_secs: float = 120.0,
+            timeout_secs: float = 10.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
-        """Poll the conversation document until image file ids appear or budget runs out.
+        """在统一补查预算内优先查询对话结果，再做少量辅助诊断。
 
-        - Sleeps image_poll_initial_wait_secs first (default 10s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
-        - Subsequent polls are image_poll_interval_secs apart (default 10s).
-        - On upstream 429 / 5xx or network errors, backs off exponentially
-          (capped at 16s, +jitter) honoring Retry-After when present.
-        - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
+        首次等待最多使用剩余预算的五分之一；辅助任务查询仅第一轮执行。
+        空结果按配置间隔重查，异常退避及二次确认至少保留 0.5 秒查询时间。
+        Retry-After 或二次确认无法装入剩余预算时提前退出，交给上层切号。
         """
-        start = time.time()
+        start = time.monotonic()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
@@ -2167,17 +2170,20 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            local_remaining = timeout_secs - (time.monotonic() - start)
+            global_remaining = remaining_image_budget()
+            return min(local_remaining, global_remaining) if global_remaining is not None else local_remaining
 
         if has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
-            if settle_for > 0:
-                time.sleep(settle_for)
+            remaining = max(0.0, _remaining())
+            if config.image_settle_secs + 0.5 >= remaining:
+                raise ImageResultResolveError("剩余补查预算不足以完成图片二次确认。", conversation_id)
+            wait_with_image_budget(config.image_settle_secs)
         elif initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
+            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()) / 5)
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                wait_with_image_budget(sleep_for)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2186,7 +2192,12 @@ class OpenAIBackendAPI:
             remaining = _remaining()
             if remaining <= 0:
                 return False
-            sleep_for = min(backoff, remaining)
+            if remaining <= 0.5:
+                return False
+            # Retry-After 不能为了塞进剩余预算而提前重试。
+            if retry_after is not None and backoff + 0.5 >= remaining:
+                raise ImageResultResolveError("上游要求的重试等待超过剩余补查预算。", conversation_id)
+            sleep_for = min(backoff, remaining - 0.5)
             log_payload: Dict[str, Any] = {
                 "event": "image_poll_retry",
                 "conversation_id": conversation_id,
@@ -2199,37 +2210,12 @@ class OpenAIBackendAPI:
             if error is not None:
                 log_payload["error"] = error
             logger.warning(log_payload)
-            time.sleep(sleep_for)
+            wait_with_image_budget(sleep_for)
             return True
 
         last_task_error = ""
         while _remaining() > 0:
             attempt += 1
-            # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
-            # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
-            last_task_error = ""
-            try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
-                        logger.info({
-                            "event": "image_poll_task_error_not_blocking",
-                            "conversation_id": conversation_id,
-                            "attempt": attempt,
-                            "error_msg": error_msg,
-                            "metadata": metadata,
-                        })
-            except Exception as exc:
-                # tasks 查询失败不影响正常轮询流程
-                logger.debug({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": str(exc),
-                })
-
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
@@ -2266,6 +2252,34 @@ class OpenAIBackendAPI:
                     })
                     raise ImageContentPolicyError(policy_msg, conversation_id or "")
 
+            if not file_ids and not sediment_ids and attempt == 1 and _remaining() > 1:
+                # 无结果时只补充一次 tasks 诊断，不能挤占对话结果查询预算。
+                # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
+                last_task_error = ""
+                try:
+                    tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=min(1.0, _remaining() / 10))
+                    for task in tasks:
+                        is_error, error_msg, metadata = self.check_task_error(task)
+                        if is_error and error_msg:
+                            last_task_error = error_msg
+                            logger.info({
+                                "event": "image_poll_task_error_not_blocking",
+                                "conversation_id": conversation_id,
+                                "attempt": attempt,
+                                "error_msg": error_msg,
+                                "metadata": metadata,
+                            })
+                except (ImagePollTimeoutError, ImageDeadlineExceeded, ImageRequestCancelled):
+                    raise
+                except Exception as exc:
+                    # tasks 查询失败不影响正常轮询流程
+                    logger.debug({
+                        "event": "image_poll_task_check_failed",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    })
+
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
@@ -2288,16 +2302,20 @@ class OpenAIBackendAPI:
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
-                wait = min(config.image_settle_secs, max(0.0, _remaining()))
+                remaining = max(0.0, _remaining())
+                if config.image_settle_secs + 0.5 >= remaining:
+                    raise ImageResultResolveError("剩余补查预算不足以完成图片二次确认。", conversation_id)
+                wait = min(config.image_settle_secs, remaining)
                 if wait > 0:
-                    time.sleep(wait)
+                    wait_with_image_budget(wait)
                     continue
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
-                          "elapsed_secs": round(time.time() - start, 1)})
-            wait = min(interval, max(0.0, _remaining()))
-            if wait > 0:
-                time.sleep(wait)
+                          "elapsed_secs": round(time.monotonic() - start, 1)})
+            remaining = max(0.0, _remaining())
+            if remaining <= 0.5:
+                break
+            wait_with_image_budget(min(interval, remaining - 0.5))
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -2532,6 +2550,8 @@ class OpenAIBackendAPI:
                     "file_ids": file_ids,
                     "sediment_ids": sediment_ids,
                 })
+            except (ImageDeadlineExceeded, ImageRequestCancelled):
+                raise
             except Exception as exc:
                 if not file_ids and not sediment_ids:
                     raise
@@ -2547,44 +2567,75 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
+    @staticmethod
+    @blocking
+    def _join_and_validate_image(chunks: list[bytes]) -> bytes:
+        content = b"".join(chunks)
+        if not content:
+            raise RuntimeError("image download returned an empty body")
+        with phase("image_validate"):
+            try:
+                with Image.open(BytesIO(content)) as image:
+                    image.verify()
+            except Exception as exc:
+                raise RuntimeError("image download returned invalid image data") from exc
+        return content
+
     @measured("image_download")
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
+        timeout_secs = float(config.image_download_timeout_secs)
+        retries = int(config.image_download_retries)
         for url in urls:
-            response = None
-            metrics = current_metrics.get()
-            try:
-                # 先取得响应头，再单独读取正文，才能区分上游等待首字节和正文传输。
-                with phase("image_download_http"):
-                    response = self.session.get(url, timeout=120, stream=True)
-                ensure_ok(response, "image_download")
-                elapsed = getattr(response, "elapsed", None)
-                ttfb = elapsed.total_seconds() if elapsed is not None else 0.0
-                if metrics is not None and ttfb > 0:
-                    metrics.add("image_download_ttfb", ttfb)
-                with phase("image_download_body"):
-                    # curl_cffi 的流式响应不会自动填充 content，必须消费完整响应流。
-                    content = b"".join(response.iter_content())
-                if not content:
-                    raise RuntimeError("image download returned an empty body")
-                # 防止 HTTP 200 的错误页或损坏数据被当作成功图片保存/返回。
+            last_error: BaseException | None = None
+            for attempt in range(retries + 1):
+                response = None
+                metrics = current_metrics.get()
                 try:
-                    with Image.open(BytesIO(content)) as image:
-                        image.verify()
+                    request_timeout = remaining_image_budget(timeout_secs)
+                    # 先取得响应头，再单独读取正文，才能区分上游等待首字节和正文传输。
+                    with phase("image_download_http"):
+                        response = self.session.get(url, timeout=request_timeout, stream=True)
+                    ensure_ok(response, "image_download")
+                    elapsed = getattr(response, "elapsed", None)
+                    ttfb = elapsed.total_seconds() if elapsed is not None else 0.0
+                    if metrics is not None and ttfb > 0:
+                        metrics.add("image_download_ttfb", ttfb)
+                    chunks = []
+                    with phase("image_download_body"):
+                        # curl_cffi 的流式响应不会自动填充 content，必须消费完整响应流。
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            remaining_image_budget()
+                            if chunk:
+                                chunks.append(chunk)
+                    content = self._join_and_validate_image(chunks)
+                    if metrics is not None:
+                        metrics.add_count("image_download_count")
+                        metrics.add_count("image_download_bytes", len(content))
+                        metrics.add_count("image_download_attempts", attempt + 1)
+                    if content not in images:
+                        images.append(content)
+                    break
+                except (ImageDownloadError, ImageDeadlineExceeded, ImageRequestCancelled):
+                    raise
                 except Exception as exc:
-                    raise RuntimeError("image download returned invalid image data") from exc
-                if metrics is not None:
-                    metrics.add_count("image_download_count")
-                    metrics.add_count("image_download_bytes", len(content))
-                if content not in images:
-                    images.append(content)
-            except Exception:
-                if metrics is not None:
-                    metrics.add_count("image_download_failures")
-                raise
-            finally:
-                if response is not None:
-                    response.close()
+                    last_error = exc
+                    if attempt >= retries:
+                        if metrics is not None:
+                            metrics.add_count("image_download_failures")
+                            metrics.add_count("image_download_attempts", attempt + 1)
+                        # 该异常只在内部流转，调用层会转换成不暴露上游细节的公共错误。
+                        # 保留底层原因便于诊断和单元测试确认失败发生在哪一步。
+                        raise ImageDownloadError(f"image download failed: {exc}") from exc
+                    try:
+                        if metrics is not None:
+                            metrics.add_count("image_download_retries")
+                        wait_with_image_budget(min(0.5 * (attempt + 1), 2.0))
+                    except BaseException:
+                        raise
+                finally:
+                    if response is not None:
+                        response.close()
         return images
 
     def stream_conversation(
@@ -2636,46 +2687,55 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        with phase("reference_upload"):
+            references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
-        self._bootstrap()
+        with phase("upstream_bootstrap"):
+            self._bootstrap()
         self._report_progress("getting_token")
-        requirements = self._get_chat_requirements()
+        with phase("requirements_token"):
+            requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        with phase("conversation_prepare"):
+            conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        with phase("generation_submit"):
+            response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
-        yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
+        with phase("sse_stream"):
+            yield from self._iter_sse_payloads_capped(response, float(config.image_sse_timeout_secs))
 
     def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
         """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
 
         curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
         上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
-        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
-        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
+        挂起约 29.5 分钟才失败）。这里使用独立的「SSE 流超时」作为硬上限：
+        底层传输由 libcurl 原生总时限中断，并抛出明确错误，避免逐请求看门狗线程。
         """
-        deadline = time.monotonic() + hard_cap_secs
-        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
-        watchdog = threading.Timer(hard_cap_secs, response.close)
-        watchdog.daemon = True
-        watchdog.start()
+        remaining = remaining_image_budget(hard_cap_secs)
+        hard_cap_secs = remaining if remaining is not None else hard_cap_secs
+        deadline = min(time.monotonic() + hard_cap_secs,
+                       getattr(response, "_image_stream_deadline", float("inf")))
+        # libcurl TIMEOUT_MS 会中断静默流；无需为每条流启动 Timer 线程。
+        # 仅调用 response.close() 会等待 stream_task，不能用共享看门狗串行关闭。
         timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         try:
             for payload in iter_sse_payloads(response):
-                yield payload
+                remaining_image_budget()
                 if time.monotonic() >= deadline:
                     raise ImageStreamHardTimeoutError(timeout_message)
+                yield payload
         except ImageStreamHardTimeoutError:
             raise
         except Exception as exc:
-            # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
+            # 原生总时限中断传输后，将底层 curl 错误统一为流硬超时。
+            # 先确认整个请求预算与取消状态，不能把它们误报为上游流超时。
+            remaining_image_budget()
             if time.monotonic() >= deadline:
                 raise ImageStreamHardTimeoutError(timeout_message) from exc
             raise
         finally:
-            watchdog.cancel()
             try:
                 response.close()
             except Exception:
@@ -2689,7 +2749,11 @@ class OpenAIBackendAPI:
             timeout=30,
         )
         ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        if cooperative():
+            self.pow_script_sources, self.pow_data_build = cpu_pool.compute(
+                parse_pow_resources_bytes, response.content, response.encoding)
+        else:
+            self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
@@ -2727,7 +2791,7 @@ class OpenAIBackendAPI:
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}
         if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+            turnstile_token = cpu_pool.compute(solve_turnstile_token, turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
         response = self.session.post(

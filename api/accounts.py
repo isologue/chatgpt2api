@@ -258,13 +258,26 @@ def create_router() -> APIRouter:
         page: int | None = Query(default=None, ge=1),
         page_size: int = Query(default=20, ge=1, le=100),
         query: str = "", account_type: str = "all", status: str = "all",
+        source: str = "all",
+        rt_status: Literal["all", "missing", "unverified", "pending", "valid", "invalid"] = "all",
+        pool: Literal["all", "hot", "cold"] = "all",
+        score_min: int | None = Query(default=None, ge=0, le=100),
+        score_max: int | None = Query(default=None, ge=0, le=100),
+        created_from: float | None = Query(default=None, allow_inf_nan=False),
+        created_to: float | None = Query(default=None, allow_inf_nan=False),
     ):
         require_admin(authorization)
+        if score_min is not None and score_max is not None and score_min > score_max:
+            raise HTTPException(status_code=422, detail="score_min must not exceed score_max")
+        if created_from is not None and created_to is not None and created_from >= created_to:
+            raise HTTPException(status_code=422, detail="created_from must precede created_to")
         # 不带 page 时保留旧客户端兼容；管理页面始终使用分页模式。
         if page is None:
             return _sanitize_account_response({"items": await run_in_threadpool(account_service.list_accounts)})
         return await run_in_threadpool(
-            account_service.list_accounts_page, page, page_size, query, account_type, status
+            account_service.list_accounts_page, page, page_size, query, account_type, status,
+            source=source, rt_status=rt_status, pool=pool, score_min=score_min, score_max=score_max,
+            created_from=created_from, created_to=created_to,
         )
 
     @router.get("/api/accounts/tokens")

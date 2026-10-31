@@ -26,6 +26,9 @@ class StorageBackend(ABC):
         query: str = "",
         account_type: str = "all",
         status: str = "all",
+        source: str = "all", rt_status: str = "all", pool: str = "all",
+        score_min: int | None = None, score_max: int | None = None,
+        created_from: float | None = None, created_to: float | None = None,
     ) -> dict[str, Any] | None:
         """Return a database-backed account page when the backend supports it.
 

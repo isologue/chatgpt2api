@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps } from "react";
+import { AccountColumnFilter, PoolScoreColumnFilter, CreatedColumnFilter, emptyAccountFilters, accountDateBoundary, type AccountTableFilters } from "./account-column-filters";
 import {
   Ban,
   CheckCircle2,
@@ -184,10 +185,21 @@ function formatRestoreAt(value?: string | null) {
   return { absolute, relative };
 }
 
+function AccountDate({ value }: { value?: string | null }) {
+  if (!value) return <span>—</span>;
+  const raw = value.trim();
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const date = new Date(zoned ? raw : `${raw.replace(" ", "T")}Z`);
+  if (Number.isNaN(date.getTime())) return <span title={raw}>—</span>;
+  return <span className="inline-flex flex-col leading-5" title={date.toLocaleString("zh-CN")}>
+    <span>{date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" })}</span>
+    <span className="text-[11px] text-stone-400">{date.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+  </span>;
+}
+
 function maskToken(token?: string) {
   if (!token) return "—";
-  if (token.length <= 18) return token;
-  return `${token.slice(0, 16)}...${token.slice(-8)}`;
+  return token.slice(-6);
 }
 
 function downloadTokens(tokens: string[]) {
@@ -222,6 +234,10 @@ function AccountsPageContent() {
   const selectedAccountsRef = useRef(new Map<string, Account>());
   const [total, setTotal] = useState(0);
   const [types, setTypes] = useState<string[]>([]);
+  const [sources, setSources] = useState<string[]>([]);
+  const [filters, setFilters] = useState<AccountTableFilters>(emptyAccountFilters);
+  const changeFilters = (patch: Partial<AccountTableFilters>) => { setFilters((current) => ({ ...current, ...patch })); setPage(1); };
+
   const [poolSummary, setPoolSummary] = useState<AccountSummary>({ total: 0, active: 0, limited: 0, abnormal: 0, disabled: 0, quota: 0 });
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -260,7 +276,12 @@ function AccountsPageContent() {
     const requestId = ++requestIdRef.current;
     if (!silent) setIsLoading(true);
     try {
-      const data = await fetchAccountsPage({ page, pageSize: Number(pageSize), query: debouncedQuery, accountType: typeFilter, status: statusFilter }, signal);
+      const data = await fetchAccountsPage({ page, pageSize: Number(pageSize), query: debouncedQuery, accountType: typeFilter, status: statusFilter,
+        source: filters.source, rtStatus: filters.rtStatus, pool: filters.pool,
+        scoreMin: filters.scoreMin === "" ? undefined : Number(filters.scoreMin),
+        scoreMax: filters.scoreMax === "" ? undefined : Number(filters.scoreMax),
+        createdFrom: accountDateBoundary(filters.createdStart), createdTo: accountDateBoundary(filters.createdEnd, true),
+      }, signal);
       if (signal?.aborted || requestId !== requestIdRef.current) return;
       setAccounts(data.items);
       for (const item of data.items) {
@@ -268,6 +289,7 @@ function AccountsPageContent() {
       }
       setTotal(data.total);
       setTypes(data.types);
+      setSources(data.sources ?? ["web", "codex"]);
       setPoolSummary(data.summary);
       if (page !== data.page) setPage(data.page);
     } catch (error) {
@@ -276,7 +298,7 @@ function AccountsPageContent() {
     } finally {
       if (!signal?.aborted && requestId === requestIdRef.current) setIsLoading(false);
     }
-  }, [page, pageSize, debouncedQuery, typeFilter, statusFilter]);
+  }, [page, pageSize, debouncedQuery, typeFilter, statusFilter, filters]);
 
   const latestLoadAccountsRef = useRef(loadAccounts);
   useEffect(() => { latestLoadAccountsRef.current = loadAccounts; }, [loadAccounts]);
@@ -693,7 +715,7 @@ function AccountsPageContent() {
           </div>
 
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-            <div className="relative min-w-[260px]">
+            <div className="relative w-full lg:w-72">
               <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
               <Input
                 value={query}
@@ -705,42 +727,10 @@ function AccountsPageContent() {
                 className="h-10 rounded-xl border-stone-200 bg-white/85 pl-10"
               />
             </div>
-            <Select
-              value={typeFilter}
-              onValueChange={(value) => {
-                setTypeFilter(value);
-                setPage(1);
-              }}
-            >
-              <SelectTrigger className="h-10 w-full rounded-xl border-stone-200 bg-white/85 lg:w-[150px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {accountTypeOptions.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={statusFilter}
-              onValueChange={(value) => {
-                setStatusFilter(value as AccountStatus | "all");
-                setPage(1);
-              }}
-            >
-              <SelectTrigger className="h-10 w-full rounded-xl border-stone-200 bg-white/85 lg:w-[150px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {accountStatusOptions.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {(typeFilter !== "all" || statusFilter !== "all" || Object.entries(filters).some(([key, value]) => value !== emptyAccountFilters[key as keyof AccountTableFilters])) ? (
+              <Button variant="ghost" className="h-10 shrink-0 text-stone-500" onClick={() => { setTypeFilter("all"); setStatusFilter("all"); setFilters(emptyAccountFilters); setPage(1); }}>清除筛选</Button>
+            ) : <span className="hidden text-xs text-stone-400 xl:inline">点击表头旁图标筛选</span>}
+
           </div>
         </div>
 
@@ -813,28 +803,32 @@ function AccountsPageContent() {
             </div>
 
             <div aria-busy={isLoading} className={cn("overflow-x-auto", isLoading && "pointer-events-none opacity-60")}>
-              <table className="w-full min-w-[1000px] text-left">
-                <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
+              <table className="w-full min-w-[1440px] table-fixed text-left [&_th]:whitespace-nowrap [&_th]:px-3 [&_td]:px-3 [&_td]:tabular-nums [&_td]:align-middle [&_td]:whitespace-nowrap">
+                <colgroup>
+                  {[40, 100, 80, 80, 94, 106, 126, 204, 118, 64, 132, 56, 64, 56, 116].map((width, index) => <col key={index} style={{ width }} />)}
+                </colgroup>
+                <thead className="border-b border-stone-100 text-xs font-medium text-stone-500">
                   <tr>
-                    <th className="w-12 px-4 py-3">
+                    <th className="py-3">
                       <Checkbox
                         checked={allCurrentSelected}
                         onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
                       />
                     </th>
-                    <th className="w-56 px-4 py-3">token</th>
-                    <th className="w-28 px-4 py-3">类型</th>
-                    <th className="w-24 px-4 py-3">来源</th>
-                    <th className="w-24 px-4 py-3">状态</th>
-                    <th className="w-28 px-4 py-3">RT状态</th>
-                    <th className="w-56 px-4 py-3">账号信息</th>
-                    <th className="w-32 px-4 py-3">创建时间</th>
-                    <th className="w-24 px-4 py-3">额度</th>
-                    <th className="w-40 px-4 py-3">恢复时间</th>
-                    <th className="w-18 px-4 py-3">在途</th>
-                    <th className="w-18 px-4 py-3">成功</th>
-                    <th className="w-18 px-4 py-3">失败</th>
-                    <th className="w-24 px-4 py-3">操作</th>
+                    <th className="py-3">Token 尾号</th>
+                    <th className="py-3"><AccountColumnFilter label="类型" value={typeFilter} options={accountTypeOptions} onChange={(value) => { setTypeFilter(value); setPage(1); }} /></th>
+                    <th className="py-3"><AccountColumnFilter label="来源" value={filters.source} options={[{ value: "all", label: "全部来源" }, ...sources.map((source) => ({ value: source, label: source }))]} onChange={(source) => changeFilters({ source })} /></th>
+                    <th className="py-3"><AccountColumnFilter label="状态" value={statusFilter} options={accountStatusOptions} onChange={(value) => { setStatusFilter(value as AccountStatus | "all"); setPage(1); }} /></th>
+                    <th className="py-3"><AccountColumnFilter label="RT状态" value={filters.rtStatus} options={[{ value: "all", label: "全部 RT 状态" }, { value: "valid", label: "有效" }, { value: "invalid", label: "失效" }, { value: "pending", label: "待重试" }, { value: "unverified", label: "未验证" }, { value: "missing", label: "无 RT" }]} onChange={(rtStatus) => changeFilters({ rtStatus })} /></th>
+                    <th className="py-3"><PoolScoreColumnFilter value={filters} onChange={changeFilters} /></th>
+                    <th className="py-3">账号信息</th>
+                    <th className="py-3"><CreatedColumnFilter value={filters} onChange={changeFilters} /></th>
+                    <th className="py-3">额度</th>
+                    <th className="py-3">恢复时间</th>
+                    <th className="py-3">在途</th>
+                    <th className="py-3">成功</th>
+                    <th className="py-3">失败</th>
+                    <th className="py-3">操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -863,10 +857,10 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium tracking-tight text-stone-700">
+                            <span className="font-mono text-xs font-medium text-stone-700">
                               {maskToken(account.access_token)}
                             </span>
-                            <button
+                            <button aria-label="复制完整 Token" title="复制完整 Token"
                               type="button"
                               className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => {
@@ -912,18 +906,20 @@ function AccountsPageContent() {
                           })()}
                         </td>
                         <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                          <div className="space-y-1 text-xs" title={[
+                            `信息校验：${account.remote_verified_at ? new Date(account.remote_verified_at * 1000).toLocaleString() : "—"}`,
+                            `有效出图：${account.last_image_success_at ? new Date(account.last_image_success_at * 1000).toLocaleString() : "—"}`,
+                            `上游安全拒绝：${account.last_policy_confirmed_at ? new Date(account.last_policy_confirmed_at * 1000).toLocaleString() : "—"}`,
+                          ].join("\n")}>
+                            <span className={cn("inline-flex rounded-md px-2 py-1", account.image_pool_hot ? "bg-sky-50 text-sky-700" : "bg-stone-100 text-stone-500")}>{account.image_pool_hot ? "热池" : "冷池"}</span>
+                            <div className="text-stone-500">评分 {account.image_score ?? 50}</div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="truncate text-xs leading-5 text-stone-600" title={account.email ?? undefined}>{account.email ?? "—"}</div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const raw = (account as any).created_at;
-                            if (!raw) return "—";
-                            try {
-                              const d = new Date(raw + "Z");
-                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-                            } catch { return String(raw).slice(0, 10); }
-                          })()}
+                          <AccountDate value={account.created_at} />
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
@@ -936,7 +932,7 @@ function AccountsPageContent() {
                             return (
                               <div className="space-y-0.5">
                                 {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}
-                                <div>{restore.absolute}</div>
+                                <div className="text-[11px] text-stone-400"><AccountDate value={account.restore_at} /></div>
                               </div>
                             );
                           })()}
@@ -968,7 +964,8 @@ function AccountsPageContent() {
                           <div className="flex items-center gap-1 text-stone-400">
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="rounded-lg p-1.5 transition hover:bg-stone-100 hover:text-stone-700 focus-visible:outline-sky-500"
+                              aria-label="编辑账号" title="编辑账号"
                               onClick={() => openEditDialog(account)}
                               disabled={isUpdating}
                             >
@@ -976,7 +973,8 @@ function AccountsPageContent() {
                             </button>
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="rounded-lg p-1.5 transition hover:bg-stone-100 hover:text-stone-700 focus-visible:outline-sky-500"
+                              aria-label="刷新账号" title="刷新账号"
                               onClick={() => void handleRefreshAccounts([account.access_token])}
                               disabled={isRefreshing}
                             >
@@ -984,7 +982,8 @@ function AccountsPageContent() {
                             </button>
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
+                              className="rounded-lg p-1.5 transition hover:bg-rose-50 hover:text-rose-500 focus-visible:outline-sky-500"
+                              aria-label="删除账号" title="删除账号"
                               onClick={() => void handleDeleteTokens([account.access_token])}
                               disabled={isDeleting}
                             >

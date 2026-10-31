@@ -21,6 +21,7 @@ export type Account = {
   access_token: string;
   type: AccountType;
   source_type?: string | null;
+  created_at?: string | null;
   status: AccountStatus;
   quota: number;
   email?: string | null;
@@ -36,6 +37,12 @@ export type Account = {
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
+  image_pool_hot?: boolean;
+  image_score?: number;
+  remote_verified_at?: number | null;
+  last_image_success_at?: number;
+  last_policy_confirmed_at?: number;
+  last_image_started_at?: number;
   last_used_at?: string | null;
   has_refresh_token?: boolean;
   refresh_token_status?: RefreshTokenStatus;
@@ -162,13 +169,13 @@ export type ThirdPartyAppsSettings = {
 
 export type ImageAccountVerificationSettings = {
   cache_ttl_secs: number | string;
-  max_stale_secs: number | string;
-  background_refresh: boolean;
   workers: number | string;
-  queue_size: number | string;
-  starts_per_second: number | string;
+  hot_pool_size: number | string;
+  hot_idle_secs: number | string;
+  hot_refresh_interval_secs: number | string;
+  cold_refresh_interval_secs: number | string;
   failure_backoff_secs: number | string;
-  query_workers: number | string;
+  wait_timeout_secs: number | string;
 };
 
 export type SettingsConfig = {
@@ -186,7 +193,6 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
-  account_refresh_startup_mode?: "deferred" | "full";
   anyio_thread_limit?: number | string;
   image_response_format?: "url" | "b64_json";
   image_allow_response_format_override?: boolean;
@@ -199,6 +205,10 @@ export type SettingsConfig = {
   image_text_reply_account_switch_retries?: number | string;
   monitoring_refresh_interval_secs?: number | string;
   image_retention_days?: number | string;
+  image_total_timeout_secs?: number | string;
+  image_download_timeout_secs?: number | string;
+  image_download_retries?: number | string;
+  image_sse_timeout_secs?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
@@ -307,7 +317,7 @@ export type SystemLog = {
   [key: string]: unknown;
 };
 
-export type RuntimePhase = { active: number; completed: number; sample_count: number; p95_ms: number; last_ms: number; max_ms?: number };
+export type RuntimePhase = { active: number; completed: number; sample_count: number; p95_ms: number; p50_ms?: number; oldest_active_ms?: number; over_30s?: number; over_120s?: number; last_ms: number; max_ms?: number; max_at?: number | null; last_at?: number | null; recent_window_secs?: number; recent_max_ms?: number; recent_max_at?: number | null; recent_max_started_at?: number | null; timeline?: { at: number; max_ms: number; max_at: number; last_ms: number; samples: number }[] };
 export type PersistenceBatch = { items: number; bytes: number; succeeded: boolean; wall_ms: number; thread_cpu_ms: number; stages: Record<string, number> };
 export type PersistenceQueue = {
   capacity: number; queued: number; pending: number; failed: number; last_queue_wait_ms: number; last_write_ms: number;
@@ -319,9 +329,9 @@ export type AccountRefreshCounts = {
   total: number; completed: number; succeeded: number; failed: number; active: number; pending: number;
 };
 export type AccountRefreshFailures = {
-  round: number; kind: "refresh" | "keepalive"; total: number; retained: number;
+  round: number; kind: "refresh" | "keepalive" | "pool"; total: number; retained: number;
   max_retained: number; offset: number; limit: number;
-  items: { account: string; error: string; time: number }[];
+  items: { account: string; error: string; time: number; lane?: string }[];
 };
 export type AccountRefreshSnapshot = {
   round: number;
@@ -338,7 +348,11 @@ export type MonitoringSnapshot = {
   snapshot_state?: Record<string, { collected_at: number | null; age_ms: number; stale: boolean; refreshing: boolean; refresh_failed: boolean }>;
   account_refresh?: AccountRefreshSnapshot;
   phases?: Record<string, RuntimePhase>;
-  account_verification?: { active: number; waiting: number; background_pending: number; background_capacity: number; cache_hit_rate: number; completed: number; failed: number; background_rejected: number };
+  image_diagnostics?: { active_requests: number; disconnected_running: number; oldest_request_ms: number };
+  image_attempt_results?: { total: number; succeeded: number; failed: number; policy_rejected: number; first_attempt_success_rate: number; switched_success_rate: number; switched_requests: number };
+  account_pool?: { base_size: number; size: number; idle_accounts: number; deficit: number; expanded: number; shrunk: number; evicted: number; last_reason: string; maintenance: Record<string, { scheduled: number; next_due_at: number | null; oldest_overdue_secs: number }> };
+  account_pool_maintenance?: Record<string, { pending: number; completed: number; succeeded: number; failed: number; last_finished_at: number | null; protection_until: number; protection_reason: string | null }>;
+  account_verification?: { lanes?: Record<string, { limit: number; active: number; waiting: number }>; inflight_accounts?: number; active: number; waiting: number; background_pending: number; background_capacity: number; cache_hit_rate: number; completed: number; failed: number; background_rejected: number };
   persistence?: { logs: PersistenceQueue; image_index: PersistenceQueue };
   completion_executor?: { active: number; pending: number; queued: number };
   timestamp: number;
@@ -480,18 +494,27 @@ export type AccountSummary = {
 };
 export type AccountPage = {
   items: Account[]; total: number; page: number; page_size: number;
-  summary: AccountSummary; types: string[];
+  summary: AccountSummary; types: string[]; sources?: string[];
 };
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
 }
 export async function fetchAccountsPage(options: {
   page: number; pageSize: number; query?: string; accountType?: string; status?: string;
+  source?: string; rtStatus?: string; pool?: string; scoreMin?: number; scoreMax?: number;
+  createdFrom?: number; createdTo?: number;
 }, signal?: AbortSignal) {
   const params = new URLSearchParams({
     page: String(options.page), page_size: String(options.pageSize),
     query: options.query ?? "", account_type: options.accountType ?? "all", status: options.status ?? "all",
   });
+  params.set("source", options.source ?? "all");
+  params.set("rt_status", options.rtStatus ?? "all");
+  params.set("pool", options.pool ?? "all");
+  for (const [key, value] of Object.entries({ score_min: options.scoreMin, score_max: options.scoreMax,
+    created_from: options.createdFrom, created_to: options.createdTo })) {
+    if (value !== undefined) params.set(key, String(value));
+  }
   return (await request.get<AccountPage>(`/api/accounts?${params}`, { signal, timeout: 30000 })).data;
 }
 export async function fetchAccountTokens(status = "all") {
@@ -764,13 +787,24 @@ export function getBackupDownloadUrl(key: string) {
   return `/api/backups/download?${params.toString()}`;
 }
 
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
+export async function fetchManagedImages(filters: { start_date?: string; end_date?: string; page?: number; page_size?: number; tags?: string[] }) {
   const params = new URLSearchParams();
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
-    `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
+  params.set("page", String(filters.page || 1));
+  params.set("page_size", String(filters.page_size || 12));
+  filters.tags?.forEach((tag) => params.append("tags", tag));
+  return httpRequest<{ items: ManagedImage[]; total: number; page: number; page_size: number }>(
+    `/api/images?${params.toString()}`,
   );
+}
+
+export async function fetchManagedImagePaths(filters: { start_date?: string; end_date?: string; tags?: string[] }) {
+  const params = new URLSearchParams({ paths_only: "true" });
+  if (filters.start_date) params.set("start_date", filters.start_date);
+  if (filters.end_date) params.set("end_date", filters.end_date);
+  filters.tags?.forEach((tag) => params.append("tags", tag));
+  return httpRequest<{ paths: string[]; total: number }>(`/api/images?${params.toString()}`);
 }
 
 export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
@@ -871,6 +905,10 @@ export async function fetchSystemLog(id: string) {
 export async function fetchAccountRefreshFailures(round: number, kind: "refresh" | "keepalive", offset = 0, limit = 20) {
   const query = new URLSearchParams({ round: String(round), kind, offset: String(offset), limit: String(limit) });
   return httpRequest<AccountRefreshFailures>(`/api/monitoring/account-refresh/failures?${query.toString()}`);
+}
+
+export async function fetchAccountPoolFailures(offset = 0, limit = 20) {
+  return httpRequest<AccountRefreshFailures>(`/api/monitoring/account-pool/failures?offset=${offset}&limit=${limit}`);
 }
 
 export async function fetchMonitoring(startDate?: string, endDate?: string) {

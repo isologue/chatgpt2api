@@ -105,31 +105,23 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
 
 
 DEFAULT_IMAGE_ACCOUNT_VERIFICATION = {
-    "cache_ttl_secs": 300,
-    "max_stale_secs": 1800,
-    "background_refresh": True,
-    "workers": 8,
-    "queue_size": 128,
-    "starts_per_second": 8,
+    "cache_ttl_secs": 900,
+    "workers": 50,
+    "hot_pool_size": 500,
+    "hot_idle_secs": 86400,
+    "hot_refresh_interval_secs": 1800,
+    "cold_refresh_interval_secs": 86400,
+    "wait_timeout_secs": 60,
     "failure_backoff_secs": 30,
-    "query_workers": 32,
 }
 
 
 def _normalize_image_account_verification(value: object) -> dict:
+    # 不迁移旧字段；只保存当前契约的字段，不设置任意的并发截断值。
     source = value if isinstance(value, dict) else {}
-    bounds = {
-        "cache_ttl_secs": (0, 86400), "max_stale_secs": (0, 604800),
-        "workers": (1, 64), "queue_size": (0, 10000),
-        "starts_per_second": (1, 1000), "failure_backoff_secs": (1, 3600),
-        "query_workers": (1, 192),
-    }
-    result = {key: min(high, _normalize_positive_int(
-        source.get(key), DEFAULT_IMAGE_ACCOUNT_VERIFICATION[key], low))
-        for key, (low, high) in bounds.items()}
-    result["max_stale_secs"] = max(result["cache_ttl_secs"], result["max_stale_secs"])
-    result["background_refresh"] = _normalize_bool(source.get("background_refresh"), True)
-    return result
+    return {key: _normalize_positive_int(source.get(key), default,
+            0 if key in {"cache_ttl_secs", "hot_pool_size"} else 1)
+            for key, default in DEFAULT_IMAGE_ACCOUNT_VERIFICATION.items()}
 
 
 DEFAULT_ANYIO_THREAD_LIMIT = 40
@@ -146,8 +138,6 @@ DEFAULT_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES = 3
 MAX_IMAGE_TEXT_REPLY_ACCOUNT_SWITCH_RETRIES = 100
 DEFAULT_MONITORING_REFRESH_INTERVAL_SECS = 3
 MAX_MONITORING_REFRESH_INTERVAL_SECS = 60
-DEFAULT_ACCOUNT_REFRESH_STARTUP_MODE = "deferred"
-ACCOUNT_REFRESH_STARTUP_MODES = {"deferred", "full"}
 
 
 def _normalize_anyio_thread_limit(value: object) -> int:
@@ -196,11 +186,6 @@ def _normalize_monitoring_refresh_interval_secs(value: object) -> int:
     except (OverflowError, TypeError, ValueError):
         normalized = DEFAULT_MONITORING_REFRESH_INTERVAL_SECS
     return min(MAX_MONITORING_REFRESH_INTERVAL_SECS, max(1, normalized))
-
-
-def _normalize_account_refresh_startup_mode(value: object) -> str:
-    normalized = str(value or DEFAULT_ACCOUNT_REFRESH_STARTUP_MODE).strip().lower()
-    return normalized if normalized in ACCOUNT_REFRESH_STARTUP_MODES else DEFAULT_ACCOUNT_REFRESH_STARTUP_MODE
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -399,7 +384,6 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
 class LoadedSettings:
     auth_key: str
     refresh_account_interval_minute: int
-    account_refresh_startup_mode: str
 
 
 def _normalize_auth_key(value: object) -> str:
@@ -444,9 +428,6 @@ def _load_settings() -> LoadedSettings:
     return LoadedSettings(
         auth_key=auth_key,
         refresh_account_interval_minute=refresh_interval,
-        account_refresh_startup_mode=_normalize_account_refresh_startup_mode(
-            raw_config.get("account_refresh_startup_mode")
-        ),
     )
 
 
@@ -484,12 +465,8 @@ class ConfigStore:
     def refresh_account_interval_minute(self) -> int:
         try:
             return int(self.data.get("refresh_account_interval_minute", 5))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return 5
-
-    @property
-    def account_refresh_startup_mode(self) -> str:
-        return _normalize_account_refresh_startup_mode(self.data.get("account_refresh_startup_mode"))
 
     @property
     def anyio_thread_limit(self) -> int:
@@ -564,15 +541,36 @@ class ConfigStore:
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return 30
+
+    @property
+    def image_total_timeout_secs(self) -> int:
+        """一次图片请求的总预算，切号和重试不会重新计时。"""
+        return _normalize_positive_int(self.data.get("image_total_timeout_secs", 240), 240, 1)
+
+    @property
+    def image_download_timeout_secs(self) -> int:
+        return _normalize_positive_int(self.data.get("image_download_timeout_secs", 30), 30, 1)
+
+    @property
+    def image_download_retries(self) -> int:
+        try:
+            return max(0, int(self.data.get("image_download_retries", 1)))
+        except (OverflowError, TypeError, ValueError):
+            return 1
+
+    @property
+    def image_sse_timeout_secs(self) -> int:
+        """限制上游生成请求的响应等待及 SSE 接收，不包含结果补查。"""
+        return _normalize_positive_int(self.data.get("image_sse_timeout_secs", 80), 80, 1)
 
     @property
     def image_poll_timeout_secs(self) -> int:
         try:
-            return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
+            return max(1, int(self.data.get("image_poll_timeout_secs", 10)))
         except (TypeError, ValueError):
-            return 120
+            return 10
 
     @property
     def image_poll_interval_secs(self) -> float:
@@ -731,7 +729,7 @@ class ConfigStore:
         data = dict(self.data)
         data["data_retention"] = self.get_retention_settings()
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
-        data["account_refresh_startup_mode"] = self.account_refresh_startup_mode
+        data.pop("account_refresh_startup_mode", None)
         data["anyio_thread_limit"] = self.anyio_thread_limit
         data["image_response_format"] = self.image_response_format
         data["image_allow_response_format_override"] = self.image_allow_response_format_override
@@ -744,7 +742,11 @@ class ConfigStore:
         data["image_text_reply_account_switch_retries"] = self.image_text_reply_account_switch_retries
         data["monitoring_refresh_interval_secs"] = self.monitoring_refresh_interval_secs
         data["image_retention_days"] = self.image_retention_days
+        data["image_sse_timeout_secs"] = self.image_sse_timeout_secs
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_total_timeout_secs"] = self.image_total_timeout_secs
+        data["image_download_timeout_secs"] = self.image_download_timeout_secs
+        data["image_download_retries"] = self.image_download_retries
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
@@ -799,9 +801,7 @@ class ConfigStore:
         next_data["anyio_thread_limit"] = _normalize_anyio_thread_limit(
             next_data.get("anyio_thread_limit", DEFAULT_ANYIO_THREAD_LIMIT)
         )
-        next_data["account_refresh_startup_mode"] = _normalize_account_refresh_startup_mode(
-            next_data.get("account_refresh_startup_mode", self.account_refresh_startup_mode)
-        )
+        next_data.pop("account_refresh_startup_mode", None)
         next_data["image_response_format"] = normalize_image_response_format(
             next_data.get("image_response_format", self.image_response_format)
         )
@@ -815,6 +815,19 @@ class ConfigStore:
         next_data["image_queue_size"] = _normalize_image_queue_size(
             next_data.get("image_queue_size", self.image_queue_size)
         )
+        next_data["image_sse_timeout_secs"] = _normalize_positive_int(
+            next_data.get("image_sse_timeout_secs", self.image_sse_timeout_secs), 80, 1)
+        next_data["image_poll_timeout_secs"] = _normalize_positive_int(
+            next_data.get("image_poll_timeout_secs", self.image_poll_timeout_secs), 10, 1)
+        next_data["image_total_timeout_secs"] = _normalize_positive_int(
+            next_data.get("image_total_timeout_secs", self.image_total_timeout_secs), 240, 1)
+        next_data["image_download_timeout_secs"] = _normalize_positive_int(
+            next_data.get("image_download_timeout_secs", self.image_download_timeout_secs), 30, 1)
+        try:
+            next_data["image_download_retries"] = max(0, int(
+                next_data.get("image_download_retries", self.image_download_retries)))
+        except (OverflowError, TypeError, ValueError):
+            raise ValueError("image_download_retries must be a non-negative integer")
         next_data["image_response_workers"] = min(128, _normalize_positive_int(
             next_data.get("image_response_workers", self.image_response_workers), 16, 1))
         next_data["image_account_verification"] = _normalize_image_account_verification(

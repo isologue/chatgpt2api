@@ -15,10 +15,10 @@ import asyncio
 import time
 from contextvars import copy_context
 
-from services.image_metrics import current_metrics
+from services.image_metrics import current_metrics, phase
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Condition, Lock
 
 from fastapi import HTTPException
 
@@ -38,6 +38,9 @@ class BoundedImageExecutor:
         self._capacity = self._workers + self._queue_size
         self._inflight = 0
         self._pool = _ResizableThreadPool(self._workers, "image-worker")
+        self._async_runtime = None
+        self._execution_condition = Condition(self._lock)
+        self._running = 0
 
     def reserve(self) -> None:
         with self._lock:
@@ -53,9 +56,46 @@ class BoundedImageExecutor:
         with self._lock:
             self._inflight = max(0, self._inflight - 1)
 
+    def try_start(self):
+        with self._lock:
+            if self._running >= self._workers:
+                return False
+            self._running += 1
+            return True
+
+    def finish_running(self):
+        with self._execution_condition:
+            self._running -= 1
+            self._execution_condition.notify_all()
+        if self._async_runtime is not None:
+            self._async_runtime.wake()
+
     def submit_reserved(self, handler, *args):
+        def execute():
+            with self._execution_condition:
+                while self._running >= self._workers:
+                    self._execution_condition.wait()
+                self._running += 1
+            try:
+                return handler(*args)
+            finally:
+                self.finish_running()
         try:
-            future = self._pool.submit(handler, *args)
+            future = self._pool.submit(execute)
+        except BaseException:
+            self.release()
+            raise
+        future.add_done_callback(lambda _: self.release())
+        return future
+
+    def submit_cooperative_reserved(self, handler, *args):
+        from services.image_async import ImageAsyncRuntime
+        try:
+            with self._lock:
+                if self._async_runtime is None:
+                    self._async_runtime = ImageAsyncRuntime(self)
+                runtime = self._async_runtime
+            future = runtime.submit(handler, *args)
         except BaseException:
             self.release()
             raise
@@ -73,7 +113,10 @@ class BoundedImageExecutor:
             self._workers = workers
             self._queue_size = queue_size
             self._capacity = workers + queue_size
+            self._execution_condition.notify_all()
         self._pool.reconfigure(workers)
+        if self._async_runtime is not None:
+            self._async_runtime.reconfigure(workers)
 
     def stats(self) -> dict[str, int | bool]:
         with self._lock:
@@ -93,6 +136,8 @@ class BoundedImageExecutor:
         }
 
     def shutdown(self, wait=True):
+        if self._async_runtime is not None:
+            self._async_runtime.shutdown(wait=wait)
         self._pool.shutdown(wait=wait, cancel_futures=True)
 
 
@@ -186,8 +231,11 @@ image_executor = BoundedImageExecutor(
 
 async def run_image_in_threadpool(handler, *args):
     submitted = time.perf_counter()
-    context = copy_context()
     metrics = current_metrics.get()
+    if metrics is not None:
+        from services.config import config
+        metrics.diagnostics.configure_budget(config.image_total_timeout_secs)
+    context = copy_context()
     if metrics is not None:
         metrics.add("request_dispatch", submitted - metrics.started)
 
@@ -195,10 +243,38 @@ async def run_image_in_threadpool(handler, *args):
         metrics = current_metrics.get()
         if metrics is not None:
             metrics.add("image_queue_wait", time.perf_counter() - submitted)
-        return handler(*args)
+        if metrics is None:
+            return handler(*args)
+        metrics.diagnostics.worker_enter()
+        try:
+            metrics.diagnostics.remaining()
+            return handler(*args)
+        finally:
+            metrics.diagnostics.worker_exit()
 
-    from services.async_completion import await_worker
-    return await await_worker(image_executor.submit(context.run, execute), "image_worker")
+    from services.async_completion import await_worker, submit_off_loop
+    # 准入只做短计数，立即返回429；真正提交和线程启动交给固定后台线程。
+    image_executor.reserve()
+    from services.image_async import supports_cooperative
+    submit = image_executor.submit_cooperative_reserved if supports_cooperative(handler, args) else image_executor.submit_reserved
+    with phase("image_dispatch_wait"):
+        if supports_cooperative(handler, args):
+            future = await submit_off_loop(submit, execute)
+        else:
+            future = await submit_off_loop(submit, context.run, execute)
+    from services.image_diagnostics import ImageDeadlineExceeded, ImageRequestCancelled
+    try:
+        return await await_worker(future, "image_worker")
+    except (ImageDeadlineExceeded, ImageRequestCancelled) as exc:
+        from services.protocol.conversation import ImageGenerationError
+        cancelled = isinstance(exc, ImageRequestCancelled)
+        raise ImageGenerationError(
+            "The image generation request was cancelled." if cancelled else
+            "The image generation request exceeded its total time budget.",
+            status_code=499 if cancelled else 504,
+            error_type="client_error" if cancelled else "server_error",
+            code="client_disconnected" if cancelled else "image_timeout",
+        ) from exc
 
 
 # Separate pools avoid parent jobs waiting for children in the same executor.
@@ -206,10 +282,15 @@ image_part_executor = _ResizableThreadPool(
     workers=_env_int("CHATGPT2API_IMAGE_WORKERS", 32, 1, 10000),
     thread_name_prefix="image-part",
 )
-account_info_executor = _ResizableThreadPool(32, "account-info")
 image_cleanup_executor = BoundedBackgroundExecutor(
     _env_int("CHATGPT2API_IMAGE_CLEANUP_WORKERS", 4, 1, 32),
     _env_int("CHATGPT2API_IMAGE_CLEANUP_QUEUE_SIZE", 128, 0, 10000),
+)
+
+
+# SSE 和下载复用传输线程；父任务与多图子任务各有一套执行器，容量随设置同步。
+image_stream_executor = _ResizableThreadPool(
+    workers=2 * image_executor.stats()["workers"], thread_name_prefix="image-stream",
 )
 
 
@@ -217,3 +298,13 @@ def configure_image_executors(workers: int, queue_size: int) -> None:
     """Apply image concurrency settings to the running process."""
     image_executor.reconfigure(workers, queue_size)
     image_part_executor.reconfigure(workers)
+    image_stream_executor.reconfigure(2 * max(1, workers))
+
+
+def close_image_async_runtime() -> None:
+    """服务停止时先排空协作任务，释放其事件循环；普通执行器仍可重新配置。"""
+    runtime = image_executor._async_runtime
+    if runtime is not None:
+        runtime.shutdown()
+        with image_executor._lock:
+            image_executor._async_runtime = None

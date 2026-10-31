@@ -41,7 +41,6 @@ class SaveSettingsRegressionTests(unittest.TestCase):
             patch.object(routes, "apply_anyio_thread_limit", AsyncMock()),
             patch.object(routes, "configure_image_executors", MagicMock()),
             patch.object(routes, "account_service", MagicMock()),
-            patch.object(routes, "account_info_executor", MagicMock()),
             patch.object(routes, "completion_executor", MagicMock()),
         ]
         for p in self.patchers:

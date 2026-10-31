@@ -1,4 +1,4 @@
-"""验证前后台校验额度分离：后台全量刷新占满自身额度时，前台生图校验仍能立即通过，
+"""验证前后台校验额度分离：后台热池维护占满自身额度时，前台生图校验仍能立即通过，
 不再被后台挤进长队列。对应优化 account_verification_queue 尾部排队。"""
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from services.config import config, DEFAULT_IMAGE_ACCOUNT_VERIFICATION
 
 @pytest.fixture
 def settings(monkeypatch):
-    # workers=4 → 后台额度 = max(1, 4//2) = 2；前台独享 4。starts_per_second 放大避免速率干扰。
-    value = {**DEFAULT_IMAGE_ACCOUNT_VERIFICATION, "workers": 4, "starts_per_second": 1000, "queue_size": 128}
+    # C=2：前台和后台各自完整使用2个槽位，无后台减半或启动速率限制。
+    value = {**DEFAULT_IMAGE_ACCOUNT_VERIFICATION, "workers": 2}
     monkeypatch.setitem(config.data, "image_account_verification", value)
     return value
 
@@ -58,13 +58,13 @@ def test_foreground_not_blocked_by_saturated_background(verifier):
         def fg_fetch():
             return {"quota": 42}
 
-        with ThreadPoolExecutor(4) as pool:
-            futs = [pool.submit(verifier.run, f"fg-{i}", fg_fetch) for i in range(4)]
+        with ThreadPoolExecutor(2) as pool:
+            futs = [pool.submit(verifier.run, f"fg-{i}", fg_fetch) for i in range(2)]
             results = [f.result(2) for f in futs]
             done_at.append(time.monotonic() - start)
 
-        assert results == [{"quota": 42}] * 4
-        # 前台 4 个在前台额度(4)内并发完成，应很快（远小于 2 秒；后台仍被 release 挂着）。
+        assert results == [{"quota": 42}] * 2
+        # 前台 2 个在前台额度(2)内并发完成，应很快（远小于 2 秒；后台仍被 release 挂着）。
         assert done_at[0] < 1.5
         # 后台仍然占着自己的额度，未被前台挪用。
         assert verifier.stats()["active_background"] == 2
@@ -92,12 +92,12 @@ def test_foreground_concurrency_uses_full_workers(verifier):
         assert verifier.run("bg-2", bg_block, background=True)
         _wait_for(lambda: verifier.stats()["active_background"] == 2)
 
-        # 前台应能同时跑满 workers(=4) 个，而不是被后台占用后只剩 2 个
-        with ThreadPoolExecutor(4) as pool:
-            for i in range(4):
+        # 前台应能同时跑满 workers(=2) 个，而不是被后台占用后只剩 1 个
+        with ThreadPoolExecutor(2) as pool:
+            for i in range(2):
                 pool.submit(verifier.run, f"fg-{i}", fg_hold)
-            _wait_for(lambda: verifier.stats()["active_foreground"] == 4)
-            assert verifier.stats()["active_foreground"] == 4
+            _wait_for(lambda: verifier.stats()["active_foreground"] == 2)
+            assert verifier.stats()["active_foreground"] == 2
             release.set()
     finally:
         release.set()

@@ -23,6 +23,10 @@ class ImageIndexStorage:
             connection.execute("CREATE TABLE IF NOT EXISTS source (id INTEGER PRIMARY KEY, fingerprint TEXT)")
         connection.close()
         self._sync_legacy()
+        # 表达式索引兼容既有元数据表，无需重写图片或改变生图写入协议。
+        with self.connection(write=True) as connection:
+            connection.execute("CREATE INDEX IF NOT EXISTS images_created ON images(json_extract(data, '$.created_at') DESC, path DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS images_date ON images(json_extract(data, '$.date'), json_extract(data, '$.created_at') DESC, path DESC)")
         self._writer = BatchWriter(self._write_batch, name="image-index-writer", close=self._close_connection)
 
     @contextmanager
@@ -116,6 +120,31 @@ class ImageIndexStorage:
 
     def all(self):
         return dict(self.iter_items())
+
+    def list_page(self, *, start_date="", end_date="", page=1, page_size=12,
+                  matching_paths=None, paths_only=False):
+        clauses = ["(path LIKE '%.png' OR path LIKE '%.jpg' OR path LIKE '%.jpeg' OR path LIKE '%.webp')"]
+        args = []
+        for operator, value in ((">=", start_date), ("<=", end_date)):
+            if value:
+                clauses.append("json_extract(data, '$.date') " + operator + " ?")
+                args.append(value)
+        if matching_paths is not None:
+            clauses.append("path IN (SELECT value FROM json_each(?))")
+            args.append(json.dumps(matching_paths))
+        where = " WHERE " + " AND ".join(clauses)
+        order = " ORDER BY json_extract(data, '$.created_at') DESC, path DESC"
+        with self.connection() as connection:
+            # 计数与分页使用同一WAL读快照，避免并发新增/删除产生不一致。
+            connection.execute("BEGIN")
+            total = connection.execute("SELECT COUNT(*) FROM images" + where, args).fetchone()[0]
+            if paths_only:
+                return {"paths": [row[0] for row in connection.execute("SELECT path FROM images" + where + order, args)], "total": total}
+            page = min(page, max(1, (total + page_size - 1) // page_size))
+            rows = connection.execute("SELECT path, data FROM images" + where + order + " LIMIT ? OFFSET ?",
+                                      [*args, page_size, (page - 1) * page_size]).fetchall()
+            return {"items": [{**json.loads(data), "rel": path, "path": path} for path, data in rows],
+                    "total": total, "page": page, "page_size": page_size}
 
     def put(self, path, value):
         self._writer.submit(("put", path, value)).result()

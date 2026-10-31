@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.image_async import blocking
+
 from typing import Any, Iterator
 
 from services.config import config
@@ -41,6 +43,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     result = collect_image_outputs(outputs, request.account_switch_tracker, max_images=n)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
-        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
+        output_tokens=blocking(count_image_output_items_tokens)(result.get("data"), size, quality),
     )
     return result

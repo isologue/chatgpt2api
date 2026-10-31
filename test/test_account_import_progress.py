@@ -14,6 +14,7 @@ from test.test_account_refresh_token_status import MemoryStorage
 class AccountImportProgressTests(unittest.TestCase):
     def setUp(self):
         self.service = AccountService(MemoryStorage())
+        self.addCleanup(self.service.verification.close)
         self.service._save_cumulative_total = lambda: None
         self.gate = threading.Event()
         self.addCleanup(self.gate.set)
@@ -33,7 +34,7 @@ class AccountImportProgressTests(unittest.TestCase):
         self.addCleanup(self.client.__exit__, None, None, None)
         # Release blocked worker threads before closing the client's event loop.
         self.addCleanup(self.gate.set)
-        self.service.fetch_remote_info = lambda token, *_: self.service.get_account(token)
+        self.service._fetch_remote_info = lambda token, *_: self.service.get_account(token)
 
     @staticmethod
     def require_admin(authorization):
@@ -87,7 +88,7 @@ class AccountImportProgressTests(unittest.TestCase):
             if token == "slow" and not self.gate.wait(5):
                 raise RuntimeError("test refresh timed out")
             return self.service.get_account(token)
-        self.service.fetch_remote_info = refresh
+        self.service._fetch_remote_info = refresh
         response = self.client.post("/api/accounts/import", headers=self.headers, json={"tokens": ["fast", "slow"]})
         progress_id = response.json()["progress_id"]
         deadline = time.monotonic() + 5
@@ -112,7 +113,7 @@ class AccountImportProgressTests(unittest.TestCase):
 
     def test_large_import_can_finish_without_upstream_refresh(self):
         calls = []
-        self.service.fetch_remote_info = lambda token, *_: calls.append(token)
+        self.service._fetch_remote_info = lambda token, *_: calls.append(token)
         tokens = [f"token-{index}" for index in range(100)]
         response = self.client.post(
             "/api/accounts/import",

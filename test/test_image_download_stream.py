@@ -72,7 +72,8 @@ def test_rejects_empty_invalid_and_truncated_image_and_closes(payload):
             backend.download_image_bytes(["https://example.test/image.png"])
         assert metrics.snapshot()["image_download_failures"] == 1
         assert metrics.snapshot().get("image_download_count", 0) == 0
-        response.close.assert_called_once()
+        # 下载失败会按配置重试同一个结果地址；每次尝试都必须关闭响应。
+        assert response.close.call_count == 2
     finally:
         current_metrics.reset(token)
 
@@ -87,7 +88,7 @@ def test_stream_read_error_propagates_and_closes():
     backend.session = SimpleNamespace(get=lambda *args, **kwargs: response)
     with pytest.raises(RuntimeError, match="connection interrupted"):
         backend.download_image_bytes(["https://example.test/image.png"])
-    response.close.assert_called_once()
+    assert response.close.call_count == 2
 
 
 def test_storage_rejects_empty_before_any_disk_write(tmp_path):

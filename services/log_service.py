@@ -176,7 +176,7 @@ class LogService:
         summary = dict(item)
         if isinstance(detail := item.get("detail"), dict):
             summary["detail"] = {key: value for key, value in detail.items()
-                                 if key not in {"request_body", "response_body"}}
+                                 if key not in {"request_body", "response_body", "diagnostics", "phase_timings_ms"}}
         return summary
 
     def _index_line(self, connection, item, number, offset, length):
@@ -955,6 +955,7 @@ class LoggedCall:
         if metrics is not None:
             detail["timing_id"] = metrics.id
             detail["phase_timings_ms"] = metrics.snapshot()
+            detail["diagnostics"] = metrics.diagnostics.snapshot()
         detail.update(self.log_context)
         if self.request_body is not None:
             detail["request_body"] = self.request_body

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.image_async import blocking
+
 import json
 import threading
 import time
@@ -153,7 +155,18 @@ class ImageTaskService:
             finally:
                 queued_since.reset(token)
 
-        future = self._executor.submit_reserved(execute)
+        from services.image_async import supports_cooperative
+        mode = args[1] if len(args) > 1 else ''
+        image_handler = self.edit_handler if mode == 'edit' else self.generation_handler
+        payload = args[2] if len(args) > 2 else {}
+        cooperative_submit = getattr(self._executor, 'submit_cooperative_reserved', None)
+        submit = cooperative_submit if cooperative_submit and supports_cooperative(image_handler, (payload,)) else self._executor.submit_reserved
+        # 后台任务有独立预算与取消生命周期，不能继承创建请求的 disconnect。
+        metrics_token = current_metrics.set(None)
+        try:
+            future = submit(execute)
+        finally:
+            current_metrics.reset(metrics_token)
         # Register before attaching the callback. A very short task can finish
         # between submit() and add_done_callback(), otherwise close() may wait
         # on a stale future forever while the completed future remains tracked.
@@ -396,10 +409,12 @@ class ImageTaskService:
                 account_switch_trace=getattr(exc, "account_switch_trace", []),
             )
 
+    @blocking
     def _task_for_log(self, key: str) -> dict[str, Any] | None:
         task = self._store.get(key)
         return _public_task(task) if task else None
 
+    @blocking
     def _log_call(
         self,
         identity: dict[str, object],
@@ -457,11 +472,13 @@ class ImageTaskService:
             if metrics is not None:
                 detail["timing_id"] = metrics.id
                 detail["phase_timings_ms"] = metrics.snapshot()
+                detail["diagnostics"] = metrics.diagnostics.snapshot()
             with phase("log_persistence"):
                 log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
             pass
 
+    @blocking
     def _update_task(self, key: str, **updates: Any) -> None:
         self._store.update(key, {**updates, "updated_at": _now_iso(), "updated_ts": time.time()})
 

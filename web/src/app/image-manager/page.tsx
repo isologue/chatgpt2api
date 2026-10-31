@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { DataRetentionCard } from "@/components/data-retention-card";
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
+import { ImageThumbnail, getImagePreviewUrl } from "@/components/image-thumbnail";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,7 +15,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImagePaths, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -65,6 +66,10 @@ function ImageManagerContent() {
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [selectingAll, setSelectingAll] = useState(false);
+  const imageRequest = useRef(0);
+  const nextLightboxIndex = useRef<"first" | "last" | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [deleteStartDate, setDeleteStartDate] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<ManagedImage | null>(null);
@@ -94,41 +99,56 @@ function ImageManagerContent() {
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
-  const filteredItems = selectedTags.length > 0
-    ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
-    : items;
+  const filteredItems = items; // 日期和标签筛选均在后端索引分页中完成。
 
   const lightboxImages = filteredItems.map((item) => ({
     id: item.name,
-    src: item.url,
+    src: getImagePreviewUrl(item.url),
     sizeLabel: formatSize(item.size),
     dimensions: item.width && item.height ? `${item.width} x ${item.height}` : undefined,
   }));
   const pageSize = 12;
-  const pageCount = Math.max(1, Math.ceil(filteredItems.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(page, pageCount);
-  const currentRows = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const currentRows = filteredItems;
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
-  const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
+  const selectedCount = deleteMode === "filtered" ? total : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
-  const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
+  const allSelected = total > 0 && selectedPaths.length === total;
 
-  const loadImages = async () => {
+  const loadImages = useCallback(async () => {
+    const requestId = ++imageRequest.current;
     setIsLoading(true);
     try {
-      const [data, tagsData] = await Promise.all([
-        fetchManagedImages({ start_date: startDate, end_date: endDate }),
-        fetchImageTags(),
-      ]);
+      const data = await fetchManagedImages({ start_date: startDate, end_date: endDate, page, page_size: pageSize, tags: selectedTags });
+      if (requestId !== imageRequest.current) return;
       setItems(data.items);
-      setAllTags(tagsData.tags);
-      setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
-      setPage(1);
+      setTotal(data.total);
+      setPage(data.page);
+      if (nextLightboxIndex.current) {
+        setLightboxIndex(nextLightboxIndex.current === "last" ? Math.max(0, data.items.length - 1) : 0);
+        nextLightboxIndex.current = null;
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载图片失败");
+      if (requestId === imageRequest.current) toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
-      setIsLoading(false);
+      if (requestId === imageRequest.current) setIsLoading(false);
     }
+  }, [startDate, endDate, page, selectedTags]);
+
+  useEffect(() => { void fetchImageTags().then((data) => setAllTags(data.tags)).catch(() => {}); }, []);
+
+  const selectAllResults = async (checked: boolean) => {
+    if (!checked) { setSelectedPaths([]); return; }
+    const requestId = imageRequest.current;
+    setSelectingAll(true);
+    try {
+      // 仅用户主动全选时读取轻量路径，不再为首屏/翻页下载全部元数据。
+      const data = await fetchManagedImagePaths({ start_date: startDate, end_date: endDate, tags: selectedTags });
+      if (requestId === imageRequest.current) setSelectedPaths(data.paths);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "全选失败");
+    } finally { setSelectingAll(false); }
   };
 
   const closeDialog = useCallback(() => {
@@ -150,6 +170,8 @@ function ImageManagerContent() {
       setItems((prev) => prev.filter((item) => item.rel !== deleteTarget.rel));
       setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(deleteTarget)));
       toast.success("图片已删除");
+      await loadImages();
+      void loadStorage();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除失败");
     } finally {
@@ -164,6 +186,7 @@ function ImageManagerContent() {
       setItems((prev) => prev.map((i) => i.rel === item.rel ? { ...i, tags: result.tags } : i));
       const tagsData = await fetchImageTags();
       setAllTags(tagsData.tags);
+      if (selectedTags.length > 0) await loadImages();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "设置标签失败");
     }
@@ -239,7 +262,12 @@ function ImageManagerContent() {
     if (!deleteMode || selectedCount === 0) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
+      const body = deleteMode === "filtered"
+        ? selectedTags.length > 0
+          ? { paths: (await fetchManagedImagePaths({ start_date: startDate, end_date: endDate, tags: selectedTags })).paths }
+          : { start_date: startDate, end_date: endDate, all_matching: true }
+        : { paths: selectedPaths };
+      const data = await deleteManagedImages(body);
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
@@ -252,10 +280,10 @@ function ImageManagerContent() {
   };
 
   const handleBatchDownload = async () => {
-    const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
-    if (paths.length === 0) return;
     setIsDownloading(true);
     try {
+      const paths = deleteMode === "filtered" ? (await fetchManagedImagePaths({ start_date: startDate, end_date: endDate, tags: selectedTags })).paths : selectedPaths;
+      if (paths.length === 0) return;
       await downloadImages(paths);
       toast.success(`已下载 ${paths.length} 张图片`);
     } catch (error) {
@@ -269,9 +297,8 @@ function ImageManagerContent() {
     await downloadSingleImage(item.rel);
   };
 
-  useEffect(() => {
-    void loadImages();
-  }, [startDate, endDate]);
+  useEffect(() => { setPage(1); setSelectedPaths([]); setLightboxOpen(false); }, [startDate, endDate, selectedTags]);
+  useEffect(() => { void loadImages(); }, [loadImages]);
 
   return (
     <section className="space-y-5">
@@ -445,14 +472,14 @@ function ImageManagerContent() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
               <ImageIcon className="size-4" />
-              共 {filteredItems.length} 张
-              {selectedTags.length > 0 ? <span className="text-stone-400">（筛选自 {items.length} 张）</span> : null}
+              共 {total} 张
+              {selectedTags.length > 0 ? <span className="text-stone-400">（按标签筛选）</span> : null}
               <label className="flex items-center gap-2">
                 <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={currentPageSelected} onCheckedChange={(checked) => togglePaths(currentRows.map(imageKey), Boolean(checked))} />
                 本页全选
               </label>
               <label className="flex items-center gap-2">
-                <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={allSelected} onCheckedChange={(checked) => togglePaths(filteredItems.map(imageKey), Boolean(checked))} />
+                <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={allSelected} disabled={selectingAll || isLoading} onCheckedChange={(checked) => void selectAllResults(Boolean(checked))} />
                 全选结果
               </label>
               {selectedPaths.length > 0 ? <span>已选 {selectedPaths.length} 张</span> : null}
@@ -489,16 +516,8 @@ function ImageManagerContent() {
                       setLightboxOpen(true);
                     }}
                   >
-                    <img
-                      src={item.thumbnail_url || item.url}
-                      alt={item.name}
-                      className="h-full w-full object-cover transition group-hover:scale-[1.02]"
-                      onError={(event) => {
-                        if (event.currentTarget.src !== item.url) {
-                          event.currentTarget.src = item.url;
-                        }
-                      }}
-                    />
+                    <ImageThumbnail src={item.url} thumbnailSrc={item.thumbnail_url} alt={item.name} className="h-full w-full"
+                      imageClassName="transition group-hover:scale-[1.02]" />
                     <span className="absolute right-2 bottom-2 rounded-full bg-black/50 p-2 text-white opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                       <Maximize2 className="size-4" />
                     </span>
@@ -624,11 +643,11 @@ function ImageManagerContent() {
             )})}
           </div>
           <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-            <span>第 {safePage} / {pageCount} 页，共 {filteredItems.length} 张</span>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+            <span>第 {safePage} / {pageCount} 页，共 {total} 张</span>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={isLoading || safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               <ChevronLeft className="size-4" />
             </Button>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={isLoading || safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
               <ChevronRight className="size-4" />
             </Button>
           </div>
@@ -677,6 +696,10 @@ function ImageManagerContent() {
         open={lightboxOpen}
         onOpenChange={setLightboxOpen}
         onIndexChange={setLightboxIndex}
+        onPreviousPage={!isLoading && page > 1 ? () => { nextLightboxIndex.current = "last"; setPage((v) => v - 1); } : undefined}
+        onNextPage={!isLoading && page < pageCount ? () => { nextLightboxIndex.current = "first"; setPage((v) => v + 1); } : undefined}
+        indexOffset={(safePage - 1) * pageSize}
+        totalCount={total}
       />
       <Dialog open={deleteMode === "selected" || deleteMode === "filtered"} onOpenChange={(open) => (!open ? setDeleteMode(null) : null)}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">

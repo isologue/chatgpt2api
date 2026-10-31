@@ -41,13 +41,11 @@ class AnyIOThreadPoolConfigTests(unittest.TestCase):
             self.assertEqual(store.anyio_thread_limit, DEFAULT_ANYIO_THREAD_LIMIT)
             self.assertEqual(store.get()["anyio_thread_limit"], DEFAULT_ANYIO_THREAD_LIMIT)
 
-    def test_account_refresh_startup_mode_defaults_to_deferred_and_normalizes(self) -> None:
+    def test_obsolete_startup_full_refresh_is_not_exposed(self) -> None:
         tmp_dir, store = self._make_store()
         with tmp_dir:
-            self.assertEqual(store.account_refresh_startup_mode, "deferred")
-            self.assertEqual(store.get()["account_refresh_startup_mode"], "deferred")
-            self.assertEqual(store.update({"account_refresh_startup_mode": "full"})["account_refresh_startup_mode"], "full")
-            self.assertEqual(store.update({"account_refresh_startup_mode": "unknown"})["account_refresh_startup_mode"], "deferred")
+            self.assertNotIn("account_refresh_startup_mode", store.get())
+            self.assertNotIn("account_refresh_startup_mode", store.update({"account_refresh_startup_mode": "full"}))
 
     def test_update_persists_and_normalizes_capacity(self) -> None:
         tmp_dir, store = self._make_store()

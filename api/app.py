@@ -22,10 +22,11 @@ from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.retention_service import retention_service
-from services.thread_pool import apply_anyio_thread_limit, configure_image_executors, account_info_executor
+from services.thread_pool import apply_anyio_thread_limit, configure_image_executors, close_image_async_runtime
 from services.account_service import account_service
 from services.isolated_executor import completion_executor
 from services import cpu_pool
+from services.account_info_queries import account_info_queries
 
 
 def create_app() -> FastAPI:
@@ -37,7 +38,6 @@ def create_app() -> FastAPI:
         await apply_anyio_thread_limit(config.anyio_thread_limit)
         configure_image_executors(config.image_workers, config.image_queue_size)
         account_service.verification.reconfigure()
-        account_info_executor.reconfigure(config.image_account_verification["query_workers"])
         completion_executor.reconfigure(config.image_response_workers)
         # 预热 CPU 进程池：PoW 等纯 CPU 任务改到子进程并行执行，避免占满主进程 GIL 饿死事件循环。
         await run_in_threadpool(cpu_pool.warmup)
@@ -63,7 +63,9 @@ def create_app() -> FastAPI:
             await run_in_threadpool(cleanup_thread.join)
             await run_in_threadpool(retention_service.drain)
             await run_in_threadpool(image_task_service.close)
+            await run_in_threadpool(close_image_async_runtime)
             await run_in_threadpool(account_service.verification.close)
+            await run_in_threadpool(account_info_queries.close)
             await run_in_threadpool(log_service.close)
             await run_in_threadpool(image_storage_service._index_store.close)
             await run_in_threadpool(auth_service.close)

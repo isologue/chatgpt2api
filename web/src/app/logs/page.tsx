@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import { DataRetentionCard } from "@/components/data-retention-card";
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { ImageThumbnail, getImageThumbnailUrl } from "@/components/image-thumbnail";
+import { ImageThumbnail, getImageThumbnailUrl, getImagePreviewUrl } from "@/components/image-thumbnail";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -18,7 +18,10 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { deleteSystemLogs, fetchLogKeyNames, fetchLogStorage, fetchSystemLog, fetchSystemLogs, type LogStorageStats, type SystemLog } from "@/lib/api";
+import { diagnosticPhaseLabel, diagnosticReasonLabel, diagnosticStatusLabel } from "@/lib/image-diagnostic-labels";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+
+import { ImagePerformance } from "./image-performance";
 
 const LogType = {
   Call: "call",
@@ -64,7 +67,7 @@ function getSwitchCount(item: SystemLog) {
 
 function getUrls(item: SystemLog | null) {
   const urls = item?.detail?.urls;
-  return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
+  return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string").map(getImagePreviewUrl) : [];
 }
 
 function getStatus(item: SystemLog) {
@@ -73,6 +76,19 @@ function getStatus(item: SystemLog) {
   if (status === "failed") return "失败";
   if (status === "safety_rejected") return "安全审核拒绝";
   return "-";
+}
+
+function formatDiagnosticTime(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return new Date(value * 1000).toLocaleString(undefined, {
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function ColumnFilter({ label, value, options, onChange, searchable = false, loadOptions }: {
@@ -223,20 +239,22 @@ function LogsContent() {
   const detailUrls = getUrls(detailLog);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const detailData = detailLog?.detail || {};
-  const requestBody = detailData.request_body ?? (typeof detailData.request_text === "string" ? { prompt: detailData.request_text } : null);
-  const responseBody = detailData.response_body ?? Object.fromEntries(
-    Object.entries(detailData).filter(([key]) => ![
-      "request_text", "request_shape", "request_body", "response_body", "duration_ms", "urls",
-      "key_id", "key_name", "role", "endpoint", "model", "started_at", "ended_at", "status",
-      "is_async", "response_format", "account_email", "conversation_id",
-    ].includes(key)),
-  );
+  const hasRequestBody = Object.prototype.hasOwnProperty.call(detailData, "request_body");
+  const hasResponseBody = Object.prototype.hasOwnProperty.call(detailData, "response_body");
+  const requestBody = detailData.request_body;
+  const responseBody = detailData.response_body;
   const switchCount = typeof detailData.switch_count === "number" ? Math.max(0, detailData.switch_count) : 0;
   const accountTimeMs = typeof detailData.account_time_ms === "number" ? Math.max(0, detailData.account_time_ms) : 0;
   const totalDurationMs = typeof detailData.duration_ms === "number" ? Math.max(0, detailData.duration_ms) : 0;
   const accountTimeShare = totalDurationMs > 0 ? Math.min(100, accountTimeMs * 100 / totalDurationMs) : 0;
   const accountSwitchTrace = Array.isArray(detailData.account_switch_trace)
     ? detailData.account_switch_trace.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    : [];
+  const diagnosticSteps = detailData.diagnostics && typeof detailData.diagnostics === "object"
+    && Array.isArray((detailData.diagnostics as Record<string, unknown>).steps)
+    ? ((detailData.diagnostics as Record<string, unknown>).steps as unknown[]).filter(
+      (item): item is Record<string, unknown> => Boolean(item && typeof item === "object"),
+    )
     : [];
   const isCallLog = type === LogType.Call;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -566,6 +584,56 @@ function LogsContent() {
                     </div>
                   ))}
               </div>
+              <ImagePerformance diagnostics={detailData.diagnostics} />
+              {diagnosticSteps.length > 0 ? (
+                <section className="space-y-3 rounded-xl border border-stone-200 bg-white p-4">
+                  <div>
+                    <h3 className="text-sm font-semibold text-stone-700">图片请求诊断时间线</h3>
+                    <p className="mt-1 text-xs text-stone-500">展示阶段、相对开始时间和阶段耗时；阶段可能重叠，账号、请求体、下载地址和图片正文不会写入这里。</p>
+                  </div>
+                  <div className="overflow-x-auto rounded-lg border border-stone-200">
+                    <Table className="min-w-[900px]">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>时间</TableHead>
+                          <TableHead>阶段</TableHead>
+                          <TableHead>图片 / 尝试</TableHead>
+                          <TableHead>账号</TableHead>
+                          <TableHead>开始偏移</TableHead>
+                          <TableHead>耗时</TableHead>
+                          <TableHead>状态</TableHead>
+                          <TableHead>原因</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {diagnosticSteps.map((step, index) => {
+                          const offset = Number(step.offset_ms);
+                          const duration = Number(step.duration_ms);
+                          const imageIndex = Number(step.image_index);
+                          const attempt = Number(step.attempt);
+                          const reason = diagnosticReasonLabel(step);
+                          return (
+                            <TableRow key={`${String(step.id ?? index)}-${index}`}>
+                              <TableCell className="whitespace-nowrap text-xs">{formatDiagnosticTime(step.started_at)}</TableCell>
+                              <TableCell className="font-medium text-stone-800">{diagnosticPhaseLabel(step.phase)}</TableCell>
+                              <TableCell className="whitespace-nowrap">{Number.isFinite(imageIndex) ? imageIndex + 1 : "-"} / {Number.isFinite(attempt) ? attempt : "-"}</TableCell>
+                              <TableCell className="max-w-[180px] break-all text-xs">{String(step.account || "-")}</TableCell>
+                              <TableCell className="whitespace-nowrap">{Number.isFinite(offset) ? `${(offset / 1000).toFixed(3)} 秒` : "-"}</TableCell>
+                              <TableCell className="whitespace-nowrap">{Number.isFinite(duration) ? `${(duration / 1000).toFixed(3)} 秒` : "-"}</TableCell>
+                              <TableCell>{diagnosticStatusLabel(step)}</TableCell>
+                              <TableCell className="max-w-[260px] break-all text-xs text-stone-500">{reason || "-"}</TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  {typeof (detailData.diagnostics as Record<string, unknown> | undefined)?.dropped_steps === "number"
+                    && Number((detailData.diagnostics as Record<string, unknown>).dropped_steps) > 0 ? (
+                    <p className="text-xs text-amber-700">时间线因达到上限而省略 {String((detailData.diagnostics as Record<string, unknown>).dropped_steps)} 个步骤。</p>
+                  ) : null}
+                </section>
+              ) : null}
               {detailLog?.type === LogType.Call ? (
                 <section className="space-y-3 rounded-xl border border-stone-200 bg-white p-4">
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -621,13 +689,13 @@ function LogsContent() {
               <section className="space-y-2">
                 <h3 className="text-sm font-semibold text-stone-700">请求体</h3>
                 <div className="max-h-[34vh] overflow-auto rounded-md border border-stone-200 bg-stone-50 p-4 font-mono text-xs leading-6 text-stone-700">
-                  {requestBody === null ? <span className="text-stone-400">该日志没有保存请求体</span> : <JsonValue value={requestBody} path="request" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
+                  {!hasRequestBody ? <span className="text-stone-400">该日志没有保存请求体</span> : <JsonValue value={requestBody} path="request" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
                 </div>
               </section>
               <section className="space-y-2">
                 <h3 className="text-sm font-semibold text-stone-700">响应体</h3>
                 <div className="max-h-[34vh] overflow-auto rounded-md border border-stone-200 bg-stone-50 p-4 font-mono text-xs leading-6 text-stone-700">
-                  {Object.keys(responseBody).length === 0 ? <span className="text-stone-400">该日志没有保存响应体</span> : <JsonValue value={responseBody} path="response" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
+                  {!hasResponseBody ? <span className="text-stone-400">该日志没有保存响应体</span> : <JsonValue value={responseBody} path="response" expanded={expandedJsonValues} onToggle={toggleJsonValue} />}
                 </div>
               </section>
             </div>

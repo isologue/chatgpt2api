@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.13"
 
 [[package]]
@@ -151,6 +151,7 @@ dependencies = [
     { name = "curl-cffi" },
     { name = "fastapi" },
     { name = "gitpython" },
+    { name = "greenlet" },
     { name = "pillow" },
     { name = "psycopg2-binary" },
     { name = "pybase64" },
@@ -170,6 +171,7 @@ requires-dist = [
     { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "fastapi", specifier = ">=0.136.0" },
     { name = "gitpython", specifier = ">=3.1.0" },
+    { name = "greenlet", specifier = ">=3.1.0" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.0" },
     { name = "pybase64", specifier = ">=1.4.3" },

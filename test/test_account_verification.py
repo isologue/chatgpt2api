@@ -14,7 +14,7 @@ from test.test_account_refresh_token_status import MemoryStorage
 
 @pytest.fixture
 def settings(monkeypatch):
-    value = {**DEFAULT_IMAGE_ACCOUNT_VERIFICATION, "workers": 2, "starts_per_second": 1000}
+    value = {**DEFAULT_IMAGE_ACCOUNT_VERIFICATION, "workers": 2}
     monkeypatch.setitem(config.data, "image_account_verification", value)
     return value
 
@@ -53,7 +53,7 @@ def test_same_account_verification_is_shared(verifier):
 
 
 def test_background_capacity_rejects_new_keys_but_joins_same_key(verifier, settings):
-    settings.update(workers=1, queue_size=0)
+    settings.update(workers=1)
     entered, release = Event(), Event()
     def fetch():
         entered.set()
@@ -62,8 +62,9 @@ def test_background_capacity_rejects_new_keys_but_joins_same_key(verifier, setti
         assert verifier.run("one", fetch, background=True)
         assert entered.wait(2)
         assert verifier.run("one", fetch, background=True)
-        assert not verifier.run("two", fetch, background=True)
-        assert verifier.stats()["background_pending"] == 1
+        assert verifier.run("two", fetch, background=True)
+        assert not verifier.run("three", fetch, background=True)
+        assert verifier.stats()["background_pending"] == 2
         assert verifier.stats()["background_rejected"] == 1
     finally:
         release.set()
@@ -82,8 +83,8 @@ def test_failure_backoff_blocks_repeated_remote_calls(verifier):
     assert verifier.run("one", lambda: 7) == 7
 
 
-def test_remote_concurrency_and_start_rate_are_bounded(verifier, settings):
-    settings.update(workers=2, starts_per_second=40)
+def test_remote_concurrency_is_bounded_without_start_rate_cap(verifier, settings):
+    settings.update(workers=2)
     guard = Lock()
     starts, active, peak = [], 0, 0
     def fetch():
@@ -98,7 +99,6 @@ def test_remote_concurrency_and_start_rate_are_bounded(verifier, settings):
     with ThreadPoolExecutor(6) as pool:
         list(pool.map(lambda n: verifier.run(str(n), fetch), range(6)))
     assert peak == 2
-    assert min(b - a for a, b in zip(starts, starts[1:])) >= 0.020
 
 
 def test_close_drains_and_reconfigure_reopens(verifier):
@@ -156,21 +156,24 @@ def test_fresh_persisted_cache_survives_service_restart(settings):
         service.verification.close()
 
 
-def test_stale_cache_returns_without_waiting_for_background(account_service, settings, monkeypatch):
+def test_expired_cache_waits_for_foreground(account_service, settings, monkeypatch):
     entered, release = Event(), Event()
-    account_service._verified_at["at"] = time.monotonic() - settings["cache_ttl_secs"] - 1
+    account_service.update_account("at", {"remote_verified_at": time.time() - settings["cache_ttl_secs"] - 1})
     def remote(*args):
         entered.set()
         assert release.wait(3)
+        return account_service.get_account("at")
     monkeypatch.setattr(account_service, "_fetch_remote_info", remote)
-    try:
-        assert account_service._image_account_with_verification("at")["quota"] == 10
-        assert entered.wait(2)
-        assert account_service.verification.stats()["active"] == 1
-        assert account_service.verification.stats()["stale_hits"] == 1
-    finally:
-        release.set()
-    wait_for(lambda: account_service.verification.stats()["background_pending"] == 0)
+    with ThreadPoolExecutor(1) as pool:
+        task = pool.submit(account_service._image_account_with_verification, "at")
+        try:
+            assert entered.wait(2)
+            assert not task.done()
+            assert account_service.verification.stats()["active_foreground"] == 1
+            assert account_service.verification.stats()["cache_hits"] == 0
+        finally:
+            release.set()
+        assert task.result(3)["quota"] == 10
 
 
 @pytest.mark.parametrize("age", [None, 2000])
@@ -267,10 +270,8 @@ def test_verification_settings_normalize_and_persist(tmp_path):
         "query_workers": "invalid", "failure_backoff_secs": "45"},
         "image_response_workers": "64"})
     actual = result["image_account_verification"]
-    assert actual == {"cache_ttl_secs": 600, "max_stale_secs": 600,
-                      "workers": 64, "queue_size": 0, "starts_per_second": 1,
-                      "background_refresh": False, "query_workers": 32,
-                      "failure_backoff_secs": 45}
+    assert actual == {**DEFAULT_IMAGE_ACCOUNT_VERIFICATION, "cache_ttl_secs": 600,
+                      "workers": 999, "failure_backoff_secs": 45}
     reopened = ConfigStore(filename)
     assert reopened.image_account_verification == actual
     assert reopened.image_response_workers == 64

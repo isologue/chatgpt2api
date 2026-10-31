@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import (
     Column,
     Integer,
+    Float,
     Index,
     String,
     Text,
@@ -21,6 +22,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 from services.storage.base import StorageBackend
+from services.account_list_fields import account_list_fields
 
 Base = declarative_base()
 
@@ -35,6 +37,12 @@ class AccountModel(Base):
     account_type = Column("type", String(64), nullable=False, default="Free", index=True)
     status = Column(String(32), nullable=False, default="", index=True)
     quota = Column(Integer, nullable=False, default=0, index=True)
+    source_type = Column(String(64), nullable=False, default="web", index=True)
+    refresh_token_status = Column(String(16), nullable=False, default="missing", index=True)
+    image_pool_hot = Column(Integer, nullable=False, default=0, index=True)
+    image_score = Column(Integer, nullable=False, default=50, index=True)
+    created_at_epoch = Column(Float, nullable=True, index=True)
+    list_index_version = Column(Integer, nullable=False, default=0, index=True)
     data = Column(Text, nullable=False)  # JSON 格式存储完整账号数据
 
     __table_args__ = (
@@ -95,6 +103,8 @@ class DatabaseStorageBackend(StorageBackend):
             "account_type": str(account.get("type") or "Free").strip() or "Free",
             "status": str(account.get("status") or "").strip(),
             "quota": quota,
+            **account_list_fields(account),
+            "list_index_version": 1,
         }
 
     def _ensure_account_schema(self) -> None:
@@ -106,13 +116,17 @@ class DatabaseStorageBackend(StorageBackend):
             "type": 'VARCHAR(64) NOT NULL DEFAULT \'Free\'',
             "status": 'VARCHAR(32) NOT NULL DEFAULT \'\'',
             "quota": "INTEGER NOT NULL DEFAULT 0",
+            "source_type": "VARCHAR(64) NOT NULL DEFAULT 'web'",
+            "refresh_token_status": "VARCHAR(16) NOT NULL DEFAULT 'missing'",
+            "image_pool_hot": "INTEGER NOT NULL DEFAULT 0",
+            "image_score": "INTEGER NOT NULL DEFAULT 50",
+            "created_at_epoch": "DOUBLE PRECISION",
+            "list_index_version": "INTEGER NOT NULL DEFAULT 0",
         }
-        schema_changed = False
         with self.engine.begin() as connection:
             for name, definition in definitions.items():
                 if name not in existing:
                     connection.execute(text(f'ALTER TABLE accounts ADD COLUMN "{name}" {definition}'))
-                    schema_changed = True
 
         # create_all() does not add indexes to an already existing table.
         for index in AccountModel.__table__.indexes:
@@ -138,34 +152,27 @@ class DatabaseStorageBackend(StorageBackend):
         # one-time backfill makes subsequent list/search requests index-only.
         session = self.Session() if hasattr(self, "Session") else sessionmaker(bind=self.engine)()
         try:
-            rows_query = session.query(AccountModel)
-            if not schema_changed:
-                rows_query = rows_query.filter(
-                    or_(
-                        AccountModel.email.is_(None),
-                        AccountModel.account_type.is_(None),
-                        AccountModel.status.is_(None),
-                        AccountModel.quota.is_(None),
-                    )
-                )
-            rows = rows_query.yield_per(500)
-            changed = 0
-            for row in rows:
-                try:
-                    account = json.loads(row.data)
-                except (TypeError, json.JSONDecodeError):
-                    account = {}
-                if not isinstance(account, dict):
-                    account = {}
-                values = self._account_index_values(account)
-                row.email = values["email"]
-                row.account_type = values["account_type"]
-                row.status = values["status"]
-                row.quota = values["quota"]
-                changed += 1
-                if changed % 500 == 0:
-                    session.commit()
-            if changed % 500:
+            # Keyset batches keep memory bounded and never commit an open
+            # server-side cursor. A version marker resumes interrupted backfills.
+            last_id = 0
+            while True:
+                rows = session.query(AccountModel).filter(
+                    AccountModel.id > last_id,
+                    or_(AccountModel.list_index_version.is_(None), AccountModel.list_index_version < 1,
+                        AccountModel.email.is_(None), AccountModel.account_type.is_(None),
+                        AccountModel.status.is_(None), AccountModel.quota.is_(None)),
+                ).order_by(AccountModel.id).limit(500).all()
+                if not rows:
+                    break
+                last_id = rows[-1].id
+                for row in rows:
+                    try:
+                        account = json.loads(row.data)
+                    except (TypeError, json.JSONDecodeError):
+                        account = {}
+                    values = self._account_index_values(account if isinstance(account, dict) else {})
+                    for key, value in values.items():
+                        setattr(row, key, value)
                 session.commit()
         finally:
             session.close()
@@ -220,24 +227,19 @@ class DatabaseStorageBackend(StorageBackend):
                 session.execute(delete(AccountModel).where(AccountModel.access_token.in_(access_tokens[start:start + 500])))
             for start in range(0, len(rows), 500):
                 statement = insert(AccountModel).values(rows[start:start + 500])
+                index_keys = self._account_index_values({}).keys()
                 if dialect == "mysql":
-                    statement = statement.on_duplicate_key_update(
-                        data=statement.inserted.data,
-                        email=statement.inserted.email,
-                        account_type=statement.inserted["type"],
-                        status=statement.inserted.status,
-                        quota=statement.inserted.quota,
-                    )
+                    statement = statement.on_duplicate_key_update(**{
+                        "data": statement.inserted.data,
+                        **{key: statement.inserted["type" if key == "account_type" else key] for key in index_keys},
+                    })
                 else:
                     statement = statement.on_conflict_do_update(
                         index_elements=[AccountModel.access_token],
-                        set_={
-                            "data": statement.excluded.data,
-                            "email": statement.excluded.email,
-                            "type": statement.excluded["type"],
-                            "status": statement.excluded.status,
-                            "quota": statement.excluded.quota,
-                        },
+                        set_={"data": statement.excluded.data, **{
+                            "type" if key == "account_type" else key:
+                            statement.excluded["type" if key == "account_type" else key] for key in index_keys
+                        }},
                     )
                 session.execute(statement)
 
@@ -248,6 +250,9 @@ class DatabaseStorageBackend(StorageBackend):
         query: str = "",
         account_type: str = "all",
         status: str = "all",
+        source: str = "all", rt_status: str = "all", pool: str = "all",
+        score_min: int | None = None, score_max: int | None = None,
+        created_from: float | None = None, created_to: float | None = None,
     ) -> dict[str, Any]:
         """Query the bounded management page directly from indexed columns."""
         page = max(1, int(page))
@@ -262,6 +267,21 @@ class DatabaseStorageBackend(StorageBackend):
                 filtered = filtered.filter(AccountModel.account_type == account_type)
             if status and status != "all":
                 filtered = filtered.filter(AccountModel.status == status)
+
+            if source != "all":
+                filtered = filtered.filter(AccountModel.source_type == source)
+            if rt_status != "all":
+                filtered = filtered.filter(AccountModel.refresh_token_status == rt_status)
+            if pool != "all":
+                filtered = filtered.filter(AccountModel.image_pool_hot == int(pool == "hot"))
+            if score_min is not None:
+                filtered = filtered.filter(AccountModel.image_score >= score_min)
+            if score_max is not None:
+                filtered = filtered.filter(AccountModel.image_score <= score_max)
+            if created_from is not None:
+                filtered = filtered.filter(AccountModel.created_at_epoch >= created_from)
+            if created_to is not None:
+                filtered = filtered.filter(AccountModel.created_at_epoch < created_to)
 
             total = filtered.with_entities(func.count(AccountModel.id)).scalar() or 0
             page_count = max(1, (total + page_size - 1) // page_size)
@@ -317,6 +337,9 @@ class DatabaseStorageBackend(StorageBackend):
                 account["type"] = row.account_type or str(account.get("type") or "Free")
                 account["status"] = row.status or str(account.get("status") or "")
                 account["quota"] = int(row.quota or 0)
+                account.update({key: getattr(row, key) for key in (
+                    "source_type", "refresh_token_status", "image_pool_hot", "image_score")})
+                account["image_pool_hot"] = bool(row.image_pool_hot)
                 items.append(account)
             return {
                 "items": items,
@@ -325,6 +348,7 @@ class DatabaseStorageBackend(StorageBackend):
                 "page_size": page_size,
                 "summary": summary,
                 "types": types,
+                "sources": [value for (value,) in session.query(AccountModel.source_type).distinct().order_by(AccountModel.source_type).all() if value],
             }
         finally:
             session.close()
@@ -408,10 +432,8 @@ class DatabaseStorageBackend(StorageBackend):
                     existing_row.data = serialized_data
                     if model is AccountModel:
                         values = self._account_index_values(item)
-                        existing_row.email = values["email"]
-                        existing_row.account_type = values["account_type"]
-                        existing_row.status = values["status"]
-                        existing_row.quota = values["quota"]
+                        for key, value in values.items():
+                            setattr(existing_row, key, value)
 
             for key_value, row in existing_rows.items():
                 if key_value not in incoming_keys:

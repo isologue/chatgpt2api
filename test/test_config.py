@@ -49,7 +49,6 @@ class ConfigLoadingTests(unittest.TestCase):
 
                 self.assertEqual(settings.auth_key, os_auth_key)
                 self.assertEqual(settings.refresh_account_interval_minute, 5)
-                self.assertEqual(settings.account_refresh_startup_mode, "deferred")
             finally:
                 module.BASE_DIR = old_base_dir
                 module.DATA_DIR = old_data_dir

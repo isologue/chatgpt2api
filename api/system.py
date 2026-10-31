@@ -21,19 +21,22 @@ from services.image_service import (
     get_image_response,
     get_thumbnail_response,
     list_images,
+    list_images_page,
     storage_stats,
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.retention_service import CleanupBusyError, retention_service
+from services.account_pool import image_attempt_results
+from services.account_pool_maintenance import pool_maintenance
 from services.account_service import account_service
 from services.account_refresh_monitor import account_refresh_monitor
 from services.monitoring import snapshot as monitoring_snapshot
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
-from services.thread_pool import apply_anyio_thread_limit, configure_image_executors, account_info_executor
+from services.thread_pool import apply_anyio_thread_limit, configure_image_executors
 from utils.log import logger
-from services.image_metrics import runtime_phases
+from services.image_metrics import runtime_phases, image_diagnostics_snapshot
 from services.monitoring_cache import SnapshotCache
 from services.isolated_executor import image_stats_executor
 from services.isolated_executor import completion_executor, monitoring_executor
@@ -120,7 +123,7 @@ def create_router(app_version: str) -> APIRouter:
             await apply_anyio_thread_limit(config.anyio_thread_limit)
             configure_image_executors(config.image_workers, config.image_queue_size)
             account_service.verification.reconfigure()
-            account_info_executor.reconfigure(config.image_account_verification["query_workers"])
+            await run_in_threadpool(account_service.reconfigure_pool)
             completion_executor.reconfigure(config.image_response_workers)
             runtime_cache.clear()
             image_stats_cache.clear()
@@ -149,8 +152,12 @@ def create_router(app_version: str) -> APIRouter:
                     "image_index": image_storage_service._index_store._writer.stats(),
                 },
                 "account_verification": account_service.verification.stats(),
+                "account_pool": account_service.pool_snapshot(),
+                "account_pool_maintenance": pool_maintenance.snapshot(),
+                "image_attempt_results": image_attempt_results.snapshot(),
                 "account_refresh": account_refresh_monitor.snapshot(),
                 "phases": runtime_phases.snapshot(),
+                "image_diagnostics": image_diagnostics_snapshot(),
                 "runtime_logging": logger.stats(),
                 "completion_executor": completion_executor.stats(),
                 "monitoring_executor": monitoring_executor.stats(),
@@ -181,18 +188,39 @@ def create_router(app_version: str) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
-    @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    @router.get("/api/monitoring/account-pool/failures")
+    async def get_account_pool_failures(
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=100),
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
+        return pool_maintenance.failures(offset, limit)
+
+    @router.get("/api/images")
+    async def get_images(request: Request, start_date: str = "", end_date: str = "",
+                         page: int | None = Query(default=None, ge=1),
+                         page_size: int = Query(default=12, ge=1, le=100),
+                         tags: list[str] = Query(default=[]), paths_only: bool = False,
+                         authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        base = resolve_image_base_url(request)
+        if page is not None or paths_only:
+            return await run_in_threadpool(list_images_page, base, start_date.strip(), end_date.strip(),
+                page=page or 1, page_size=page_size, tags=tags, paths_only=paths_only)
+        # 保留旧无分页接口及历史文件发现行为，但扫描不再阻塞事件循环。
+        return await run_in_threadpool(list_images, base, start_date=start_date.strip(), end_date=end_date.strip())
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        return await run_in_threadpool(get_image_response, image_path)
+
+    # 将Pillow解码/缩放移出事件循环，且不让大量缩略图耗尽全部共享工作线程。
+    thumbnail_slots = asyncio.Semaphore(4)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        async with thumbnail_slots:
+            return await run_in_threadpool(get_thumbnail_response, image_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
@@ -416,7 +444,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return storage_stats()
+        return await run_in_threadpool(storage_stats)
 
     @router.post("/api/images/storage/compress")
     async def compress_all_images(authorization: str | None = Header(default=None)):

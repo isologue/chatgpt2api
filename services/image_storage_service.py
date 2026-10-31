@@ -171,6 +171,8 @@ class ImageStorageService:
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
         self._index_store = ImageIndexStorage(index_file)
+        self._page_bootstrap_lock = Lock()
+        self._page_bootstrapped = False
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
@@ -267,6 +269,16 @@ class ImageStorageService:
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
         return _is_image_rel(safe_rel) and _local_image_path(safe_rel).is_file()
+
+    def list_page(self, **filters):
+        if not self._page_bootstrapped:
+            with self._page_bootstrap_lock:
+                if not self._page_bootstrapped:
+                    # 没有索引的老部署首次发现文件；已有索引时不再扫描目录。
+                    if not self._index_store.list_page(page=1, page_size=1)["total"]:
+                        self.list_items("")
+                    self._page_bootstrapped = True
+        return self._index_store.list_page(**filters)
 
     def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
         with self._index_lock:

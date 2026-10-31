@@ -16,13 +16,14 @@ import { testProxy, type ProxyTestResult } from "@/lib/api";
 import { useSettingsStore } from "../store";
 
 const verificationFields = [
-  { key: "cache_ttl_secs", label: "校验缓存有效期（秒）", min: 0, max: 86400, fallback: 300, hint: "有效期内直接使用本地账号信息；0 表示每次选中都需重新校验或进入后台刷新。" },
-  { key: "max_stale_secs", label: "校验信息最大使用期限（秒）", min: 0, max: 604800, fallback: 1800, hint: "从上次成功校验开始计时，至少等于缓存有效期；超过后必须先校验再生成。" },
-  { key: "workers", label: "账号校验并发", min: 1, max: 64, fallback: 8, hint: "限制同时校验的账号数，前台和后台共用；不等于生图并发。" },
-  { key: "queue_size", label: "后台校验等待队列", min: 0, max: 10000, fallback: 128, hint: "队列满时跳过本次后台刷新，后续选号再尝试；不丢弃生图请求。" },
-  { key: "starts_per_second", label: "每秒最多启动账号校验", min: 1, max: 1000, fallback: 8, hint: "平滑启动速率，每个账号校验通常还会产生三个子查询。" },
-  { key: "failure_backoff_secs", label: "校验失败退避基数（秒）", min: 1, max: 3600, fallback: 30, hint: "连续失败按倍数延长等待，最长一小时；避免反复查询异常账号。" },
-  { key: "query_workers", label: "账号信息子查询并发", min: 1, max: 192, fallback: 32, hint: "账号信息查询线程上限。请结合校验并发与上游承载能力调整。" },
+  { key: "cache_ttl_secs", label: "可用性确认有效期 X（秒）", min: 0, fallback: 900, hint: "最近校验成功、有效出图或上游安全拒绝任一时间在 X 内，跳过信息校验；0 表示每次先校验。凭据检查始终保留。" },
+  { key: "workers", label: "账号刷新并发 C（每条通道）", min: 1, fallback: 50, hint: "前台按需、热池补充、热池维护、冷池维护、手动刷新各自拥有 C；C=50 时最多同时刷新 250 个不同账号。同账号跨通道去重，不代表生图并发。" },
+  { key: "hot_pool_size", label: "基础热池账号数", min: 0, fallback: 500, hint: "健康热池的补位目标，不是上限。热池无空闲槽位时按实际需求扩张；0 表示不自动保底补位。" },
+  { key: "hot_idle_secs", label: "热池闲置退出 Y（秒）", min: 1, fallback: 86400, hint: "从最后实际承接生图开始计时；后台刷新不算使用。在途账号不退出，正常缩容不低于基础目标。" },
+  { key: "hot_refresh_interval_secs", label: "热池维护间隔（秒）", min: 1, fallback: 1800, hint: "按账号最近可用性确认时间计算到期，近期成功出图/安全拒绝者无需重复刷新。重启不重置已有确认时间。" },
+  { key: "cold_refresh_interval_secs", label: "冷池维护间隔（秒）", min: 1, fallback: 86400, hint: "非热池账号低频错峰维护。没有历史确认的冷账号分散到一个周期内，避免启动刷新风暴。" },
+  { key: "failure_backoff_secs", label: "校验失败退避基数（秒）", min: 1, fallback: 30, hint: "同一账号连续校验失败指数退避，最长一小时，不限制其他账号的正常并发。" },
+  { key: "wait_timeout_secs", label: "校验/槽位等待上限（秒）", min: 1, fallback: 60, hint: "限制前台排队和等待结果的时间；超时不会取消或重复启动正在进行的同账号校验。" },
 ] as const;
 
 export function ConfigCard() {
@@ -33,7 +34,6 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
-  const setAccountRefreshStartupMode = useSettingsStore((state) => state.setAccountRefreshStartupMode);
   const setAnyioThreadLimit = useSettingsStore((state) => state.setAnyioThreadLimit);
   const setImageResponseFormat = useSettingsStore((state) => state.setImageResponseFormat);
   const setImageAllowResponseFormatOverride = useSettingsStore((state) => state.setImageAllowResponseFormatOverride);
@@ -45,7 +45,11 @@ export function ConfigCard() {
   const setImagePollTimeoutAccountSwitchRetries = useSettingsStore((state) => state.setImagePollTimeoutAccountSwitchRetries);
   const setImageTextReplyAccountSwitchRetries = useSettingsStore((state) => state.setImageTextReplyAccountSwitchRetries);
   const setMonitoringRefreshIntervalSecs = useSettingsStore((state) => state.setMonitoringRefreshIntervalSecs);
+  const setImageSseTimeoutSecs = useSettingsStore((state) => state.setImageSseTimeoutSecs);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageTotalTimeoutSecs = useSettingsStore((state) => state.setImageTotalTimeoutSecs);
+  const setImageDownloadTimeoutSecs = useSettingsStore((state) => state.setImageDownloadTimeoutSecs);
+  const setImageDownloadRetries = useSettingsStore((state) => state.setImageDownloadRetries);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
@@ -161,7 +165,7 @@ export function ConfigCard() {
                 placeholder="128"
                 className="h-10 rounded-xl border-stone-200 bg-white"
               />
-              <p className="text-xs leading-5 text-stone-500">执行线程全部占用后允许等待的任务数。设置为 0 表示没有等待队列，满载时直接返回 429。</p>
+              <p className="text-xs leading-5 text-stone-500">图片任务执行名额全部占用后允许等待的任务数。设置为 0 表示没有等待队列，满载时直接返回 429。</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">单账号图片并发</label>
@@ -199,7 +203,7 @@ export function ConfigCard() {
                 placeholder="40"
                 className="h-10 rounded-xl border-stone-200 bg-white"
               />
-              <p className="text-xs leading-5 text-stone-500">用于鉴权、参数处理、任务提交和日志等同步环节；不决定上游生图线程数，默认 40，最大 1000。</p>
+              <p className="text-xs leading-5 text-stone-500">用于鉴权、参数处理、任务提交和日志等同步环节；不决定同时执行的生图任务数，默认 40，最大 1000。</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">监控页刷新间隔（秒）</label>
@@ -219,18 +223,13 @@ export function ConfigCard() {
           <div className="mt-4 space-y-4 rounded-xl border border-stone-200 bg-white/70 p-4">
             <div>
               <h4 className="text-sm font-semibold text-stone-800">账号校验与结果返回</h4>
-              <p className="mt-1 text-xs leading-5 text-stone-600">减少生图前的重复查询。成功校验时间会保存并在重启后恢复；首次使用、令牌轮换和认证异常仍需重新校验。保存后立即生效。</p>
+              <p className="mt-1 text-xs leading-5 text-stone-600">动态热池与按需刷新。确认时间、热池身份和评分随账号持久化；过期必须先校验再生成，不再放行过期缓存。各通道采用同一 C、独立槽位，保存后生效。</p>
             </div>
-            <label className="flex items-center gap-3 text-sm text-stone-700">
-              <Checkbox checked={config?.image_account_verification?.background_refresh !== false}
-                onCheckedChange={(checked) => setImageAccountVerificationField("background_refresh", Boolean(checked))} />
-              缓存过期后允许使用本地状态并后台刷新（不超过最大使用期限）
-            </label>
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-              {verificationFields.map((field) => (
+              {verificationFields.slice(0, 6).map((field) => (
                 <div className="space-y-2" key={field.key}>
                   <label className="text-sm text-stone-700" htmlFor={`verification-${field.key}`}>{field.label}</label>
-                  <Input id={`verification-${field.key}`} type="number" min={field.min} max={field.max} step={1}
+                  <Input id={`verification-${field.key}`} type="number" min={field.min} step={1}
                     value={String(config?.image_account_verification?.[field.key] ?? field.fallback)}
                     onChange={(event) => setImageAccountVerificationField(field.key, event.target.value)}
                     className="h-10 rounded-xl border-stone-200 bg-white" />
@@ -245,17 +244,30 @@ export function ConfigCard() {
                 <p className="text-xs leading-5 text-stone-500">独立处理日志详情构造和响应编码，避免与图片接入、管理接口争抢通用线程。</p>
               </div>
             </div>
+            <details className="text-sm text-stone-600">
+              <summary className="cursor-pointer font-medium">高级：失败退避与等待保护</summary>
+              <div className="mt-3 grid gap-4 md:grid-cols-2">
+                {verificationFields.slice(6).map((field) => <div className="space-y-2" key={field.key}>
+                  <label className="text-sm text-stone-700" htmlFor={`verification-${field.key}`}>{field.label}</label>
+                  <Input id={`verification-${field.key}`} type="number" min={field.min} step={1}
+                    value={String(config?.image_account_verification?.[field.key] ?? field.fallback)}
+                    onChange={(event) => setImageAccountVerificationField(field.key, event.target.value)}
+                    className="h-10 rounded-xl border-stone-200 bg-white" />
+                  <p className="text-xs leading-5 text-stone-500">{field.hint}</p>
+                </div>)}
+              </div>
+            </details>
           </div>
           <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4">
             <div className="mb-3">
               <h4 className="text-sm font-semibold text-stone-800">图片账号故障切换</h4>
               <p className="mt-1 text-xs leading-5 text-stone-600">
-                统一控制生图遇到账号不可用、轮询超时或上游未返回图片时的账号切换上限。这里不包含同一账号的 TLS 和连接超时重试；保存后立即生效。
+                统一控制生图遇到账号不可用、上游未返回图片或图片下载重试耗尽时的账号切换上限。各类错误触发的换号均受总尝试预算约束，分项上限不会相乘；保存后立即生效。
               </p>
             </div>
             <div className="grid gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <label className="text-sm text-stone-700">账号预检最大尝试数</label>
+                <label className="text-sm text-stone-700">单张图账号总尝试上限</label>
                 <Input
                   type="number"
                   min={1}
@@ -266,10 +278,10 @@ export function ConfigCard() {
                   placeholder="20"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                 />
-                <p className="text-xs leading-5 text-stone-500">每次生图预检账号时最多尝试多少个候选账号，至少为 1，最大 1000。</p>
+                <p className="text-xs leading-5 text-stone-500">预检与生成共用的总预算：N 表示最多使用 N 个不同账号（最多切 N−1 次），不因生成重试重新计数。至少为 1，最大 1000。</p>
               </div>
               <div className="space-y-2">
-                <label className="text-sm text-stone-700">轮询超时切号次数</label>
+                <label className="text-sm text-stone-700">补查失败切号次数</label>
                 <Input
                   type="number"
                   min={0}
@@ -280,7 +292,7 @@ export function ConfigCard() {
                   placeholder="4"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                 />
-                <p className="text-xs leading-5 text-stone-500">图片轮询超时后最多切换多少次账号，设置为 0 表示不因该原因切号。</p>
+                <p className="text-xs leading-5 text-stone-500">图片结果补查超时或失败后，最多切换多少次账号重新生成；0 表示不切号。仍受账号尝试上限和请求总预算约束。</p>
               </div>
               <div className="space-y-2">
                 <label className="text-sm text-stone-700">未生成图片切号次数</label>
@@ -301,30 +313,14 @@ export function ConfigCard() {
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">账号刷新间隔</label>
+            <label className="text-sm text-stone-700">AT/RT 凭据维护检查间隔</label>
             <Input
               value={String(config?.refresh_account_interval_minute || "")}
               onChange={(event) => setRefreshAccountIntervalMinute(event.target.value)}
               placeholder="分钟"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm text-stone-700">容器启动时账号刷新策略</label>
-            <Select
-              value={config?.account_refresh_startup_mode === "full" ? "full" : "deferred"}
-              onValueChange={(value) => setAccountRefreshStartupMode(value as "deferred" | "full")}
-            >
-              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="deferred">延后全量刷新（推荐）</SelectItem>
-                <SelectItem value="full">启动立即全量刷新</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-stone-500">下次容器启动生效。延后模式只处理临期账号和 Token 保活，完整账号池刷新等待一个刷新间隔；全量模式保留旧行为。</p>
+            <p className="text-xs text-stone-500">单位分钟，仅检查临期 AT 和 RT 保活；账号信息刷新使用上方热池/冷池维护间隔，不再全量刷新。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>
@@ -405,14 +401,57 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">模型名称以 -standard、-extended 或 -max 结尾时，模型后缀优先。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片轮询超时</label>
+            <label className="text-sm text-stone-700">上游生成流超时（秒）</label>
+            <Input
+              value={String(config?.image_sse_timeout_secs || "")}
+              onChange={(event) => setImageSseTimeoutSecs(event.target.value)}
+              placeholder="80"
+              inputMode="numeric"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">从提交上游生成请求计时，包含等待响应头和接收生成流；超时关闭连接并返回结果未确定，不自动切号。与结果补查分别计时，仍受请求总预算限制。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片结果补查超时（秒）</label>
             <Input
               value={String(config?.image_poll_timeout_secs || "")}
               onChange={(event) => setImagePollTimeoutSecs(event.target.value)}
-              placeholder="120"
+              placeholder="10"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
+            <p className="text-xs text-stone-500">从生成流结束后开始计时，任务检查、结果查询、等待和补查重试共用此上限；不会自动延长到 300 秒。获取下载地址后结束计时，图片下载单独计时。补查失败按「补查失败切号次数」重新选号生成，仍受请求总预算限制。</p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">图片请求总预算（秒）</label>
+              <Input
+                value={String(config?.image_total_timeout_secs || "240")}
+                onChange={(event) => setImageTotalTimeoutSecs(event.target.value)}
+                inputMode="numeric"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">包含排队、校验、切号、生成、轮询和下载；切号不会重新计时。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">单次图片下载超时（秒）</label>
+              <Input
+                value={String(config?.image_download_timeout_secs || "30")}
+                onChange={(event) => setImageDownloadTimeoutSecs(event.target.value)}
+                inputMode="numeric"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">限制每次结果下载的时长；下载重试耗尽后可切号重新生图，仍受请求总预算约束。</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">图片下载重试次数</label>
+              <Input
+                value={String(config?.image_download_retries ?? "1")}
+                onChange={(event) => setImageDownloadRetries(event.target.value)}
+                inputMode="numeric"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">先重试同一个结果地址；耗尽后按「单张图账号总尝试上限」切号重新生图，可能额外消耗额度。设为 0 仅关闭同地址重试。</p>
+            </div>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

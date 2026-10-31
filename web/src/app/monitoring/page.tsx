@@ -180,28 +180,84 @@ function MonitoringContent() {
             <Metric label="图片下载中" value={data.phases?.image_download?.active ?? 0} />
             <Metric label="图片保存中" value={data.phases?.image_save?.active ?? 0} />
             <Metric label="正在远程校验" value={data.account_verification?.active ?? 0} hint={`等待 ${data.account_verification?.waiting ?? 0}，后台待完成 ${data.account_verification?.background_pending ?? 0}`} />
-            <Metric label="校验缓存命中率" value={`${(data.account_verification?.cache_hit_rate ?? 0).toFixed(1)}%`} hint="进程累计，包含允许后台刷新的缓存命中" tone="text-emerald-700" />
+            <Metric label="校验缓存命中率" value={`${(data.account_verification?.cache_hit_rate ?? 0).toFixed(1)}%`} hint="进程累计，信息校验/有效出图/上游安全拒绝确认" tone="text-emerald-700" />
             <Metric label="日志确认等待" value={data.phases?.log_confirmation?.active ?? 0} hint={`日志队列待确认 ${data.persistence?.logs.pending ?? 0}`} />
             <Metric label="结果处理队列" value={data.completion_executor?.queued ?? 0} hint={`正在处理 ${data.completion_executor?.active ?? 0}`} />
           </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric label="诊断请求在途" value={data.image_diagnostics?.active_requests ?? 0} hint={`最老 ${((data.image_diagnostics?.oldest_request_ms ?? 0) / 1000).toFixed(1)} 秒`} />
+            <Metric label="客户端断开仍在跑" value={data.image_diagnostics?.disconnected_running ?? 0} tone="text-amber-700" />
+            <Metric label="上游生成超 30 秒" value={data.phases?.upstream_generation?.over_30s ?? 0} />
+            <Metric label="上游生成超 120 秒" value={data.phases?.upstream_generation?.over_120s ?? 0} tone="text-rose-700" />
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Metric label="事件循环最近延迟" value={formatDuration(data.phases?.event_loop_lag?.last_ms)} hint={`采样时间 ${formatTime(data.phases?.event_loop_lag?.last_at ?? 0)}`} />
+            <Metric label="事件循环近5分钟峰值" value={formatDuration(data.phases?.event_loop_lag?.recent_max_ms)} hint={`停顿开始 ${formatTime(data.phases?.event_loop_lag?.recent_max_started_at ?? 0)}`} tone="text-amber-700" />
+            <Metric label="事件循环进程历史峰值" value={formatDuration(data.phases?.event_loop_lag?.max_ms)} hint={`峰值检出 ${formatTime(data.phases?.event_loop_lag?.max_at ?? 0)}`} />
+          </div>
+          <details className="rounded-xl border border-stone-200 p-3 text-xs text-stone-600">
+            <summary className="cursor-pointer">事件循环近5分钟时间线（每5秒聚合）</summary>
+            <div className="mt-3 max-h-64 overflow-auto"><table className="w-full text-left"><thead><tr><th>采样时间</th><th>窗口峰值</th><th>峰值检出时间</th><th>最新延迟</th></tr></thead><tbody>
+              {(data.phases?.event_loop_lag?.timeline ?? []).map((point) => <tr key={point.at} className="border-t border-stone-100"><td className="py-1">{formatTime(point.at)}</td><td>{formatDuration(point.max_ms)}</td><td>{formatTime(point.max_at)}</td><td>{formatDuration(point.last_ms)}</td></tr>)}
+            </tbody></table></div>
+          </details>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Metric label="图片传输循环最近延迟" value={formatDuration(data.phases?.image_io_loop_lag?.last_ms)} hint={`采样时间 ${formatTime(data.phases?.image_io_loop_lag?.last_at ?? 0)}`} />
+            <Metric label="图片传输循环近5分钟峰值" value={formatDuration(data.phases?.image_io_loop_lag?.recent_max_ms)} hint={`停顿开始 ${formatTime(data.phases?.image_io_loop_lag?.recent_max_started_at ?? 0)}`} tone="text-amber-700" />
+            <Metric label="图片传输循环历史峰值" value={formatDuration(data.phases?.image_io_loop_lag?.max_ms)} hint={`峰值检出 ${formatTime(data.phases?.image_io_loop_lag?.max_at ?? 0)}`} />
+          </div>
+          <details className="rounded-xl border border-stone-200 p-3 text-xs text-stone-600">
+            <summary className="cursor-pointer">图片传输循环近5分钟时间线（每5秒聚合）</summary>
+            <div className="mt-3 max-h-64 overflow-auto"><table className="w-full text-left"><thead><tr><th>采样时间</th><th>窗口峰值</th><th>峰值检出时间</th><th>最新延迟</th></tr></thead><tbody>
+              {(data.phases?.image_io_loop_lag?.timeline ?? []).map((point) => <tr key={point.at} className="border-t border-stone-100"><td className="py-1">{formatTime(point.at)}</td><td>{formatDuration(point.max_ms)}</td><td>{formatTime(point.max_at)}</td><td>{formatDuration(point.last_ms)}</td></tr>)}
+            </tbody></table></div>
+          </details>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
-              <thead><tr className="border-b border-stone-200 text-stone-500"><th className="py-2 font-medium">阶段</th><th className="py-2 font-medium">进行中</th><th className="py-2 font-medium">近期 P95</th><th className="py-2 font-medium">累计完成</th></tr></thead>
+              <thead><tr className="border-b border-stone-200 text-stone-500"><th className="py-2 font-medium">阶段</th><th className="py-2 font-medium">进行中</th><th className="py-2 font-medium">P50</th><th className="py-2 font-medium">P95</th><th className="py-2 font-medium">最老在途</th><th className="py-2 font-medium">累计完成</th></tr></thead>
               <tbody>
                 {([
                   ["request_auth", "接入鉴权"], ["request_filter", "接入内容检查"],
-                  ["event_loop_lag", "事件循环调度延迟"],
-                  ["account_lookup", "账号获取与校验"], ["account_verification_queue", "校验并发 / 速率等待"],
+                  ["event_loop_lag", "接口事件循环延迟"], ["image_io_loop_lag", "图片传输循环延迟"],
+                  ["image_dispatch_wait", "图片任务分发等待"], ["image_admission_wait", "等待图片执行名额"],
+                  ["account_lookup", "账号获取与校验"], ["account_verification_queue", "校验并发等待"],
                   ["account_verification", "远程校验"], ["upstream_generation", "上游提交与轮询"],
-                  ["image_download", "图片下载"], ["image_save", "图片保存"],
+                  ["reference_upload", "参考图上传"], ["requirements_token", "校验令牌/PoW"],
+                  ["generation_submit", "生成提交"], ["sse_stream", "SSE 流"], ["result_poll", "结果轮询"],
+                  ["image_download", "图片下载"], ["image_validate", "图片校验"], ["image_save", "图片保存"],
                   ["log_prepare", "日志详情构造"], ["log_confirmation", "日志持久化确认"],
                   ["log_write", "日志批次写入"], ["response_serialization", "响应编码与调度"],
                 ] as const).map(([key, label]) => {
                   const phase = data.phases?.[key];
-                  return <tr key={key} className="border-b border-stone-100 last:border-0"><td className="py-2 text-stone-700">{label}</td><td className="py-2">{phase?.active ?? 0}</td><td className="py-2">{((phase?.p95_ms ?? 0) / 1000).toFixed(3)} 秒</td><td className="py-2">{phase?.completed ?? 0}</td></tr>;
+                  return <tr key={key} className="border-b border-stone-100 last:border-0"><td className="py-2 text-stone-700">{label}</td><td className="py-2">{phase?.active ?? 0}</td><td className="py-2">{((phase?.p50_ms ?? 0) / 1000).toFixed(3)} 秒</td><td className="py-2">{((phase?.p95_ms ?? 0) / 1000).toFixed(3)} 秒</td><td className="py-2">{formatDuration(phase?.oldest_active_ms)}</td><td className="py-2">{phase?.completed ?? 0}</td></tr>;
                 })}
               </tbody>
             </table>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric label="动态热池账号" value={data.account_pool?.size ?? 0} hint={`基础目标 ${data.account_pool?.base_size ?? 0}，缺口 ${data.account_pool?.deficit ?? 0}`} />
+            <Metric label="热池有空闲槽位账号" value={data.account_pool?.idle_accounts ?? 0} hint="账号数，不是槽位数" />
+            <Metric label="按需扩张 / 闲置退出" value={`${data.account_pool?.expanded ?? 0} / ${data.account_pool?.shrunk ?? 0}`} hint={data.account_pool?.last_reason ?? "startup"} />
+            <Metric label="实际去重校验账号" value={data.account_verification?.inflight_accounts ?? 0} hint="跨通道同一账号只执行一次" />
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Metric label="首尝试出图率" value={`${(data.image_attempt_results?.first_attempt_success_rate ?? 0).toFixed(1)}%`} hint="本进程按单张图统计，预检换号也算重试；不含安全拒绝" />
+            <Metric label="切号后出图率" value={`${(data.image_attempt_results?.switched_success_rate ?? 0).toFixed(1)}%`} hint={`本进程累计 ${data.image_attempt_results?.switched_requests ?? 0} 张图发生账号切换`} />
+            <Metric label="上游安全拒绝（本进程）" value={data.image_attempt_results?.policy_rejected ?? 0} hint="不算技术失败，不加减账号评分" />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs text-stone-600">
+              <thead><tr><th className="py-2">刷新通道</th><th>上限 C</th><th>执行中</th><th>等待</th><th>维护成功 / 失败</th></tr></thead>
+              <tbody>{([
+                ["foreground", "前台按需校验"], ["hot_fill", "热池补充"], ["hot_maintenance", "热池维护"],
+                ["cold_maintenance", "冷池维护"], ["manual", "手动批量刷新"],
+              ] as const).map(([lane, label]) => {
+                const state = data.account_verification?.lanes?.[lane];
+                const counts = data.account_pool_maintenance?.[lane];
+                return <tr className="border-t border-stone-100" key={lane}><td className="py-2">{label}</td><td>{state?.limit ?? 0}</td><td>{state?.active ?? 0}</td><td>{state?.waiting ?? 0}</td><td>{counts ? <>{counts.succeeded} / <button type="button" disabled={!counts.failed} className="enabled:text-rose-700 enabled:underline" onClick={() => setFailureSelection({ round: 0, kind: "pool" })}>{counts.failed}{counts.failed ? "（详情）" : ""}</button>{counts.protection_reason ? " · 故障保护暂停维护" : ""}</> : "—"}</td></tr>;
+              })}</tbody>
+            </table>
+            <p className="mt-2 text-xs text-stone-500">热池维护最老到期等待 {Math.round(data.account_pool?.maintenance?.hot_maintenance?.oldest_overdue_secs ?? 0)} 秒；冷池维护最老到期等待 {Math.round(data.account_pool?.maintenance?.cold_maintenance?.oldest_overdue_secs ?? 0)} 秒。维护累计数为本进程计数；失败退避不会伪造刷新成功时间。</p>
           </div>
           <p className="text-xs leading-5 text-stone-500">
             校验累计失败 {data.account_verification?.failed ?? 0} 次，后台刷新容量不足跳过 {data.account_verification?.background_rejected ?? 0} 次。
@@ -278,19 +334,19 @@ function MonitoringContent() {
                   <Metric label="待处理" value={refresh.refresh.pending} />
                 </div>
                 {refresh.refresh.total > 0 ? <div className="space-y-1.5">
-                  <div className="flex justify-between text-xs text-stone-500"><span>账号信息刷新进度</span><span>{refresh.refresh.completed} / {refresh.refresh.total} · {refreshPercent.toFixed(1)}%</span></div>
-                  <div role="progressbar" aria-label="账号信息刷新进度" aria-valuemin={0} aria-valuemax={refresh.refresh.total} aria-valuenow={refresh.refresh.completed} className="h-1.5 overflow-hidden rounded-full bg-stone-100"><div className="h-full rounded-full bg-sky-500 transition-[width]" style={{ width: `${refreshPercent}%` }} /></div>
-                </div> : <p className="text-xs text-stone-500">{refresh.status === "running" && refresh.phase === "preparing" ? "正在收集本轮待刷新账号…" : refresh.status === "idle" ? "尚无后台刷新记录" : "本轮没有需要更新信息的账号"}</p>}
+                  <div className="flex justify-between text-xs text-stone-500"><span>临期 AT 续期进度</span><span>{refresh.refresh.completed} / {refresh.refresh.total} · {refreshPercent.toFixed(1)}%</span></div>
+                  <div role="progressbar" aria-label="临期 AT 续期进度" aria-valuemin={0} aria-valuemax={refresh.refresh.total} aria-valuenow={refresh.refresh.completed} className="h-1.5 overflow-hidden rounded-full bg-stone-100"><div className="h-full rounded-full bg-sky-500 transition-[width]" style={{ width: `${refreshPercent}%` }} /></div>
+                </div> : <p className="text-xs text-stone-500">{refresh.status === "running" && refresh.phase === "preparing" ? "正在收集本轮待刷新账号…" : refresh.status === "idle" ? "尚无后台刷新记录" : "本轮没有需要续期的 AT"}</p>}
                 <dl className="grid gap-x-4 gap-y-3 text-xs sm:grid-cols-2">
                   <div><dt className="text-stone-400">最近一轮开始</dt><dd className="mt-1 text-stone-700">{formatTime(refresh.started_at ?? 0)}</dd></div>
                   <div><dt className="text-stone-400">最近一轮结束</dt><dd className="mt-1 text-stone-700">{refresh.status === "running" ? "尚未结束" : formatTime(refresh.finished_at ?? 0)}</dd></div>
                   <div><dt className="text-stone-400">最近成功刷新 / 保活</dt><dd className="mt-1 text-stone-700">{formatTime(refresh.last_success_at ?? 0)}</dd></div>
-                  <div><dt className="text-stone-400">最近完整刷新结束</dt><dd className="mt-1 text-stone-700">{formatTime(refresh.last_full_refresh_finished_at ?? 0)}</dd></div>
-                  <div><dt className="text-stone-400">预计下次完整刷新</dt><dd className="mt-1 text-stone-700">{formatTime(refresh.next_full_refresh_at ?? refresh.next_run_at ?? 0)}</dd></div>
+                  <div><dt className="text-stone-400">热池下次维护到期</dt><dd className="mt-1 text-stone-700">{formatTime(data.account_pool?.maintenance?.hot_maintenance?.next_due_at ?? 0)}</dd></div>
+                  <div><dt className="text-stone-400">冷池下次维护到期</dt><dd className="mt-1 text-stone-700">{formatTime(data.account_pool?.maintenance?.cold_maintenance?.next_due_at ?? 0)}</dd></div>
                 </dl>
                 <p className="text-xs leading-5 text-stone-500">Token 保活：已处理 {refresh.keepalive.completed} / {refresh.keepalive.total}，成功 {refresh.keepalive.succeeded}，<button type="button" disabled={refresh.keepalive.failed === 0} onClick={() => setFailureSelection({ round: refresh.round, kind: "keepalive" })} className="rounded text-rose-700 enabled:underline enabled:underline-offset-2 disabled:text-inherit">失败 {refresh.keepalive.failed}{refresh.keepalive.failed ? "（查看原因）" : ""}</button>，正在处理 {refresh.keepalive.active}，待处理 {refresh.keepalive.pending}。</p>
                 {refresh.error ? <p role="alert" className="text-xs text-amber-700">{refresh.error}</p> : null}
-                <p className="text-xs leading-5 text-stone-400">仅统计后台自动巡检，不含手动刷新或生图触发的校验；失败包含网络及校验异常，不等于账号已失效。信息刷新和 Token 保活均结束才算整轮完成，自动重新登录不在本进度内。当前轮次明细会在应用重启后重置，但完整刷新时间会持久化，下一轮按上次完整刷新结束时间计算{refresh.interval_seconds > 0 ? `，间隔 ${refresh.interval_seconds / 60} 分钟` : ""}。</p>
+                <p className="text-xs leading-5 text-stone-400">本区域仅统计临期 AT 续期和 RT 保活，不含手动刷新或生图校验；账号信息维护见上方热池/冷池通道。确认时间持久化，重启不重新计算已有账号的到期时间。凭据维护每 {refresh.interval_seconds / 60} 分钟检查一次。</p>
               </> : <p className="text-xs text-stone-500">当前后端未提供后台刷新状态，请更新后端后查看。</p>}
             </div>
           </CardContent>

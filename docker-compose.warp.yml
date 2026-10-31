@@ -103,6 +103,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: chatgpt2api:warp
     # image: milodk/chatgpt2api:latest
     container_name: chatgpt2api-warp

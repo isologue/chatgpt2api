@@ -19,6 +19,10 @@ type ImageLightboxProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onIndexChange: (index: number) => void;
+  onPreviousPage?: () => void;
+  onNextPage?: () => void;
+  indexOffset?: number;
+  totalCount?: number;
 };
 
 type ImageTransform = {
@@ -92,7 +96,7 @@ export function ImageLightbox({
   currentIndex,
   open,
   onOpenChange,
-  onIndexChange,
+  onIndexChange, onPreviousPage, onNextPage, indexOffset = 0, totalCount,
 }: ImageLightboxProps) {
   const gestureRef = useRef<TouchGesture | null>(null);
   const lastTapRef = useRef(0);
@@ -101,8 +105,8 @@ export function ImageLightbox({
   const [transform, setTransform] = useState<ImageTransform>({ scale: 1, x: 0, y: 0 });
   const [isGesturing, setIsGesturing] = useState(false);
   const current = images[currentIndex];
-  const hasPrev = currentIndex > 0;
-  const hasNext = currentIndex < images.length - 1;
+  const hasPrev = currentIndex > 0 || Boolean(onPreviousPage);
+  const hasNext = currentIndex < images.length - 1 || Boolean(onNextPage);
 
   const cancelScheduledTransform = useCallback(() => {
     if (rafRef.current != null) {
@@ -145,12 +149,14 @@ export function ImageLightbox({
   }, [cancelScheduledTransform]);
 
   const goPrev = useCallback(() => {
-    if (hasPrev) onIndexChange(currentIndex - 1);
-  }, [hasPrev, currentIndex, onIndexChange]);
+    if (currentIndex > 0) onIndexChange(currentIndex - 1);
+    else onPreviousPage?.();
+  }, [currentIndex, onIndexChange, onPreviousPage]);
 
   const goNext = useCallback(() => {
-    if (hasNext) onIndexChange(currentIndex + 1);
-  }, [hasNext, currentIndex, onIndexChange]);
+    if (currentIndex < images.length - 1) onIndexChange(currentIndex + 1);
+    else onNextPage?.();
+  }, [currentIndex, images.length, onIndexChange, onNextPage]);
 
   useEffect(() => {
     resetTransform();
@@ -359,9 +365,9 @@ export function ImageLightbox({
                 {[current.sizeLabel, current.dimensions].filter(Boolean).join(" · ")}
               </span>
             ) : null}
-            {images.length > 1 && (
+            {(totalCount ?? images.length) > 1 && (
               <span className="rounded-full bg-black/50 px-3 py-1.5 text-xs font-medium text-white/90">
-                {currentIndex + 1} / {images.length}
+                {indexOffset + currentIndex + 1} / {totalCount ?? images.length}
               </span>
             )}
             <button

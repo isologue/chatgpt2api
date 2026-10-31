@@ -4,6 +4,8 @@ import io
 import shutil
 import zipfile
 from pathlib import Path
+from uuid import uuid4
+from services.keyed_locks import KeyedLocks
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response
@@ -14,6 +16,7 @@ from services.image_storage_service import image_storage_service
 from services.image_tags_service import load_tags, remove_tags, remove_tags_many
 
 THUMBNAIL_SIZE = (320, 320)
+_THUMBNAIL_LOCKS = KeyedLocks()
 
 
 def _cleanup_empty_dirs(root: Path) -> None:
@@ -76,6 +79,12 @@ def _image_dimensions(path: Path) -> tuple[int, int] | None:
 
 
 def ensure_thumbnail(relative_path: str) -> Path:
+    # 多页面同时请求同一缩略图时只生成一次；锁在最后一个等待者退出后回收。
+    with _THUMBNAIL_LOCKS.hold(_safe_relative_path(relative_path)):
+        return _ensure_thumbnail(relative_path)
+
+
+def _ensure_thumbnail(relative_path: str) -> Path:
     target = _thumbnail_path(relative_path)
     source_mtime = 0.0
     source: Path | None = None
@@ -93,7 +102,12 @@ def ensure_thumbnail(relative_path: str) -> Path:
             if image.mode not in {"RGB", "RGBA"}:
                 image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
             image.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-            image.save(target, format="PNG", optimize=True)
+            temporary = target.with_name(target.name + "." + uuid4().hex + ".tmp")
+            try:
+                image.save(temporary, format="PNG", compress_level=3)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
     except HTTPException:
         raise
     except Exception as exc:
@@ -107,6 +121,7 @@ def get_thumbnail_response(relative_path: str) -> FileResponse:
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
+    headers["Cache-Control"] = "public, max-age=300"
     return FileResponse(ensure_thumbnail(relative_path), headers=headers)
 
 
@@ -144,6 +159,22 @@ def cleanup_image_thumbnails() -> int:
             removed += 1
     _cleanup_empty_dirs(thumbnails_root)
     return removed
+
+def list_images_page(base_url: str, start_date="", end_date="", *, page=1, page_size=12,
+                     tags=None, paths_only=False):
+    all_tags = load_tags()
+    matching = None
+    if tags:
+        matching = [path for path, values in all_tags.items() if all(tag in values for tag in tags)]
+    result = image_storage_service.list_page(start_date=start_date, end_date=end_date,
+        page=page, page_size=page_size, matching_paths=matching, paths_only=paths_only)
+    if paths_only:
+        return result
+    result["items"] = [{**item, "url": image_storage_service._public_url(str(item["path"]), base_url),
+        "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
+        "tags": all_tags.get(str(item["path"]), [])} for item in result["items"]]
+    return result
+
 
 def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
     all_tags = load_tags()
