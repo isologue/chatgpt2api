@@ -9,6 +9,8 @@ from curl_cffi import AsyncCurl
 from curl_cffi.aio import CURL_POLL_NONE, CURL_SOCKET_TIMEOUT
 from curl_cffi.requests import AsyncSession
 
+from services.image_loop_work import get_loop_work
+
 
 class _Watchdog:
     INTERVAL = 0.1
@@ -53,6 +55,8 @@ class ImageAsyncCurl(AsyncCurl):
     def __init__(self, *args, **kwargs):
         # 首次回调前允许下一次扫描补偿，避免丢失启动通知后等满宽限期。
         self._last_action = 0.0
+        self._socket_wall = self._socket_cpu = 0.0
+        self._loop_work = get_loop_work()
         super().__init__(*args, **kwargs)
 
     async def _force_timeout(self):
@@ -69,13 +73,27 @@ class ImageAsyncCurl(AsyncCurl):
                 # 等最后一个公共任务退出，避免 loop 关闭时残留定时器。
                 await asyncio.gather(hub.task, return_exceptions=True)
 
+    def process_data(self, sockfd, ev_bitmask):
+        started, cpu_started = time.perf_counter(), time.thread_time()
+        wall_before, cpu_before = self._socket_wall, self._socket_cpu
+        try:
+            return super().process_data(sockfd, ev_bitmask)
+        finally:
+            # 排除嵌套 socket_action，只统计完成结果分发及移除 handle 的开销。
+            self._loop_work.record('curl_completion', started + self._socket_wall - wall_before,
+                time.perf_counter() - started - (self._socket_wall - wall_before),
+                time.thread_time() - cpu_started - (self._socket_cpu - cpu_before))
+
     def socket_action(self, sockfd, ev_bitmask):
-        started = time.perf_counter()
+        started, cpu_started = time.perf_counter(), time.thread_time()
         try:
             return super().socket_action(sockfd, ev_bitmask)
         finally:
             self._last_action = time.monotonic()
-            elapsed = time.perf_counter() - started
+            elapsed, cpu = time.perf_counter() - started, time.thread_time() - cpu_started
+            self._socket_wall += elapsed
+            self._socket_cpu += cpu
+            self._loop_work.record('curl_socket', started, elapsed, cpu)
             if elapsed >= .05:
                 from services.image_metrics import runtime_phases
                 # 固定数值快照；不采集 URL、认证、正文或调用参数。

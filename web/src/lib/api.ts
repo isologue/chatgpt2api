@@ -344,7 +344,15 @@ export type AccountRefreshSnapshot = {
   refresh: AccountRefreshCounts; keepalive: AccountRefreshCounts;
 };
 
+export type ImageLoopWork = {
+  window_secs: number; bucket_secs: number; categories: string[];
+  timeline: { at: number; lag_ms: number; work: Record<string, {
+    count: number; total_ms: number; cpu_ms: number; max_ms: number; max_at: number;
+  }> }[];
+};
+
 export type MonitoringSnapshot = {
+  image_loop_work?: ImageLoopWork;
   snapshot_state?: Record<string, { collected_at: number | null; age_ms: number; stale: boolean; refreshing: boolean; refresh_failed: boolean }>;
   account_refresh?: AccountRefreshSnapshot;
   phases?: Record<string, RuntimePhase>;

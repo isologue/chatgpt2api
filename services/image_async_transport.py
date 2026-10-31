@@ -22,6 +22,9 @@ MAX_SSE_LINE = 1024 * 1024
 MAX_INLINE_JSON_BODY = 256 * 1024
 # 已缓冲正文也要定期让出，防止一个响应连读时饿死其他请求。
 READ_YIELD_BYTES = 256 * 1024
+READ_YIELD_CHUNKS = 64
+READ_YIELD_SECS = 0.002
+LINE_YIELD_COUNT = 64
 
 
 class AsyncImageResponse:
@@ -36,6 +39,8 @@ class AsyncImageResponse:
         self.is_sse = is_sse
         self.bytes_read = self.chunks = 0
         self._bytes_since_yield = 0
+        self._chunks_since_yield = 0
+        self._read_quantum = time.perf_counter()
         self.first_at = self.last_at = None
         self.max_gap = 0.0
         self.ended = 'closed'
@@ -54,9 +59,12 @@ class AsyncImageResponse:
     async def _next(self):
         remaining = remaining_image_budget()
         try:
-            if self._bytes_since_yield >= READ_YIELD_BYTES:
-                self._bytes_since_yield = 0
+            if (self._bytes_since_yield >= READ_YIELD_BYTES
+                    or self._chunks_since_yield >= READ_YIELD_CHUNKS
+                    or time.perf_counter() - self._read_quantum >= READ_YIELD_SECS):
+                self._bytes_since_yield = self._chunks_since_yield = 0
                 await asyncio.sleep(0)
+                self._read_quantum = time.perf_counter()
                 remaining = remaining_image_budget()
             queue = getattr(self.response, 'queue', None)
             stream_task = getattr(self.response, 'astream_task', None)
@@ -81,6 +89,7 @@ class AsyncImageResponse:
         if chunk:
             self.bytes_read += len(chunk)
             self._bytes_since_yield += len(chunk)
+            self._chunks_since_yield += 1
             self.chunks += 1
             self.max_gap = max(self.max_gap, now - (self.last_at or self.headers_at))
             self.first_at = self.first_at or now
@@ -117,11 +126,20 @@ class AsyncImageResponse:
 
     def iter_lines(self, chunk_size=None, decode_unicode=False, delimiter=None):
         pending = b''
+        line_count, quantum = 0, time.perf_counter()
         for chunk in self.iter_content():
             pending += chunk
             lines = pending.split(b'\n')
             pending = lines.pop()
             for line in lines:
+                line_count += 1
+                # 单块可能包含大量小事件；字节数阈值无法保证解析期间的公平调度。
+                if (line_count >= LINE_YIELD_COUNT
+                        or (line_count % 8 == 0 and time.perf_counter() - quantum >= READ_YIELD_SECS)):
+                    remaining_image_budget()
+                    await_io(asyncio.sleep(0))
+                    remaining_image_budget()
+                    line_count, quantum = 0, time.perf_counter()
                 if len(line) > MAX_SSE_LINE:
                     self.ended = 'body_limit'
                     raise RuntimeError('image SSE line exceeds the size limit')

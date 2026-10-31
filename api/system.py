@@ -37,6 +37,7 @@ from services.proxy_service import proxy_settings, test_clearance, test_proxy
 from services.thread_pool import apply_anyio_thread_limit, configure_image_executors
 from utils.log import logger
 from services.image_metrics import runtime_phases, image_diagnostics_snapshot
+from services.image_loop_work import snapshot as image_loop_work_snapshot
 from services.monitoring_cache import SnapshotCache
 from services.isolated_executor import image_stats_executor
 from services.isolated_executor import completion_executor, monitoring_executor
@@ -158,6 +159,7 @@ def create_router(app_version: str) -> APIRouter:
                 "account_refresh": account_refresh_monitor.snapshot(),
                 "phases": runtime_phases.snapshot(),
                 "image_diagnostics": image_diagnostics_snapshot(),
+                "image_loop_work": image_loop_work_snapshot(),
                 "runtime_logging": logger.stats(),
                 "completion_executor": completion_executor.stats(),
                 "monitoring_executor": monitoring_executor.stats(),

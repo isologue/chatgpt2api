@@ -31,6 +31,8 @@ def await_io(awaitable):
 
 async def run_cooperative(handler, *args):
     """每个 asyncio Task 有自己的 Context；阶段、预算、账号信息随切换保留。"""
+    from services.image_loop_work import get_loop_work
+    work = get_loop_work()
     child = greenlet(handler, parent=getcurrent())
     child._image_cooperative = True
     child.gr_context = getcurrent().gr_context
@@ -42,6 +44,7 @@ async def run_cooperative(handler, *args):
             return callback(*values)
         finally:
             elapsed, cpu = time.perf_counter() - started, time.thread_time() - cpu_started
+            work.record('business_slice', started, elapsed, cpu)
             # 让出点所属的最内层业务阶段；结束片段退回外层阶段或 other。
             stage = child.gr_context.get(current_stage, 'other')
             if stage == 'other':
@@ -155,14 +158,21 @@ class ImageAsyncRuntime:
             self._watch.cancel()
             self.loop.run_until_complete(asyncio.gather(self._watch, return_exceptions=True))
             self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            work = getattr(self.loop, '_image_loop_work', None)
+            if work is not None:
+                work.flush(force=True)
             self.loop.close()
 
     async def _watch_requests(self):
         from services.image_metrics import runtime_phases
+        from services.image_loop_work import get_loop_work
+        work = get_loop_work()
         while True:
             target = self.loop.time() + 0.1
             await asyncio.sleep(0.1)
-            runtime_phases.observe('image_io_loop_lag', max(0.0, self.loop.time() - target))
+            lag = max(0.0, self.loop.time() - target)
+            runtime_phases.observe('image_io_loop_lag', lag)
+            work.flush(lag)
             for task, diagnostics in tuple(self._tasks.items()):
                 if diagnostics is not None and diagnostics.cancelled.is_set() and not task.cancelling():
                     task.cancel()

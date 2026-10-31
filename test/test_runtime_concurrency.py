@@ -218,8 +218,8 @@ def test_poll_queries_result_before_tasks_and_limits_auxiliary_budget(clock, mon
     monkeypatch.setattr(config, 'data', {**config.data, 'image_poll_initial_wait_secs': 10, 'image_poll_interval_secs': 10})
     with pytest.raises(diag.ImagePollTimeoutError):
         backend._poll_image_results('fixture', timeout_secs=10)
-    assert order == ['conversation', 'tasks', 'conversation']
-    assert timeouts == [.8]
+    assert order == ['conversation', 'tasks', 'conversation', 'conversation', 'conversation']
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 1
     assert 1009 <= clock.now < 1010
 
 

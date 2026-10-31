@@ -1262,15 +1262,12 @@ def _resolve_stream_image_result(backend: OpenAIBackendAPI, request: Conversatio
         retry_poll_timeout = config.image_poll_timeout_secs
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
-            retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
+            # 初始等待统一交给轮询器，避免外层等待和内部等待重复消耗短预算。
             logger.info({
-                "event": "image_stream_retry_poll_after_wait",
+                "event": "image_stream_retry_poll",
                 "conversation_id": conversation_id,
-                "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            if not poll_pause(retry_wait_secs):
-                raise ImagePollTimeoutError("图片补查剩余预算不足，停止等待。", conversation_id)
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,

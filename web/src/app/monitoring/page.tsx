@@ -212,6 +212,22 @@ function MonitoringContent() {
               {(data.phases?.image_io_loop_lag?.timeline ?? []).map((point) => <tr key={point.at} className="border-t border-stone-100"><td className="py-1">{formatTime(point.at)}</td><td>{formatDuration(point.max_ms)}</td><td>{formatTime(point.max_at)}</td><td>{formatDuration(point.last_ms)}</td></tr>)}
             </tbody></table></div>
           </details>
+          <details className="rounded-xl border border-stone-200 p-3 text-xs text-stone-600">
+            <summary className="cursor-pointer">图片循环工作耗时（近5分钟，每5秒聚合）</summary>
+            <p className="mt-2 leading-5">每项依次展示：次数、累计耗时、单次最大耗时、CPU耗时。网络处理与完成通知分别统计；这里只覆盖已标记的工作，不能解释全部事件循环延迟。鼠标移到单元格可查看最慢工作的开始时间。</p>
+            <div className="mt-3 max-h-64 overflow-auto"><table className="w-full min-w-[720px] text-left">
+              <thead><tr><th>窗口时间</th><th>循环延迟峰值</th><th>网络处理</th><th>完成通知</th><th>业务连续执行</th></tr></thead>
+              <tbody>{(data.image_loop_work?.timeline ?? []).slice().reverse().map((point) => <tr key={point.at} className="border-t border-stone-100">
+                <td className="py-2 whitespace-nowrap">{formatTime(point.at)}</td><td>{formatDuration(point.lag_ms)}</td>
+                {(["curl_socket", "curl_completion", "business_slice"] as const).map((name) => {
+                  const item = point.work[name];
+                  return <td key={name} title={item ? `最慢工作开始：${formatTime(item.max_at)}` : "该窗口没有记录"} className="whitespace-nowrap">
+                    {item ? `${item.count} 次 / ${formatDuration(item.total_ms)} / ${formatDuration(item.max_ms)} / ${formatDuration(item.cpu_ms)}` : "—"}
+                  </td>;
+                })}
+              </tr>)}</tbody>
+            </table></div>
+          </details>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead><tr className="border-b border-stone-200 text-stone-500"><th className="py-2 font-medium">阶段</th><th className="py-2 font-medium">进行中</th><th className="py-2 font-medium">P50</th><th className="py-2 font-medium">P95</th><th className="py-2 font-medium">最老在途</th><th className="py-2 font-medium">累计完成</th></tr></thead>

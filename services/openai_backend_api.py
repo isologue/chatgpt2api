@@ -2,6 +2,7 @@ from services.image_async import blocking, cooperative
 
 import base64
 import json
+import math
 import mimetypes
 import os
 import random
@@ -2143,8 +2144,8 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """在统一补查预算内优先查询对话结果，再做少量辅助诊断。
 
-        首次等待最多使用剩余预算的五分之一；辅助任务查询仅第一轮执行。
-        空结果按配置间隔重查，异常退避及二次确认至少保留 0.5 秒查询时间。
+        短预算分配少量均匀查询，避免长间隔把迟到结果拖到最后一刻。
+        辅助任务查询仅第一轮执行；网络退避和二次确认也计入查询上限。
         Retry-After 或二次确认无法装入剩余预算时提前退出，交给上层切号。
         """
         start = time.monotonic()
@@ -2174,16 +2175,24 @@ class OpenAIBackendAPI:
             global_remaining = remaining_image_budget()
             return min(local_remaining, global_remaining) if global_remaining is not None else local_remaining
 
+        # 10 秒 / 默认间隔时最多查询 4 次；用户配置更短间隔或更长预算时
+        # 按原有频率计算上限。这里限制的是远程查询次数，不是生图并发。
+        available = max(0.0, _remaining())
+        max_attempts = max(4, math.ceil(available / max(0.5, interval)))
+        query_reserve = min(1.0, available / 4)
+        first_wait = min(initial_wait, max(0.0, available - query_reserve) / 10)
+        first_wait *= 0.9 + random.uniform(0, 0.1)
+        max_query_secs = 0.0
+        # 只允许有图片标识后的最后一次二次确认额外占用一轮。
+        confirmation_pending = False
+
         if has_initial_ids and config.image_settle_enabled:
             remaining = max(0.0, _remaining())
             if config.image_settle_secs + 0.5 >= remaining:
                 raise ImageResultResolveError("剩余补查预算不足以完成图片二次确认。", conversation_id)
             wait_with_image_budget(config.image_settle_secs)
-        elif initial_wait > 0:
-            jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()) / 5)
-            if sleep_for > 0:
-                wait_with_image_budget(sleep_for)
+        elif not has_initial_ids and first_wait > 0:
+            wait_with_image_budget(first_wait)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2192,12 +2201,12 @@ class OpenAIBackendAPI:
             remaining = _remaining()
             if remaining <= 0:
                 return False
-            if remaining <= 0.5:
+            if remaining <= query_reserve or attempt >= max_attempts:
                 return False
             # Retry-After 不能为了塞进剩余预算而提前重试。
-            if retry_after is not None and backoff + 0.5 >= remaining:
+            if retry_after is not None and backoff + query_reserve >= remaining:
                 raise ImageResultResolveError("上游要求的重试等待超过剩余补查预算。", conversation_id)
-            sleep_for = min(backoff, remaining - 0.5)
+            sleep_for = min(backoff, remaining - query_reserve)
             log_payload: Dict[str, Any] = {
                 "event": "image_poll_retry",
                 "conversation_id": conversation_id,
@@ -2213,11 +2222,24 @@ class OpenAIBackendAPI:
             wait_with_image_budget(sleep_for)
             return True
 
+        def _query_conversation():
+            nonlocal max_query_secs, query_reserve
+            query_started = time.monotonic()
+            try:
+                return self._get_conversation(conversation_id)
+            finally:
+                max_query_secs = max(max_query_secs, time.monotonic() - query_started)
+                # 快查询允许最后一轮更靠近截止时间；慢查询提前预留相应网络时间。
+                query_reserve = max(0.5, max_query_secs * 1.5)
+                if config.image_check_before_hit_enabled and config.image_settle_enabled:
+                    query_reserve = query_reserve * 2 + config.image_settle_secs
+
         last_task_error = ""
-        while _remaining() > 0:
+        while _remaining() > 0 and (attempt < max_attempts or confirmation_pending):
+            confirmation_pending = False
             attempt += 1
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = _query_conversation()
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -2307,20 +2329,30 @@ class OpenAIBackendAPI:
                     raise ImageResultResolveError("剩余补查预算不足以完成图片二次确认。", conversation_id)
                 wait = min(config.image_settle_secs, remaining)
                 if wait > 0:
+                    confirmation_pending = attempt == max_attempts
                     wait_with_image_budget(wait)
                     continue
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - start, 1)})
             remaining = max(0.0, _remaining())
-            if remaining <= 0.5:
+            if remaining <= query_reserve or attempt >= max_attempts:
                 break
-            wait_with_image_budget(min(interval, remaining - 0.5))
+            # 下一次查询按窗口内的位置安排；小幅错峰，不把最后一次查询挤出预算。
+            spacing = min(interval, max(0.0, available - first_wait - query_reserve) / (max_attempts - 1))
+            target = start + first_wait + spacing * attempt
+            pause = max(0.0, target - time.monotonic())
+            if attempt < max_attempts - 1:
+                pause *= 0.95 + random.uniform(0, 0.1)
+            if pause > 0:
+                wait_with_image_budget(min(pause, max(0.0, remaining - query_reserve)))
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "attempts_made": attempt,
+            "query_limit": max_attempts,
+            "query_reserve_secs": round(query_reserve, 3),
             # attempts_made == 0 means the initial_wait consumed the entire budget — no HTTP attempted.
             "initial_wait_exhausted_budget": attempt == 0,
             "last_task_error": last_task_error if last_task_error else None,

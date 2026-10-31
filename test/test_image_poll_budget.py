@@ -147,9 +147,8 @@ def test_short_poll_budget_still_attempts_a_query(clock, monkeypatch):
     monkeypatch.setattr(config, "data", {**config.data, "image_poll_initial_wait_secs": 10, "image_poll_interval_secs": 10})
     with pytest.raises(ImagePollTimeoutError):
         backend._poll_image_results("conv", timeout_secs=10)
-    assert calls == ["conv", "conv"]
-    assert clock.now <= 1010
-    assert clock.now >= 1009
+    assert calls == ["conv"] * 4  # 短窗口查询有界，避免每秒补查放大流量。
+    assert 1008 <= clock.now <= 1010
 
 
 def test_sse_and_poll_config_defaults_are_independent(monkeypatch):
@@ -253,3 +252,146 @@ def test_missing_conversation_after_recovery_is_a_poll_failure(monkeypatch):
         {"turn_use_case": "image gen"}]))
     with pytest.raises(ImageResultResolveError):
         list(flow.stream_image_outputs(backend, flow.ConversationRequest(prompt="test", model="gpt-image-2")))
+
+
+@pytest.fixture
+def planned_backend(clock, monkeypatch):
+    """真实轮询实现 + 虚拟上游，仅替换网络；每次查询消耗 100ms。"""
+    monkeypatch.setattr("services.openai_backend_api.random.uniform", lambda *args: 0)
+    monkeypatch.setattr(config, "data", {**config.data, "image_poll_initial_wait_secs": 10,
+        "image_poll_interval_secs": 10, "image_poll_timeout_secs": 10, "image_check_before_hit_enabled": False,
+        "image_settle_enabled": False})
+    backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+    state = SimpleNamespace(queries=[], task_queries=0, ready_at=None)
+    def conversation(cid):
+        state.queries.append(clock.now)
+        clock.now += .1
+        return {"ready": state.ready_at is not None and clock.now >= state.ready_at}
+    def tasks(**kwargs):
+        state.task_queries += 1
+        clock.now += .1
+        return []
+    backend._get_conversation = conversation
+    backend._query_backend_tasks = tasks
+    backend._extract_image_tool_records = lambda value: ([{"file_ids": ["fixture"], "sediment_ids": []}] if value["ready"] else [])
+    backend._find_content_policy_error_in_conversation = lambda value: ""
+    return backend, state
+
+
+def test_late_result_found_before_end_of_short_budget(clock, planned_backend):
+    backend, state = planned_backend
+    state.ready_at = 1004
+    assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
+    assert 1004 <= clock.now < 1007
+    assert len(state.queries) == 3
+    assert state.task_queries == 1
+
+
+def test_poll_query_limit_includes_transient_errors(clock, monkeypatch, planned_backend):
+    from utils.helper import UpstreamHTTPError
+    backend, state = planned_backend
+    def query(cid):
+        state.queries.append(clock.now)
+        raise UpstreamHTTPError("fixture", 429, {}, retry_after=0)
+    backend._get_conversation = query
+    with pytest.raises(ImagePollTimeoutError):
+        backend._poll_image_results("fixture", 10)
+    assert len(state.queries) == 4
+    assert state.task_queries == 0
+
+
+def test_retry_after_is_not_shortened_to_fit_poll_window(clock, planned_backend):
+    from utils.helper import UpstreamHTTPError
+    from services.image_diagnostics import ImageResultResolveError
+    backend, state = planned_backend
+    def query(cid):
+        state.queries.append(clock.now)
+        raise UpstreamHTTPError("fixture", 429, {}, retry_after=30)
+    backend._get_conversation = query
+    with pytest.raises(ImageResultResolveError, match="重试等待"):
+        backend._poll_image_results("fixture", 10)
+    assert len(state.queries) == 1
+    assert clock.now < 1002
+
+
+def test_retry_after_delay_is_observed_before_query(clock, planned_backend):
+    from utils.helper import UpstreamHTTPError
+    backend, state = planned_backend
+    original = backend._get_conversation
+    def query(cid):
+        if not state.queries:
+            state.queries.append(clock.now)
+            raise UpstreamHTTPError("fixture", 429, {}, retry_after=2)
+        return original(cid)
+    backend._get_conversation = query
+    state.ready_at = 1001
+    assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
+    assert state.queries[1] - state.queries[0] >= 2
+
+
+def test_last_query_can_confirm_image_without_unbounded_extra_queries(clock, monkeypatch, planned_backend):
+    backend, state = planned_backend
+    state.ready_at = 1008
+    monkeypatch.setitem(config.data, "image_check_before_hit_enabled", True)
+    monkeypatch.setitem(config.data, "image_settle_enabled", True)
+    monkeypatch.setitem(config.data, "image_settle_secs", .1)
+    assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
+    assert len(state.queries) == 5
+    assert clock.now < 1010
+
+
+def test_fallback_has_only_pollers_initial_wait(clock, monkeypatch, planned_backend):
+    backend, state = planned_backend
+    state.ready_at = 1000
+    monkeypatch.setattr(flow, "conversation_events", lambda *a, **k: iter([{
+        "conversation_id": "fixture", "turn_use_case": "image gen", "text": ""}]))
+    monkeypatch.setattr(flow, "_get_detailed_error_from_tasks", lambda *a, **k: "")
+    backend.resolve_conversation_image_urls = lambda *a, **k: ["local"] if k.get("poll") is False else []
+    backend.download_image_bytes = lambda urls: [b"fixture"]
+    monkeypatch.setattr(flow, "format_image_result", lambda *a, **k: {"data": [{"url": "local"}]})
+    result = list(flow.stream_image_outputs(backend, flow.ConversationRequest(prompt="fixture", model="gpt-image-2")))
+    assert result[-1].data == [{"url": "local"}]
+    assert len(state.queries) == 1
+    assert state.queries[0] < 1001.5
+    assert clock.now < 1002
+
+
+def test_poll_plan_honors_shorter_outer_deadline(clock, planned_backend):
+    backend, state = planned_backend
+    with pytest.raises(ImagePollTimeoutError):
+        with diag.image_poll_budget(2, "outer"):
+            backend._poll_image_results("fixture", 10)
+    assert len(state.queries) <= 4
+    assert clock.now <= 1002
+    assert diag.remaining_poll_budget() is None
+
+
+@pytest.mark.parametrize("interval", [.5, 1])
+def test_explicit_short_interval_remains_configurable(clock, monkeypatch, planned_backend, interval):
+    backend, state = planned_backend
+    monkeypatch.setitem(config.data, "image_poll_interval_secs", interval)
+    with pytest.raises(ImagePollTimeoutError):
+        backend._poll_image_results("fixture", 10)
+    assert 4 < len(state.queries) <= 10 / interval
+    assert clock.now <= 1010
+
+
+def test_slow_queries_leave_time_for_the_last_network_call(clock, planned_backend):
+    backend, state = planned_backend
+    def query(cid):
+        state.queries.append(clock.now)
+        clock.now += 1
+        return {"ready": len(state.queries) >= 4}
+    backend._get_conversation = query
+    assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
+    assert len(state.queries) == 4
+    assert state.queries[-1] <= 1008.5
+    assert clock.now <= 1010
+
+
+def test_result_just_before_deadline_is_still_found(clock, planned_backend):
+    backend, state = planned_backend
+    state.ready_at = 1009.3
+    assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
+    assert len(state.queries) == 4
+    assert clock.now < 1010
