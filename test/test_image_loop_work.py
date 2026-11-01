@@ -64,7 +64,7 @@ def test_curl_completion_excludes_socket_work(monkeypatch):
         driver = ImageAsyncCurl()
         work = get_loop_work()
         try:
-            driver.process_data(-1, 0)
+            driver._process_data(-1, 0, "timer")
             work.flush(force=True)
             row = work.samples(time.perf_counter())[-1]["work"]
             assert row["curl_socket"]["count"] == 1

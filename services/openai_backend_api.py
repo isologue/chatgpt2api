@@ -2636,7 +2636,8 @@ class OpenAIBackendAPI:
                     chunks = []
                     with phase("image_download_body"):
                         # curl_cffi 的流式响应不会自动填充 content，必须消费完整响应流。
-                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                        # 只合并已到达的块，减少跨 greenlet 切换，不等待凑满。
+                        for chunk in response.iter_content(chunk_size=256 * 1024):
                             remaining_image_budget()
                             if chunk:
                                 chunks.append(chunk)

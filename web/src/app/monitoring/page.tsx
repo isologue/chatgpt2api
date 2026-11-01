@@ -227,6 +227,21 @@ function MonitoringContent() {
                 })}
               </tr>)}</tbody>
             </table></div>
+            <p className="mt-4 leading-5">回调来源：每项展示触发次数、实际执行次数、执行耗时。重复就绪通知可被合并；来源耗时包含上表网络处理及完成通知，不能重复相加。单个底层调用仍无法被中途打断。</p>
+            <div className="mt-3 max-h-64 overflow-auto"><table className="w-full min-w-[1100px] text-left">
+              <thead><tr><th>窗口时间</th><th>套接字就绪</th><th>原生定时器</th><th>兜底检查</th><th>合并通知</th><th>批次 / 让出 / 加速</th><th>通知排队峰值 / 最长等待</th><th>删除定时器</th></tr></thead>
+              <tbody>{(data.image_loop_work?.timeline ?? []).slice().reverse().map((point) => <tr key={point.at} className="border-t border-stone-100">
+                <td className="py-2 whitespace-nowrap">{formatTime(point.at)}</td>
+                {(["socket", "timer", "watchdog"] as const).map((source) => {
+                  const item = point.work[`curl_${source}_event`];
+                  return <td key={source} className="whitespace-nowrap">{point.curl_dispatch?.[`${source}_events`] ?? 0} 次 / {item?.count ?? 0} 次 / {formatDuration(item?.total_ms)}</td>;
+                })}
+                <td>{point.curl_dispatch?.coalesced_events ?? 0} 次</td>
+                <td>{point.curl_dispatch?.batches ?? 0} / {point.curl_dispatch?.yields ?? 0} / {point.curl_dispatch?.pressure_batches ?? 0}</td>
+                <td title={`套接字最长等待：${formatDuration(point.curl_dispatch?.max_socket_wait_ms)}；定时器最长等待：${formatDuration(point.curl_dispatch?.max_timer_wait_ms)}；平均回调等待：${formatDuration((point.curl_dispatch?.wait_total_ms ?? 0) / Math.max(1, point.curl_dispatch?.wait_count ?? 0))}`} className="whitespace-nowrap">{point.curl_dispatch?.max_pending ?? 0} / {formatDuration(point.curl_dispatch?.max_wait_ms)}</td>
+                <td>{point.curl_dispatch?.timer_cancels ?? 0} 次</td>
+              </tr>)}</tbody>
+            </table></div>
           </details>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">

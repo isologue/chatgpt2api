@@ -1,6 +1,6 @@
 const phaseLabels: Record<string, string> = {
   image_queue_wait: "图片任务排队", image_admission_wait: "等待图片执行名额",
-  image_dispatch_wait: "分发图片任务", sse_transport: "生成流传输摘要", account_slot_wait: "等待账号槽位",
+  image_dispatch_wait: "分发图片任务", sse_transport: "生成流传输摘要", image_download_transport: "图片下载传输摘要", account_slot_wait: "等待账号槽位",
   account_foreground_verification: "按需校验账号", account_verification_wait: "等待账号校验",
   account_token_refresh: "刷新账号令牌", request_auth: "请求鉴权", request_filter: "请求内容检查",
   account_lookup: "获取可用账号", account_verification_queue: "账号校验排队",
@@ -54,10 +54,15 @@ export function diagnosticStatusLabel(step: Record<string, unknown>): string {
 }
 
 export function diagnosticReasonLabel(step: Record<string, unknown>): string {
-  if (step.phase === "sse_transport" && step.transport && typeof step.transport === "object") {
+  if (["sse_transport", "image_download_transport"].includes(String(step.phase)) && step.transport && typeof step.transport === "object") {
     const data = step.transport as Record<string, unknown>;
     const ms = (key: string) => `${Math.round(Number(data[key]) || 0)}ms`;
     const endings: Record<string, string> = { eof: "流结束", closed: "主动结束读取", error: "传输异常", body_limit: "正文超过上限" };
+    if (step.phase === "image_download_transport") {
+      const codes: Record<number, string> = { 18: "正文不完整", 23: "写入中断", 28: "传输超时", 35: "TLS 握手失败", 52: "空响应", 55: "发送失败", 56: "接收失败", 92: "HTTP/2 流异常" };
+      const code = Number(data.curl_error_code) || 0;
+      return `响应头 ${ms("headers_ms")} · 正文 ${ms("body_ms")} · 已读 ${Number(data.bytes) || 0}/${Number(data.expected_bytes) || "未知"} 字节 · 均速 ${Math.round((Number(data.bytes_per_sec) || 0) / 1024)} KiB/s · 最长回调排队 ${ms("dispatch_max_wait_ms")} · 最长间隔 ${ms("max_gap_ms")} · ${endings[String(data.termination)] || "未知结束"}${code ? ` · curl ${code}（${codes[code] || "传输异常"}）` : ""}`;
+    }
     return `响应头 ${ms("headers_ms")} · 首段 ${data.first_chunk_received ? ms("first_chunk_ms") : "未收到"} · 最后数据 ${ms("last_chunk_ms")} · 最长间隔 ${ms("max_gap_ms")} · 末段后等待 ${ms("idle_after_last_ms")} · ${Number(data.bytes) || 0}字节/${Number(data.chunks) || 0}段 · ${endings[String(data.termination)] || "未知结束"}`;
   }
   return ([['action', actionLabels], ['reason', reasonLabels], ['error_type', errorLabels]] as const)
@@ -69,6 +74,7 @@ export function diagnosticReasonLabel(step: Record<string, unknown>): string {
 }
 
 const performanceLabels: Record<string, string> = {
+  curl_queue_wait: "本次 HTTP 回调累计排队（可能重叠）", curl_queue_wait_max: "本次 HTTP 最长回调排队",
   http_headers: "等待并接收响应头", http_body: "响应头后至读取收尾", http_total: "HTTP 调用总耗时",
   curl_dns: "连接计时：域名解析完成", curl_connect: "连接计时：TCP 连接完成",
   curl_tls: "连接计时：TLS 握手完成", curl_first_byte: "连接计时：收到首字节",

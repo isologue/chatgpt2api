@@ -121,3 +121,5 @@ uv run python scripts/benchmark_image_loop_fairness.py --baseline-ref 9dcb904 --
 完整本地证据：output/loadtest_detailed_20261031T235802/report.md 及同目录 JSON/JSONL，均不提交仓库。
 
 用户确认保留此版本，合入并推送 origin/main。后续在 codex/image-curl-callback-fairness 分支调查 socket 就绪、timer、watchdog 触发来源及重复唤醒，离线验证回调去重、时间预算和公平调度，再同口径复测。继续保留账号连接、Cookie 与认证隔离，暂缓紧凑账号索引重构。
+
+后续 curl 回调公平调度的复现、实现及本机 Linux/Windows 对照见 docs/image-curl-callback-fairness-20261101.md。

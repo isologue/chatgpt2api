@@ -28,12 +28,13 @@ LINE_YIELD_COUNT = 64
 
 
 class AsyncImageResponse:
-    def __init__(self, owner, response, started, stream_deadline, cap, is_sse):
+    def __init__(self, owner, response, started, stream_deadline, cap, is_sse, dispatch_wait=None):
         self.owner = owner
         self.response = response
         self.started = started
         self.headers_at = time.perf_counter()
         self.stage = current_stage.get()
+        self._dispatch_wait = dispatch_wait
         self._image_stream_deadline = stream_deadline if stream_deadline is not None else float('inf')
         self.cap = cap
         self.is_sse = is_sse
@@ -45,6 +46,7 @@ class AsyncImageResponse:
         self.max_gap = 0.0
         self.ended = 'closed'
         self._closed = False
+        self._curl_error_code = None
         self._iterator = response.aiter_content().__aiter__()
 
     def __getattr__(self, name):
@@ -80,7 +82,8 @@ class AsyncImageResponse:
         except StopAsyncIteration:
             self.ended = 'eof'
             raise
-        except BaseException:
+        except BaseException as exc:
+            self._curl_error_code = getattr(exc, 'code', None)
             self.ended = 'error'
             # 总预算/取消优先于网络错误与阶段超时。
             remaining_image_budget()
@@ -163,12 +166,22 @@ class AsyncImageResponse:
             await asyncio.gather(stream_task, return_exceptions=True)
         self.owner.responses.discard(self)
         ended_at = time.perf_counter()
+        if self._dispatch_wait:
+            record('curl_queue_wait', self._dispatch_wait['total_ms'] / 1000, stage=self.stage)
+            record('curl_queue_wait_max', self._dispatch_wait['max_ms'] / 1000, stage=self.stage)
         record('http_body', ended_at - self.headers_at, stage=self.stage)
         record('http_total', ended_at - self.started, stage=self.stage)
-        if self.is_sse:
+        is_download = self.stage in {'image_download', 'image_download_http'}
+        if self.is_sse or is_download:
             now = time.perf_counter()
             metrics = current_metrics.get()
             if metrics is not None:
+                headers = getattr(self.response, 'headers', {})
+                length = headers.get('content-length', '')
+                expected = int(length) if str(length).isdigit() and len(str(length)) < 16 else 0
+                body_secs = max(.000001, ended_at - self.headers_at)
+                if is_download:
+                    metrics.add_count('image_download_wire_bytes', self.bytes_read)
                 metrics.diagnostics.transport_summary({
                     'headers_ms': (self.headers_at - self.started) * 1000,
                     'first_chunk_ms': ((self.first_at or now) - self.started) * 1000,
@@ -178,7 +191,13 @@ class AsyncImageResponse:
                     'bytes': self.bytes_read, 'chunks': self.chunks,
                     'first_chunk_received': self.first_at is not None,
                     'termination': self.ended,
-                })
+                    **({'body_ms': body_secs * 1000, 'bytes_per_sec': self.bytes_read / body_secs,
+                        'expected_bytes': expected, 'curl_error_code': self._curl_error_code,
+                        'dispatch_count': (self._dispatch_wait or {}).get('count', 0),
+                        'dispatch_wait_ms': (self._dispatch_wait or {}).get('total_ms', 0),
+                        'dispatch_max_wait_ms': (self._dispatch_wait or {}).get('max_ms', 0)}
+                       if is_download else {}),
+                }, phase='image_download_transport' if is_download else 'sse_transport')
 
     def close(self):
         if self._closed:
@@ -246,6 +265,9 @@ class AsyncImageSession:
             **self.session.curl_options, CurlOpt.TIMEOUT_MS: max(1, math.ceil(total * 1000)),
             CurlOpt.MAXFILESIZE_LARGE: cap,
         }
+        # 单账号一次只执行一个 HTTP 传输；记录数值摘要，不向回调上下文放入请求信息。
+        dispatch_wait = {'count': 0, 'total_ms': 0., 'max_ms': 0.}
+        self.session.acurl._transfer_wait = dispatch_wait
         task = asyncio.create_task(self.session.request(method, url, **kwargs))
         headers_recorded = False
         try:
@@ -262,7 +284,7 @@ class AsyncImageSession:
                 if isinstance(value, (int, float)):
                     record(component, value)
             remaining_image_budget()
-            wrapped = AsyncImageResponse(self, response, started, deadline, cap, stream_cap is not None)
+            wrapped = AsyncImageResponse(self, response, started, deadline, cap, stream_cap is not None, dispatch_wait)
             self.responses.add(wrapped)
             if not is_stream:
                 try:

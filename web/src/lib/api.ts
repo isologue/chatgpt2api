@@ -346,7 +346,11 @@ export type AccountRefreshSnapshot = {
 
 export type ImageLoopWork = {
   window_secs: number; bucket_secs: number; categories: string[];
-  timeline: { at: number; lag_ms: number; work: Record<string, {
+  timeline: { at: number; lag_ms: number;
+    curl_dispatch?: Partial<Record<"socket_events" | "timer_events" | "watchdog_events" | "coalesced_events" |
+      "batches" | "yields" | "max_pending" | "max_wait_ms" | "timer_cancels" | "pressure_batches" | "wait_count" | "wait_total_ms" |
+      "max_socket_wait_ms" | "max_timer_wait_ms" | "max_watchdog_wait_ms", number>>;
+    work: Record<string, {
     count: number; total_ms: number; cpu_ms: number; max_ms: number; max_at: number;
   }> }[];
 };

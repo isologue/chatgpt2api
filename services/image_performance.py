@@ -12,7 +12,7 @@ COMPONENTS = frozenset({
     'http_headers', 'http_body', 'http_total', 'curl_dns', 'curl_connect',
     'curl_tls', 'curl_first_byte', 'offload_queue', 'offload_work', 'offload_resume',
     'cpu_submit', 'cpu_queue', 'cpu_work', 'cpu_work_cpu', 'cpu_return', 'cpu_resume', 'cpu_fallback',
-    'sync_slice', 'sync_slice_cpu',
+    'sync_slice', 'sync_slice_cpu', 'curl_queue_wait', 'curl_queue_wait_max',
 })
 current_stage = ContextVar('image_performance_stage', default='other')
 SLOW_SLICE_SECS = 0.05

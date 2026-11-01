@@ -9,6 +9,7 @@ from pathlib import Path
 import ssl
 import statistics
 import sys
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,7 @@ from services.image_async import run_cooperative
 from services.image_async_transport import AsyncImageSession
 from services.image_curl import ImageAsyncCurl, ImageCurlSession
 from services.image_metrics import ImageMetrics, current_metrics
+from services.image_loop_work import get_loop_work
 
 
 def tls_context(folder, cert_path=None, key_path=None):
@@ -57,9 +59,27 @@ def stats(values):
             for k, q in [('p50_ms', .5), ('p95_ms', .95), ('max_ms', 1)]} if values else {}
 
 
-async def trial(mode, count, context):
-    driver_class = AsyncCurl if mode == 'legacy' else ImageAsyncCurl
-    session_class = AsyncSession if mode == 'legacy' else ImageCurlSession
+def load_baseline(ref, filename=None):
+    if filename:
+        source = Path(filename).read_text(encoding='utf8')
+    else:
+        source = subprocess.check_output(['git', 'show', ref + ':services/image_curl.py']).decode('utf8')
+    scope = {'__name__': 'curl_benchmark_baseline'}
+    exec(compile(source, '<git-curl-baseline>', 'exec'), scope)
+    return scope['ImageAsyncCurl'], scope['ImageCurlSession']
+
+
+async def trial(mode, count, context, baseline=None):
+    old_driver, old_session = baseline or (AsyncCurl, AsyncSession)
+    driver_class = old_driver if mode == 'legacy' else ImageAsyncCurl
+    session_class = old_session if mode == 'legacy' else ImageCurlSession
+    loop = asyncio.get_running_loop()
+    previous_queue = getattr(loop, '_image_curl_callbacks', None)
+    if previous_queue is not None:
+        assert not previous_queue.pending and previous_queue.handle is None
+        del loop._image_curl_callbacks
+    loop_work = get_loop_work()
+    loop_work.flush(force=True)
     callbacks = {'all': 0, 'timeout': 0, 'wall_s': 0., 'max_s': 0.}
     original = driver_class.socket_action
     def action(self, sockfd, bitmask):
@@ -145,8 +165,10 @@ async def trial(mode, count, context):
         if connections: await asyncio.gather(*tuple(connections), return_exceptions=True)
     assert len(drivers) == count and all(d._curlm is None for d in drivers)
     assert not getattr(asyncio.get_running_loop(), '_image_curl_watchdog', None)
-    return {'mode': mode, 'requests': count, 'tls': bool(context),
-            'watchdog_grace_secs': 1.0 if mode == 'tuned' else None, 'latency': stats(latency),
+    loop_work.flush(force=True)
+    dispatch = loop_work.samples(time.perf_counter())[-1].get('curl_dispatch', {})
+    return {'dispatch': dispatch, 'mode': mode, 'requests': count, 'tls': bool(context),
+            'watchdog_grace_secs': 1.0 if mode == 'tuned' or baseline else None, 'latency': stats(latency),
             'loop_lag': stats(lag), 'wall_ms': round((time.perf_counter()-start)*1000, 3),
             'cpu_ms': round((time.process_time()-cpu)*1000, 3), 'connections_peak': peak,
             'callbacks': callbacks, 'account_isolation_checks': count*2}
@@ -154,11 +176,12 @@ async def trial(mode, count, context):
 
 async def main(options):
     results = []
+    baseline = load_baseline(options.baseline_ref, options.baseline_file) if options.baseline_ref or options.baseline_file else None
     with tempfile.TemporaryDirectory(prefix='image-curl-local-') as folder:
         context = None if options.http else tls_context(folder, options.cert, options.key)
         for repeat in range(options.repeats):
             for mode in (('legacy', 'tuned') if repeat % 2 == 0 else ('tuned', 'legacy')):
-                result = await trial(mode, options.requests, context)
+                result = await trial(mode, options.requests, context, baseline)
                 result['repeat'] = repeat+1; results.append(result)
                 print(json.dumps(result), flush=True)
     summaries = {}
@@ -171,13 +194,15 @@ async def main(options):
             'timeout_callbacks': [r['callbacks']['timeout'] for r in items],
             'all_callbacks': [r['callbacks']['all'] for r in items]}.items()}
     output = {'scope': 'local TLS/HTTP, HTML, metadata, cookie/header isolation, 512KiB body; excludes upstream and disk',
-              'results': results, 'median': summaries}
+              'baseline_ref': options.baseline_ref, 'baseline_file': options.baseline_file, 'results': results, 'median': summaries}
     if options.output: Path(options.output).write_text(json.dumps(output, indent=2), encoding='utf8')
     print(json.dumps(summaries, indent=2))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--baseline-ref', help='Compare the account-isolated driver at a specific Git revision')
+    parser.add_argument('--baseline-file', help='Compare an exact saved workspace driver; local benchmark only')
     parser.add_argument('--requests', type=int, default=200)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--http', action='store_true')

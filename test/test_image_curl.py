@@ -69,7 +69,8 @@ def test_watchdog_ignores_idle_and_recent_callbacks_but_drains_stalled_handle():
                 _curlm = True
                 _curl2future = {1: object()} if active else {}
                 _last_action = float('inf') if fresh else 0.
-                def process_data(self, *args):
+                _pending_events = set()
+                def process_data(self, *args, **kwargs):
                     called.append(name)
                     self._last_action = time.monotonic()
                     if name == 'stalled': self._curl2future.clear()
@@ -97,7 +98,7 @@ def test_many_due_drivers_yield_and_close_without_leaking_watchdog(monkeypatch):
         for driver in drivers:
             driver._last_action = 0
             driver._curl2future = {object(): object()}
-            monkeypatch.setattr(driver, 'process_data', lambda *args: calls.append(1))
+            monkeypatch.setattr(driver, 'process_data', lambda *args, **kwargs: calls.append(1))
         async def beat():
             for _ in range(4):
                 await asyncio.sleep(.03); beats.append(len(calls))
@@ -161,10 +162,10 @@ def test_watchdog_still_delivers_timeout_when_normal_notifications_are_lost(monk
         session = ImageCurlSession(trust_env=False)
         driver = session.acurl
         original = driver.process_data
-        def lost_notification(*args):
+        def lost_notification(*args, **kwargs):
             hub = getattr(asyncio.get_running_loop(), '_image_curl_watchdog', None)
             if hub and asyncio.current_task() is hub.task:
-                return original(*args)
+                return original(*args, **kwargs)
         monkeypatch.setattr(driver, 'process_data', lost_notification)
         try:
             url = 'http://127.0.0.1:'+str(server.sockets[0].getsockname()[1])
@@ -202,7 +203,7 @@ def test_wrapper_total_timeout_does_not_wait_for_watchdog_grace(monkeypatch):
     from services.image_diagnostics import ImageDeadlineExceeded
     async def scenario():
         # 故意丢弃所有 curl 通知，验证业务总预算仍独立于 1 秒兜底周期。
-        monkeypatch.setattr(ImageAsyncCurl, 'process_data', lambda *args: None)
+        monkeypatch.setattr(ImageAsyncCurl, 'process_data', lambda *args, **kwargs: None)
         metrics = ImageMetrics(); metrics.diagnostics.configure_budget(.05)
         token = current_metrics.set(metrics)
         session = AsyncImageSession(trust_env=False)

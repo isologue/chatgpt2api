@@ -7,7 +7,12 @@ from collections import deque
 from threading import Lock
 from weakref import WeakSet
 
-_CATEGORIES = frozenset({'curl_socket', 'curl_completion', 'business_slice'})
+_CATEGORIES = frozenset({'curl_socket', 'curl_completion', 'business_slice',
+    'curl_socket_event', 'curl_timer_event', 'curl_watchdog_event'})
+_EVENTS = frozenset({'socket_events', 'timer_events', 'watchdog_events', 'coalesced_events',
+    'batches', 'yields', 'max_pending', 'max_wait_ms', 'timer_cancels',
+    'pressure_batches', 'wait_count', 'wait_total_ms', 'max_socket_wait_ms',
+    'max_timer_wait_ms', 'max_watchdog_wait_ms'})
 _recorders = WeakSet()
 _registry_lock = Lock()
 
@@ -20,6 +25,7 @@ class LoopWorkRecorder:
         self._offset = time.time() - time.perf_counter()
         self._started = time.perf_counter()
         self._work = {}
+        self._events = {}
         self._lag_ms = 0.0
         self._history = deque(maxlen=600)
         self._lock = Lock()
@@ -42,6 +48,12 @@ class LoopWorkRecorder:
             item['max_ms'] = ms
             item['max_at'] = self._offset + started
 
+    def event(self, name, value=1):
+        if name not in _EVENTS:
+            return
+        previous = self._events.get(name, 0)
+        self._events[name] = max(previous, value) if name.startswith('max_') else previous + value
+
     def flush(self, lag=0.0, *, force=False):
         now = time.perf_counter()
         self._lag_ms = max(self._lag_ms, lag * 1000)
@@ -49,8 +61,8 @@ class LoopWorkRecorder:
             return
         sample = {'at': self._offset + now, 'started_at': self._offset + self._started,
             'span_ms': (now - self._started) * 1000, 'lag_ms': self._lag_ms,
-            'work': self._work}
-        self._work, self._lag_ms, self._started = {}, 0.0, now
+            'work': self._work, 'curl_dispatch': self._events}
+        self._work, self._events, self._lag_ms, self._started = {}, {}, 0.0, now
         with self._lock:
             self._history.append((now, sample))
 
@@ -76,8 +88,11 @@ def snapshot():
     for sample in samples:
         # 以完成时刻分桶。跨桶的长工作仍保留实际开始时刻和单次最大值。
         key = int(sample['at'] // 5) * 5
-        bucket = buckets.setdefault(key, {'at': key, 'lag_ms': 0.0, 'work': {}})
+        bucket = buckets.setdefault(key, {'at': key, 'lag_ms': 0.0, 'work': {}, 'curl_dispatch': {}})
         bucket['lag_ms'] = max(bucket['lag_ms'], sample['lag_ms'])
+        for name, value in sample['curl_dispatch'].items():
+            old = bucket['curl_dispatch'].get(name, 0)
+            bucket['curl_dispatch'][name] = max(old, value) if name.startswith('max_') else old + value
         for name, value in sample['work'].items():
             item = bucket['work'].setdefault(name, {'count': 0, 'total_ms': 0.0,
                 'cpu_ms': 0.0, 'max_ms': 0.0, 'max_at': 0.0})
@@ -88,6 +103,9 @@ def snapshot():
     timeline = [buckets[key] for key in sorted(buckets)]
     for bucket in timeline:
         bucket['lag_ms'] = round(bucket['lag_ms'], 3)
+        for key in bucket['curl_dispatch']:
+            if key.endswith('_ms'):
+                bucket['curl_dispatch'][key] = round(bucket['curl_dispatch'][key], 3)
         for item in bucket['work'].values():
             for field in ('total_ms', 'cpu_ms', 'max_ms'):
                 item[field] = round(item[field], 3)

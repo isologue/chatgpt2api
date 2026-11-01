@@ -176,6 +176,9 @@ class ImageDiagnostics:
             if error is not None:
                 # 不保存 str(error)：原始异常可能包含代理认证信息或带签名 URL。
                 step['error_type'] = type(error).__name__
+                code = getattr(error, 'code', None)
+                if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
+                    step['curl_error_code'] = int(code)
 
     def event(self, action: str, reason: str) -> None:
         """调用方仅传固定枚举，不传原始异常或用户输入。"""
@@ -194,12 +197,18 @@ class ImageDiagnostics:
                    if key in ('image_index', 'attempt') and isinstance(value, int)},
             })
 
-    def transport_summary(self, values: dict) -> None:
+    def transport_summary(self, values: dict, *, phase: str = 'sse_transport') -> None:
         """传输摘要只接受固定数值和结束类型，不记录地址、正文或认证信息。"""
+        if phase not in {'sse_transport', 'image_download_transport'}:
+            return
         now = time.perf_counter()
         fields = {key: round(float(values[key]), 3) for key in (
             'headers_ms', 'first_chunk_ms', 'last_chunk_ms', 'max_gap_ms',
-            'idle_after_last_ms', 'bytes', 'chunks') if key in values}
+            'idle_after_last_ms', 'bytes', 'chunks', 'body_ms', 'bytes_per_sec',
+            'expected_bytes', 'dispatch_count', 'dispatch_wait_ms', 'dispatch_max_wait_ms') if key in values}
+        code = values.get('curl_error_code')
+        if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
+            fields['curl_error_code'] = int(code)
         fields['first_chunk_received'] = bool(values.get('first_chunk_received'))
         ending = values.get('termination')
         fields['termination'] = ending if ending in {'eof', 'closed', 'error', 'body_limit'} else 'error'
@@ -208,7 +217,7 @@ class ImageDiagnostics:
             if len(self._steps) == self.MAX_STEPS:
                 self._dropped += 1
             self._steps.append({
-                'id': self._sequence, 'phase': 'sse_transport', 'status': 'recorded',
+                'id': self._sequence, 'phase': phase, 'status': 'recorded',
                 'offset_ms': round((now - self.started) * 1000, 3),
                 'started_at': self.started_at + now - self.started,
                 'duration_ms': 0, 'transport': fields,
