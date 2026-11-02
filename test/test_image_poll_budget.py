@@ -395,3 +395,42 @@ def test_result_just_before_deadline_is_still_found(clock, planned_backend):
     assert backend._poll_image_results("fixture", 10) == (["fixture"], [])
     assert len(state.queries) == 4
     assert clock.now < 1010
+
+
+
+def test_stream_recovery_preserves_poll_and_native_transport_timeouts(clock, monkeypatch):
+    metrics = ImageMetrics()
+    metrics.diagnostics.configure_budget(120)
+    token = current_metrics.set(metrics)
+    observed = []
+    def request(self, method, url, **kwargs):
+        observed.append((kwargs["timeout"], self.curl_options[CurlOpt.TIMEOUT_MS]))
+        return SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("curl_cffi.requests.Session.request", request)
+    try:
+        metrics.diagnostics._deadline = metrics.started - 1
+        monkeypatch.setattr(metrics.diagnostics.cancelled, "wait",
+                            lambda seconds: setattr(clock, "now", clock.now + seconds))
+        diag.allow_stream_timeout_recovery()
+        assert diag.remaining_image_budget() is None
+        assert diag.remaining_image_budget(80) == 80
+        with ImageBackendSession(trust_env=False) as session:
+            with pytest.raises(diag.ImagePollTimeoutError):
+                with diag.image_poll_budget(10):
+                    diag.wait_with_image_budget(7)
+                    session.get("http://fixture/conversation", timeout=60)
+                    diag.wait_with_image_budget(4)
+        assert observed == [(3, 3000)]
+        assert diag.remaining_poll_budget() is None
+        assert diag.remaining_image_budget() is None
+        with ImageBackendSession(trust_env=False) as session:
+            session.get("http://fixture/generate", stream=True, timeout=120, image_stream_timeout=80)
+        assert observed[-1] == (80, 80000)
+        # 豁免只属于该请求，不能解除另一个请求的总预算。
+        other = ImageMetrics()
+        other.diagnostics.configure_budget(1)
+        other.diagnostics._deadline = other.started - 1
+        with pytest.raises(diag.ImageDeadlineExceeded):
+            other.diagnostics.remaining()
+    finally:
+        current_metrics.reset(token)

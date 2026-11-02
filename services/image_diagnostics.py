@@ -104,6 +104,7 @@ class ImageDiagnostics:
         self._sequence = 0
         self._dropped = 0
         self._deadline: float | None = None
+        self._stream_timeout_recovery = False
         self.cancelled = Event()
         self._disconnected_at: float | None = None
         self._workers = 0
@@ -114,11 +115,21 @@ class ImageDiagnostics:
         with self._lock:
             self._deadline = min(self._deadline, deadline) if self._deadline is not None else deadline
 
+    def allow_stream_timeout_recovery(self) -> None:
+        """实际发生生成流硬超时后，恢复链路只受阶段时限、重试次数和取消约束。"""
+        if self.cancelled.is_set():
+            raise ImageRequestCancelled('image request cancelled: caller disconnected')
+        with self._lock:
+            if self._stream_timeout_recovery:
+                return
+            self._stream_timeout_recovery = True
+        self.event('ignore_total_budget', 'sse_hard_timeout')
+
     def remaining(self, cap: float | None = None) -> float | None:
         if self.cancelled.is_set():
             raise ImageRequestCancelled('image request cancelled: caller disconnected')
         with self._lock:
-            deadline = self._deadline
+            deadline = None if self._stream_timeout_recovery else self._deadline
         remaining = deadline - time.perf_counter() if deadline is not None else None
         if remaining is not None and remaining <= 0:
             raise ImageDeadlineExceeded('image request total time budget exceeded')
@@ -274,6 +285,7 @@ class ImageDiagnostics:
             disconnected_at = self._disconnected_at
             workers = self._workers
             deadline = self._deadline
+            stream_timeout_recovery = self._stream_timeout_recovery
         for step in steps:
             if step['status'] == 'running':
                 step['duration_ms'] = round(max(0.0, (now - self.started) * 1000 - step['offset_ms']), 3)
@@ -281,6 +293,7 @@ class ImageDiagnostics:
             'version': 1, 'started_at': self.started_at,
             'elapsed_ms': round(max(0.0, now - self.started) * 1000, 3),
             'budget_ms': round((deadline - self.started) * 1000, 3) if deadline is not None else None,
+            'total_budget_exempt_reason': 'sse_hard_timeout' if stream_timeout_recovery else None,
             'steps': steps, 'dropped_steps': dropped,
             'performance': performance, 'slow_slices': slow_slices,
             'caller_disconnected': disconnected_at is not None,
@@ -295,6 +308,13 @@ detached_budget: ContextVar[bool] = ContextVar('image_detached_budget', default=
 
 class ImageDownloadError(RuntimeError):
     """同一生成结果的下载重试已耗尽，由调用层按共享账号预算决定是否切号。"""
+
+
+def allow_stream_timeout_recovery() -> None:
+    from services.image_metrics import current_metrics
+    metrics = current_metrics.get()
+    if metrics is not None:
+        metrics.diagnostics.allow_stream_timeout_recovery()
 
 
 def remaining_image_budget(cap: float | None = None) -> float | None:

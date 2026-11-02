@@ -293,7 +293,7 @@ export function ConfigCard() {
                   placeholder="4"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                 />
-                <p className="text-xs leading-5 text-stone-500">图片结果补查超时或失败后，最多切换多少次账号重新生成；0 表示不切号。仍受账号尝试上限和请求总预算约束。</p>
+                <p className="text-xs leading-5 text-stone-500">生成流硬超时、图片结果补查超时或失败后，最多切换多少次账号重新生成；0 表示不切号。仍受账号尝试上限限制；发生生成流硬超时后，恢复链路不再受请求总预算限制。</p>
               </div>
               <div className="space-y-2">
                 <label className="text-sm text-stone-700">未生成图片切号次数</label>
@@ -410,7 +410,7 @@ export function ConfigCard() {
               inputMode="numeric"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">从提交上游生成请求计时，包含等待响应头和接收生成流；超时关闭连接并返回结果未确定，不自动切号。与结果补查分别计时，仍受请求总预算限制。</p>
+            <p className="text-xs text-stone-500">从提交上游生成请求计时，包含等待响应头和接收生成流；硬超时后先补查原结果，未恢复则按「补查失败切号次数」换号。发生硬超时后，恢复链路不受请求总预算限制，每轮生成仍使用此时限。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片结果补查超时（秒）</label>
@@ -420,7 +420,7 @@ export function ConfigCard() {
               placeholder="10"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">从生成流结束后开始计时，任务检查、结果查询、等待和补查重试共用此上限；不会自动延长到 300 秒。获取下载地址后结束计时，图片下载单独计时。补查失败按「补查失败切号次数」重新选号生成，仍受请求总预算限制。</p>
+            <p className="text-xs text-stone-500">从生成流结束后开始计时，任务检查、结果查询、等待和补查重试共用此上限；不会自动延长到 300 秒。获取下载地址后结束计时，图片下载单独计时。补查失败按「补查失败切号次数」重新选号生成；普通补查失败受请求总预算限制，生成流硬超时后的恢复链路除外。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片下载并发</label>
@@ -430,7 +430,7 @@ export function ConfigCard() {
               onChange={(event) => setImageDownloadConcurrency(event.target.value)}
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">仅控制生成后的图片下载，默认 64，可按带宽调高，不限制同时生成数量。等待下载名额计入请求总预算，取得名额后开始单次下载计时。</p>
+            <p className="text-xs text-stone-500">仅控制生成后的图片下载，默认 64，可按带宽调高，不限制同时生成数量。普通请求等待下载名额计入请求总预算，生成流硬超时后的恢复请求除外；取得名额后开始单次下载计时。</p>
           </div>
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
@@ -441,7 +441,7 @@ export function ConfigCard() {
                 inputMode="numeric"
                 className="h-10 rounded-xl border-stone-200 bg-white"
               />
-              <p className="text-xs text-stone-500">包含排队、校验、切号、生成、轮询和下载；切号不会重新计时。</p>
+              <p className="text-xs text-stone-500">包含排队、校验、切号、生成、轮询和下载；普通切号不会重新计时。实际发生生成流硬超时后，该请求后续恢复豁免此预算，仍受每阶段超时、切号次数和调用方取消限制。</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">单次图片下载超时（秒）</label>

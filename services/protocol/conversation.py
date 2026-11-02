@@ -21,6 +21,7 @@ from services.thread_pool import image_cleanup_executor, image_part_executor
 from contextvars import copy_context
 from services.image_diagnostics import (
     ImageDeadlineExceeded,
+    allow_stream_timeout_recovery,
     image_poll_budget,
     poll_pause,
     ImageDownloadError,
@@ -999,6 +1000,8 @@ def stream_image_outputs(
                         conversation_id=str(event.get("conversation_id") or ""),
                     )
     except ImageStreamHardTimeoutError as exc:
+        # 补查原图前即豁免总预算，避免补查和后续换号被原截止时间打断。
+        allow_stream_timeout_recovery()
         conversation_id = str(last.get("conversation_id") or "")
         if not conversation_id:
             raise
@@ -1444,6 +1447,7 @@ def _generate_single_image_impl(
     budget = budget or ImageAttemptBudget(config.image_account_selection_max_attempts)
     pending_download_error: ImageGenerationError | None = None
     pending_poll_error: ImageGenerationError | None = None
+    pending_text_error: ImageGenerationError | None = None
     download_account_switch_count = 0
 
     while True:
@@ -1462,14 +1466,15 @@ def _generate_single_image_impl(
         except (ImageDeadlineExceeded, ImageRequestCancelled):
             raise
         except RuntimeError as exc:
-            # 重试时无其他可用账号，保留上一次下载/补查失败的真实类型。
-            pending_error = pending_download_error or pending_poll_error
+            # 重试时无其他可用账号，保留上一次下载/补查/未出图的真实类型。
+            pending_error = pending_download_error or pending_poll_error or pending_text_error
             if pending_error is not None:
                 raise pending_error from exc
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         pending_download_error = None
         pending_poll_error = None
+        pending_text_error = None
         result_recorded = False
         attempt_started_at = time.time()
         def record_result(success, outcome="neutral"):
@@ -1589,6 +1594,7 @@ def _generate_single_image_impl(
                 continue
             raise pending_download_error from exc
         except ImageStreamHardTimeoutError as exc:
+            allow_stream_timeout_recovery()
             release_without_result = True
             record_image_decision("generation_result_uncertain", "sse_hard_timeout")
             pending_poll_error = ImageGenerationError(
@@ -1597,11 +1603,9 @@ def _generate_single_image_impl(
                 account_email=account_email,
                 conversation_id=getattr(exc, "conversation_id", "") or last_conversation_id,
             )
-            # 没有对话ID可补查时，也只能在共享次数与总预算内恢复；
-            # 尾部不足一次最短生成窗口时不再提交新生成请求。
-            remaining = remaining_image_budget()
-            enough_time = remaining is None or remaining >= min(20.0, float(config.image_sse_timeout_secs))
-            if (not returned_result and enough_time
+            # 流硬超时恢复不再要求总预算剩余至少 20 秒；取消和次数上限仍有效。
+            remaining_image_budget()
+            if (not returned_result
                     and poll_failure_retry_count < config.image_poll_timeout_account_switch_retries
                     and len(budget.identities) < budget.limit):
                 poll_failure_retry_count += 1
@@ -1630,7 +1634,8 @@ def _generate_single_image_impl(
             enough_time = remaining is None or remaining >= min(20.0, float(config.image_sse_timeout_secs))
             if (not returned_result and enough_time and poll_failure_retry_count < max_switches
                     and len(budget.identities) < budget.limit):
-                # 整个请求预算不会重置；本次 finally 会关闭连接并释放账号槽位。
+                # 普通补查失败仍受总预算限制；流硬超时恢复已豁免总预算。
+                # 本次 finally 会关闭连接并释放账号槽位。
                 remaining_image_budget()
                 poll_failure_retry_count += 1
                 if tracker:
@@ -1670,10 +1675,14 @@ def _generate_single_image_impl(
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
-            # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            # 未出图以明确错误码为准；进度消息不算图片结果，安全审核拒绝不切号。
+            no_image = exc.code == "no_image_generated"
+            if (exc.code != "content_policy_violation" and not returned_result
+                    and (no_image or is_model_text_reply_instead_of_image(error_text))):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= max_text_reply_account_switch_retries:
+                    remaining_image_budget()
+                    pending_text_error = exc
                     if tracker:
                         tracker.mark_switch(index, "上游未生成图片后切换账号")
                     logger.warning({
@@ -1692,6 +1701,8 @@ def _generate_single_image_impl(
                     "retry_count": text_reply_retry_count,
                     "index": index,
                 })
+                if no_image:
+                    raise
                 raise ImageGenerationError(
                     "Image generation failed: the upstream model returned a text description "
                     "instead of generating an image. Please try again later.",

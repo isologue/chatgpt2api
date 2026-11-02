@@ -24,6 +24,7 @@ const actionLabels: Record<string, string> = {
   recover_original_result: "补查原对话图片", result_poll_failed: "图片结果补查失败",
   result_download_failed: "图片下载失败", account_switch: "切换账号",
   generation_result_uncertain: "生成结果尚未确定",
+  ignore_total_budget: "生成流超时后豁免请求总预算",
 };
 const reasonLabels: Record<string, string> = {
   retry_same_result_exhausted: "同一图片下载重试已用尽", image_download_failed: "图片下载失败",

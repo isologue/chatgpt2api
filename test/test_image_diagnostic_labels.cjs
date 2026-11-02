@@ -20,6 +20,7 @@ assert.equal(status({ phase: 'sse_stream', status: 'failed', error_type: 'Timeou
 assert.equal(status({ status: 'running' }), '进行中');
 assert.equal(reason({ action: 'generation_result_uncertain', reason: 'result_poll_timeout' }), '生成结果尚未确定 / 图片结果补查超时');
 assert.equal(reason({ error_type: 'ImageDeadlineExceeded' }), '图片请求总预算耗尽');
+assert.equal(reason({ action: 'ignore_total_budget', reason: 'sse_hard_timeout' }), '生成流超时后豁免请求总预算 / 上游生成流读取超时');
 assert.equal(reason({ error_type: 'UnmappedError' }), '其他异常');
 console.log('Chinese labels cover every diagnostic phase, historical GeneratorExit, and timeout decisions.');
 assert.equal(reason({ action: 'result_poll_failed', reason: 'result_resolve_failed' }), '图片结果补查失败 / 图片结果补查或解析失败');

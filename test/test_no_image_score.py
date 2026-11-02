@@ -9,6 +9,8 @@ from test.test_image_download_account_switch import scenario
 @pytest.mark.parametrize("policy", [False, True])
 @pytest.mark.parametrize("as_error", [False, True])
 def test_no_image_deducts_score_but_policy_never_does(scenario, monkeypatch, policy, as_error):
+    # 本测试只验证单次尝试的记分，切号行为由独立回归覆盖。
+    monkeypatch.setitem(flow.config.data, "image_text_reply_account_switch_retries", 0)
     backend = Mock()
     monkeypatch.setattr(flow, "OpenAIBackendAPI", lambda **kwargs: backend)
     text = "content_policy_violation: blocked by safety policy" if policy else "I cannot generate an image right now."

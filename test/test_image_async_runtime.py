@@ -686,3 +686,39 @@ def test_queued_async_task_detaches_creator_and_records_expired_terminal(scenari
                 await asyncio.to_thread(service.close)
                 await drain(executor)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", ["/silent", "/headers"])
+def test_recovery_past_total_deadline_keeps_native_stream_timeout(path):
+    from services.image_diagnostics import ImageStreamHardTimeoutError, allow_stream_timeout_recovery
+    async def scenario():
+        executor = BoundedImageExecutor(1, 0)
+        metrics = ImageMetrics()
+        metrics.diagnostics.configure_budget(3)
+        context = current_metrics.set(metrics)
+        async with http_server() as (url, _, __):
+            def work():
+                for attempt in range(2):
+                    backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+                    backend.session = ImageBackendSession(trust_env=False)
+                    try:
+                        with pytest.raises(ImageStreamHardTimeoutError):
+                            response = backend.session.get(url + path, stream=True, image_stream_timeout=.1)
+                            list(backend._iter_sse_payloads_capped(response, .1))
+                        allow_stream_timeout_recovery()
+                        metrics.diagnostics._deadline = metrics.started - 1
+                    finally:
+                        backend.close()
+                session = ImageBackendSession(trust_env=False)
+                try:
+                    return session.get(url + "/hold", timeout=1).status_code
+                finally:
+                    session.close()
+            try:
+                assert await asyncio.wrap_future(submit(executor, work)) == 200
+                assert metrics.diagnostics.remaining() is None
+                assert not executor.stats()["inflight"]
+            finally:
+                current_metrics.reset(context)
+                await drain(executor)
+    asyncio.run(scenario())

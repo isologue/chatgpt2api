@@ -1,4 +1,4 @@
-"""Result polling failures switch accounts within both configured retry and total budgets."""
+"""Ordinary polling obeys total budgets; stream hard-timeout recovery obeys retry limits."""
 import time
 from unittest.mock import Mock
 
@@ -121,12 +121,11 @@ def test_sse_hard_timeout_uses_shared_poll_switch_budget(scenario, monkeypatch):
     assert caught.value.switch_count == 2
     assert not scenario.service._image_inflight
 
-@pytest.mark.parametrize('error_type', [flow.ImageStreamHardTimeoutError, flow.ImagePollTimeoutError])
-def test_too_little_total_budget_does_not_start_another_generation(scenario, monkeypatch, error_type):
+def test_too_little_total_budget_does_not_start_another_generation(scenario, monkeypatch):
     def nearing_deadline():
         scenario.metrics.diagnostics._deadline = time.perf_counter() + 2
     backends = install_poll_flow(monkeypatch, failures=10,
-        error_type=(lambda *args: error_type('timeout')), before_failure=nearing_deadline)
+        error_type=(lambda *args: flow.ImagePollTimeoutError('timeout')), before_failure=nearing_deadline)
     with pytest.raises(flow.ImageGenerationError) as caught:
         flow._generate_single_image(request(), 1, 1)
     assert caught.value.code == 'image_result_uncertain'
@@ -140,8 +139,10 @@ def test_hard_timeout_recovers_original_conversation_without_regeneration(scenar
     def events(*args, **kwargs):
         yield {'type': 'conversation.event', 'conversation_id': 'original-conversation',
                'text': 'generating', 'raw': {}}
+        scenario.metrics.diagnostics._deadline = time.perf_counter() - 1
         raise flow.ImageStreamHardTimeoutError('hard timeout')
     def resolve(backend, req, last):
+        assert flow.remaining_image_budget() == pytest.approx(config.image_poll_timeout_secs, abs=.1)
         calls.append(last)
         return ['http://sandbox/image'], '', last['conversation_id']
     monkeypatch.setattr(flow, 'conversation_events', events)
@@ -167,3 +168,67 @@ def test_hard_timeout_recovery_keeps_safety_refusal(scenario, monkeypatch):
     outputs = list(flow.stream_image_outputs(SimpleNamespace(), request()))
     assert outputs[-1].kind == 'message'
     assert 'content policy' in outputs[-1].text
+
+
+@pytest.mark.parametrize("seconds_left", [2, -1])
+@pytest.mark.parametrize("retry_limit", [0, 1, 2])
+def test_hard_timeout_ignores_total_budget_but_honors_switch_limits(
+        scenario, monkeypatch, seconds_left, retry_limit):
+    monkeypatch.setitem(config.data, "image_poll_timeout_account_switch_retries", retry_limit)
+    def expire():
+        scenario.metrics.diagnostics._deadline = time.perf_counter() + seconds_left
+    backends = install_poll_flow(monkeypatch, failures=10,
+        error_type=lambda *a: flow.ImageStreamHardTimeoutError("hard timeout"), before_failure=expire)
+    with pytest.raises(flow.ImageGenerationError) as caught:
+        flow._generate_single_image(request(), 1, 1)
+    assert caught.value.code == "image_result_uncertain"
+    assert len(backends) == retry_limit + 1
+    assert caught.value.switch_count == retry_limit
+    assert not scenario.service._image_inflight
+    assert all(b.close.call_count == 1 for b in backends)
+    diagnostic = scenario.metrics.diagnostics.snapshot()
+    assert diagnostic["total_budget_exempt_reason"] == "sse_hard_timeout"
+    assert sum(s.get("action") == "ignore_total_budget" for s in diagnostic["steps"]) == 1
+
+
+def test_hard_timeout_recovery_survives_following_poll_failure(scenario, monkeypatch):
+    errors = iter([flow.ImageStreamHardTimeoutError("hard timeout"), flow.ImagePollTimeoutError("poll timeout")])
+    def expire():
+        scenario.metrics.diagnostics._deadline = time.perf_counter() - 1
+    backends = install_poll_flow(monkeypatch, failures=2,
+        error_type=lambda *a: next(errors), before_failure=expire)
+    outputs = flow._generate_single_image(request(), 1, 1)
+    assert outputs[-1].data == [{"url": "local"}]
+    assert len(backends) == 3
+    assert not scenario.service._image_inflight
+    assert all(b.close.call_count == 1 for b in backends)
+
+
+def test_hard_timeout_recovery_still_honors_account_attempt_limit(scenario, monkeypatch):
+    monkeypatch.setitem(config.data, "image_poll_timeout_account_switch_retries", 10)
+    monkeypatch.setitem(config.data, "image_account_selection_max_attempts", 2)
+    backends = install_poll_flow(monkeypatch, failures=10,
+        error_type=lambda *a: flow.ImageStreamHardTimeoutError("hard timeout"))
+    with pytest.raises(flow.ImageGenerationError) as caught:
+        flow._generate_single_image(request(), 1, 1)
+    assert caught.value.code == "image_result_uncertain"
+    assert len(backends) == 2
+    assert not scenario.service._image_inflight
+
+
+def test_cancel_during_hard_timeout_recovery_stops_switching(scenario, monkeypatch):
+    calls = []
+    def expire_or_cancel():
+        calls.append(1)
+        scenario.metrics.diagnostics._deadline = time.perf_counter() - 1
+        if len(calls) == 2:
+            scenario.metrics.diagnostics.disconnect()
+    backends = install_poll_flow(monkeypatch, failures=10,
+        error_type=lambda *a: flow.ImageStreamHardTimeoutError("hard timeout"),
+        before_failure=expire_or_cancel)
+    with pytest.raises(flow.ImageGenerationError) as caught:
+        flow._generate_single_image(request(), 1, 1)
+    assert caught.value.code == "client_disconnected"
+    assert len(backends) == 2
+    assert not scenario.service._image_inflight
+    assert all(b.close.call_count == 1 for b in backends)
