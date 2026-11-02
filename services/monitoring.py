@@ -22,6 +22,42 @@ def _read_proc_stat() -> tuple[int, int] | None:
 
 _cpu_state: tuple[float, int, int] | None = None
 _cpu_lock = threading.Lock()
+_network_state = None
+_network_lock = threading.Lock()
+
+
+def _network_totals():
+    totals = dict.fromkeys(('received_bytes', 'sent_bytes', 'receive_errors',
+        'send_errors', 'receive_drops', 'send_drops'), 0)
+    for line in Path('/proc/net/dev').read_text(encoding='ascii').splitlines()[2:]:
+        name, raw = line.split(':', 1)
+        if name.strip() == 'lo':
+            continue
+        fields = raw.split()
+        for key, index in (('received_bytes', 0), ('sent_bytes', 8),
+                ('receive_errors', 2), ('send_errors', 10),
+                ('receive_drops', 3), ('send_drops', 11)):
+            totals[key] += int(fields[index])
+    return totals
+
+
+def _network():
+    global _network_state
+    try:
+        current = _network_totals()
+    except (OSError, IndexError, ValueError):
+        return {'available': False}
+    with _network_lock:
+        now = time.monotonic()
+        previous = _network_state
+        _network_state = (now, current)
+    span = now - previous[0] if previous is not None else 0
+    def rate(key):
+        return (round(max(0, current[key] - previous[1][key]) / span, 3)
+            if span > 0 else None)
+    return {**current, 'available': True, 'scope': 'process_network_namespace',
+        'sample_seconds': round(span, 3), 'received_bytes_per_sec': rate('received_bytes'),
+        'sent_bytes_per_sec': rate('sent_bytes')}
 
 
 def _cpu_percent() -> float | None:
@@ -78,6 +114,7 @@ def snapshot(account_stats: dict[str, Any], image_stats: dict[str, Any]) -> dict
         "images": image_stats,
         "system": {
             "cpu_percent": _cpu_percent(),
+            "network": _network(),
             "memory": _memory(),
             "disk": {
                 "used_bytes": disk.total - disk.free,

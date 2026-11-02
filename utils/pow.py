@@ -30,6 +30,24 @@ class ScriptSrcParser(HTMLParser):
         self.script_sources: list[str] = []
         self.data_build = ""
 
+    # 只收集 script 属性。普通元素仍由标准库判定完整标签边界，
+    # 但不构造和解码它们的属性列表；保留 script/原始文本元素的原解析路径。
+    # 标签名称规则与 HTMLParser 一致，不用正文正则提取 script，避免命中注释/JS。
+    _tag_name = re.compile(r"<([a-zA-Z][^\t\n\r\f />\x00]*)")
+
+    def parse_starttag(self, i: int) -> int:
+        match = self._tag_name.match(self.rawdata, i)
+        if match:
+            tag = match.group(1).lower()
+            if (tag not in {"script", "plaintext", "noscript"}
+                    and tag not in self.CDATA_CONTENT_ELEMENTS
+                    and tag not in getattr(self, "RCDATA_CONTENT_ELEMENTS", ())):
+                end = self.check_for_whole_start_tag(i)
+                if end >= 0:
+                    self.lasttag = tag
+                return end
+        return super().parse_starttag(i)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag != "script":
             return

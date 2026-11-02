@@ -189,6 +189,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     monitoring_refresh_interval_secs: Number(config.monitoring_refresh_interval_secs || 3),
     image_retention_days: Number(config.image_retention_days || 30),
     image_total_timeout_secs: Number(config.image_total_timeout_secs || 240),
+    image_download_concurrency: Number(config.image_download_concurrency || 64),
     image_download_timeout_secs: Number(config.image_download_timeout_secs || 30),
     image_download_retries: Number(config.image_download_retries ?? 1),
     image_sse_timeout_secs: Number(config.image_sse_timeout_secs || 80),
@@ -328,6 +329,7 @@ type SettingsStore = {
   setImageSseTimeoutSecs: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
   setImageTotalTimeoutSecs: (value: string) => void;
+  setImageDownloadConcurrency: (value: string) => void;
   setImageDownloadTimeoutSecs: (value: string) => void;
   setImageDownloadRetries: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
@@ -470,6 +472,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         monitoring_refresh_interval_secs: Math.min(60, Math.max(1, Number(config.monitoring_refresh_interval_secs) || 3)),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_total_timeout_secs: Math.max(1, Number(config.image_total_timeout_secs) || 240),
+        image_download_concurrency: Math.max(1, Number(config.image_download_concurrency) || 64),
         image_download_timeout_secs: Math.max(1, Number(config.image_download_timeout_secs) || 30),
         image_download_retries: Math.max(0, Number(config.image_download_retries) || 0),
         image_sse_timeout_secs: Math.max(1, Number(config.image_sse_timeout_secs) || 80),
@@ -630,6 +633,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageTotalTimeoutSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_total_timeout_secs: value } } : {});
+  },
+
+  setImageDownloadConcurrency: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_download_concurrency: value } } : {});
   },
 
   setImageDownloadTimeoutSecs: (value) => {

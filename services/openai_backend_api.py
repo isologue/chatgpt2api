@@ -2635,12 +2635,15 @@ class OpenAIBackendAPI:
                         metrics.add("image_download_ttfb", ttfb)
                     chunks = []
                     with phase("image_download_body"):
-                        # curl_cffi 的流式响应不会自动填充 content，必须消费完整响应流。
-                        # 只合并已到达的块，减少跨 greenlet 切换，不等待凑满。
-                        for chunk in response.iter_content(chunk_size=256 * 1024):
-                            remaining_image_budget()
-                            if chunk:
-                                chunks.append(chunk)
+                        from services.image_async_transport import AsyncImageResponse
+                        if isinstance(response, AsyncImageResponse):
+                            chunks = response.read_image_chunks()
+                        else:
+                            # 同步传输仍需消费完整响应流，不能直接取空的 content。
+                            for chunk in response.iter_content(chunk_size=256 * 1024):
+                                remaining_image_budget()
+                                if chunk:
+                                    chunks.append(chunk)
                     content = self._join_and_validate_image(chunks)
                     if metrics is not None:
                         metrics.add_count("image_download_count")
@@ -2661,6 +2664,10 @@ class OpenAIBackendAPI:
                         # 保留底层原因便于诊断和单元测试确认失败发生在哪一步。
                         raise ImageDownloadError(f"image download failed: {exc}") from exc
                     try:
+                        # 失败传输先关闭并交还下载名额，退避期间不占用网络容量。
+                        if response is not None:
+                            response.close()
+                            response = None
                         if metrics is not None:
                             metrics.add_count("image_download_retries")
                         wait_with_image_budget(min(0.5 * (attempt + 1), 2.0))

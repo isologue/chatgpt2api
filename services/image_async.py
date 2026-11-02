@@ -150,6 +150,15 @@ class ImageAsyncRuntime:
         asyncio.set_event_loop(self.loop)
         self._condition = asyncio.Condition()
         self._tasks = {}
+        # 只在生产协作运行时启用；同步兼容路径和独立传输测试保持原行为。
+        import os
+        from services.image_download_pool import DownloadProcessPool
+        try:
+            count = max(0, int(os.environ.get('CHATGPT2API_IMAGE_DOWNLOAD_PROCESSES', '4')))
+        except ValueError:
+            count = 4
+        pool = self.loop._image_download_pool = DownloadProcessPool(count) if count > 0 else None
+        warmup = self.loop.create_task(pool.warm()) if pool is not None else None
         self._watch = self.loop.create_task(self._watch_requests())
         self._ready.set()
         try:
@@ -157,6 +166,10 @@ class ImageAsyncRuntime:
         finally:
             self._watch.cancel()
             self.loop.run_until_complete(asyncio.gather(self._watch, return_exceptions=True))
+            if pool is not None:
+                if warmup is not None:
+                    self.loop.run_until_complete(warmup)
+                self.loop.run_until_complete(pool.close())
             self.loop.run_until_complete(self.loop.shutdown_asyncgens())
             work = getattr(self.loop, '_image_loop_work', None)
             if work is not None:

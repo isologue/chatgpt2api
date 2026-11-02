@@ -8,6 +8,7 @@ import time
 from curl_cffi import CurlInfo, CurlOpt
 from curl_cffi.requests.models import loads as load_json
 from services.image_curl import ImageCurlSession as AsyncSession
+from services.image_ca import image_ca_options
 
 from services.image_async import await_io, cooperative, run_blocking
 from services.image_diagnostics import remaining_image_budget
@@ -28,13 +29,19 @@ LINE_YIELD_COUNT = 64
 
 
 class AsyncImageResponse:
-    def __init__(self, owner, response, started, stream_deadline, cap, is_sse, dispatch_wait=None):
+    def __init__(self, owner, response, started, stream_deadline, cap, is_sse, dispatch_wait=None, download_lease=None):
         self.owner = owner
         self.response = response
         self.started = started
         self.headers_at = time.perf_counter()
         self.stage = current_stage.get()
+        from services.image_loop_work import get_loop_work
+        self._download_work = (get_loop_work()
+            if self.stage in {'image_download', 'image_download_http'} else None)
+        self._diagnostic_driver = getattr(getattr(owner, 'session', None), '_acurl', None)
+        self._read_stage = self.stage
         self._dispatch_wait = dispatch_wait
+        self._download_lease = download_lease
         self._image_stream_deadline = stream_deadline if stream_deadline is not None else float('inf')
         self.cap = cap
         self.is_sse = is_sse
@@ -43,6 +50,7 @@ class AsyncImageResponse:
         self._chunks_since_yield = 0
         self._read_quantum = time.perf_counter()
         self.first_at = self.last_at = None
+        self.read_ended_at = None
         self.max_gap = 0.0
         self.ended = 'closed'
         self._closed = False
@@ -58,8 +66,11 @@ class AsyncImageResponse:
             return load_json(content, **kwargs)
         return await_io(run_blocking(load_json, content, **kwargs))
 
-    async def _next(self):
-        remaining = remaining_image_budget()
+    async def _next(self, *, budget_guarded=False):
+        stage = current_stage.get()
+        if self._diagnostic_driver is not None and stage != self._read_stage:
+            self._read_stage = self._diagnostic_driver._transfer_stage = stage
+        remaining = None if budget_guarded else remaining_image_budget()
         try:
             if (self._bytes_since_yield >= READ_YIELD_BYTES
                     or self._chunks_since_yield >= READ_YIELD_CHUNKS
@@ -74,22 +85,30 @@ class AsyncImageResponse:
             # 传输仍在进行时，EOF/错误标记还会 await aclose，必须保留超时保护。
             buffered = queue is not None and not queue.empty()
             settled = stream_task is None or stream_task.done()
-            if remaining is None or (buffered and settled):
+            if budget_guarded or remaining is None or (buffered and settled):
                 chunk = await anext(self._iterator)
             else:
                 async with asyncio.timeout(remaining):
                     chunk = await anext(self._iterator)
         except StopAsyncIteration:
             self.ended = 'eof'
+            self.read_ended_at = time.perf_counter()
+            # EOF 已等待底层流收尾；及时交接网络名额，后续图片校验和
+            # 工作线程排队不应占用下载容量。close 仍负责完整诊断与清理。
+            if self._download_lease is not None:
+                await self._download_lease.release()
             raise
         except BaseException as exc:
             self._curl_error_code = getattr(exc, 'code', None)
             self.ended = 'error'
+            self.read_ended_at = time.perf_counter()
             # 总预算/取消优先于网络错误与阶段超时。
             remaining_image_budget()
             raise
         now = time.perf_counter()
         if chunk:
+            if self._download_work is not None:
+                self._download_work.download_bytes(len(chunk))
             self.bytes_read += len(chunk)
             self._bytes_since_yield += len(chunk)
             self._chunks_since_yield += 1
@@ -100,17 +119,53 @@ class AsyncImageResponse:
         if self.bytes_read > self.cap:
             self.ended = 'body_limit'
             raise RuntimeError('image upstream response exceeds the body size limit')
-        remaining_image_budget()
+        if not budget_guarded:
+            remaining_image_budget()
         return chunk
 
+    def read_image_chunks(self):
+        """图片正文共用一次异步等待，块列表仍交给原有工作线程合并校验。"""
+        return await_io(self._read_image_chunks())
+
+    async def _read_image_chunks(self):
+        chunks = []
+        try:
+            # 整段正文共用总预算计时器，避免每块往返同步协议和重建计时器。
+            # _next 保留周期让出、取消检查、正文上限、诊断和 EOF 名额释放。
+            async with asyncio.timeout(remaining_image_budget()):
+                while True:
+                    try:
+                        chunk = await self._next(budget_guarded=True)
+                    except StopAsyncIteration:
+                        break
+                    if chunk:
+                        chunks.append(chunk)
+            remaining_image_budget()
+            return chunks
+        except BaseException:
+            remaining_image_budget()
+            raise
+
     async def _read_ready(self, size):
+        # 同一批已到达数据共用一个预算计时器；逐个小块建/撤计时器会放大
+        # HTTP/2 碎片正文的事件循环开销。EOF/错误清理仍包含在预算内。
+        try:
+            async with asyncio.timeout(remaining_image_budget()):
+                content = await self._read_ready_batch(size)
+            remaining_image_budget()
+            return content
+        except BaseException:
+            remaining_image_budget()
+            raise
+
+    async def _read_ready_batch(self, size):
         # 只合并已经到达的块，不为凑足 chunk_size 等待新数据；SSE 仍逐块读取。
-        chunks = [await self._next()]
+        chunks = [await self._next(budget_guarded=True)]
         length = len(chunks[0])
         queue = getattr(self.response, 'queue', None)
         while length < size and queue is not None and not queue.empty():
             try:
-                chunk = await self._next()
+                chunk = await self._next(budget_guarded=True)
             except StopAsyncIteration:
                 break
             chunks.append(chunk)
@@ -158,46 +213,66 @@ class AsyncImageResponse:
         if self._closed:
             return
         self._closed = True
-        stream_task = self.response.astream_task
-        if stream_task is not None and not stream_task.done():
-            # curl_cffi aclose() 本身只等待结束；静默连接要先撤销 handle 才能立即释放。
-            self.response.quit_now.set()
-            self.owner.session.acurl.remove_handle(self.response.curl)
-            await asyncio.gather(stream_task, return_exceptions=True)
-        self.owner.responses.discard(self)
-        ended_at = time.perf_counter()
-        if self._dispatch_wait:
-            record('curl_queue_wait', self._dispatch_wait['total_ms'] / 1000, stage=self.stage)
-            record('curl_queue_wait_max', self._dispatch_wait['max_ms'] / 1000, stage=self.stage)
-        record('http_body', ended_at - self.headers_at, stage=self.stage)
-        record('http_total', ended_at - self.started, stage=self.stage)
-        is_download = self.stage in {'image_download', 'image_download_http'}
-        if self.is_sse or is_download:
-            now = time.perf_counter()
-            metrics = current_metrics.get()
-            if metrics is not None:
-                headers = getattr(self.response, 'headers', {})
-                length = headers.get('content-length', '')
-                expected = int(length) if str(length).isdigit() and len(str(length)) < 16 else 0
-                body_secs = max(.000001, ended_at - self.headers_at)
-                if is_download:
-                    metrics.add_count('image_download_wire_bytes', self.bytes_read)
-                metrics.diagnostics.transport_summary({
-                    'headers_ms': (self.headers_at - self.started) * 1000,
-                    'first_chunk_ms': ((self.first_at or now) - self.started) * 1000,
-                    'last_chunk_ms': ((self.last_at or self.headers_at) - self.started) * 1000,
-                    'max_gap_ms': self.max_gap * 1000,
-                    'idle_after_last_ms': (now - (self.last_at or self.headers_at)) * 1000,
-                    'bytes': self.bytes_read, 'chunks': self.chunks,
-                    'first_chunk_received': self.first_at is not None,
-                    'termination': self.ended,
-                    **({'body_ms': body_secs * 1000, 'bytes_per_sec': self.bytes_read / body_secs,
-                        'expected_bytes': expected, 'curl_error_code': self._curl_error_code,
-                        'dispatch_count': (self._dispatch_wait or {}).get('count', 0),
-                        'dispatch_wait_ms': (self._dispatch_wait or {}).get('total_ms', 0),
-                        'dispatch_max_wait_ms': (self._dispatch_wait or {}).get('max_ms', 0)}
-                       if is_download else {}),
-                }, phase='image_download_transport' if is_download else 'sse_transport')
+        try:
+            stream_task = self.response.astream_task
+            if stream_task is not None and not stream_task.done():
+                # curl_cffi aclose() 本身只等待结束；静默连接要先撤销 handle 才能立即释放。
+                self.response.quit_now.set()
+                self.owner.session.acurl.remove_handle(self.response.curl)
+                await asyncio.gather(stream_task, return_exceptions=True)
+            if hasattr(self.response, 'transport_summary'):
+                await self.response.aclose()
+            self.owner.responses.discard(self)
+            ended_at = time.perf_counter()
+            if self._dispatch_wait:
+                record('curl_queue_wait', self._dispatch_wait['total_ms'] / 1000, stage=self.stage)
+                record('curl_queue_wait_max', self._dispatch_wait['max_ms'] / 1000, stage=self.stage)
+            record('http_body', ended_at - self.headers_at, stage=self.stage)
+            record('http_total', ended_at - self.started, stage=self.stage)
+            is_download = self.stage in {'image_download', 'image_download_http'}
+            if self.is_sse or is_download:
+                now = time.perf_counter()
+                metrics = current_metrics.get()
+                if metrics is not None:
+                    headers = getattr(self.response, 'headers', {})
+                    length = headers.get('content-length', '')
+                    expected = int(length) if str(length).isdigit() and len(str(length)) < 16 else 0
+                    body_secs = max(.000001, ended_at - self.headers_at)
+                    completion = self._dispatch_wait or {}
+                    wire_at = completion.get('completed_at')
+                    read_end = self.read_ended_at or ended_at
+                    transfer = ({
+                        'curl_received_bytes': completion['received_bytes'],
+                        'curl_transfer_ms': completion['transfer_ms'],
+                        'curl_first_byte_ms': completion['first_byte_ms'],
+                        'curl_completed_ms': (wire_at - self.started) * 1000,
+                        'completion_to_read_end_ms': max(0., read_end - wire_at) * 1000,
+                    } if wire_at is not None and all(key in completion for key in
+                        ('received_bytes', 'transfer_ms', 'first_byte_ms')) else {})
+                    if is_download:
+                        metrics.add_count('image_download_wire_bytes', self.bytes_read)
+                    metrics.diagnostics.transport_summary({
+                        'headers_ms': (self.headers_at - self.started) * 1000,
+                        'first_chunk_ms': ((self.first_at or now) - self.started) * 1000,
+                        'last_chunk_ms': ((self.last_at or self.headers_at) - self.started) * 1000,
+                        'max_gap_ms': self.max_gap * 1000,
+                        'idle_after_last_ms': (now - (self.last_at or self.headers_at)) * 1000,
+                        'bytes': self.bytes_read, 'chunks': self.chunks,
+                        'first_chunk_received': self.first_at is not None,
+                        'termination': self.ended,
+                        **({'body_ms': body_secs * 1000, 'bytes_per_sec': self.bytes_read / body_secs,
+                            'expected_bytes': expected, 'curl_error_code': self._curl_error_code,
+                            **transfer,
+                            'dispatch_count': (self._dispatch_wait or {}).get('count', 0),
+                            'dispatch_wait_ms': (self._dispatch_wait or {}).get('total_ms', 0),
+                            'dispatch_max_wait_ms': (self._dispatch_wait or {}).get('max_ms', 0)}
+                           if is_download else {}),
+                        **getattr(self.response, 'transport_summary', {}),
+                    }, phase='image_download_transport' if is_download else 'sse_transport')
+
+        finally:
+            if self._download_lease is not None:
+                await self._download_lease.release()
 
     def close(self):
         if self._closed:
@@ -240,6 +315,18 @@ class AsyncImageSession:
         return self.request('PATCH', url, **kwargs)
 
     async def _request(self, method, url, **kwargs):
+        lease = None
+        if kwargs.get('stream') and current_stage.get() in {'image_download', 'image_download_http'}:
+            from services.image_download_limiter import acquire_download_slot
+            lease = await acquire_download_slot()
+        try:
+            return await self._request_admitted(method, url, lease, **kwargs)
+        except BaseException:
+            if lease is not None:
+                await lease.release()
+            raise
+
+    async def _request_admitted(self, method, url, download_lease, **kwargs):
         from services.image_diagnostics import ImageStreamHardTimeoutError
         remaining_image_budget()
         if self.closed:
@@ -257,17 +344,43 @@ class AsyncImageSession:
         total = min(remaining, requested) if remaining is not None and requested else remaining or requested or 120
         total = max(0.001, total)
         kwargs['timeout'] = total
+        pool = getattr(self.loop, '_image_download_pool', None)
+        if download_lease is not None and pool is not None:
+            response = await pool.request(method, url, self, total, kwargs)
+            record('http_headers', time.perf_counter() - started)
+            for component, info in (('curl_dns', CurlInfo.NAMELOOKUP_TIME),
+                                    ('curl_connect', CurlInfo.CONNECT_TIME),
+                                    ('curl_tls', CurlInfo.APPCONNECT_TIME),
+                                    ('curl_first_byte', CurlInfo.STARTTRANSFER_TIME)):
+                value = response.infos.get(info)
+                if isinstance(value, (int, float)):
+                    record(component, value)
+            wrapped = AsyncImageResponse(self, response, started, None,
+                MAX_IMAGE_BODY, False, download_lease=download_lease)
+            self.responses.add(wrapped)
+            return wrapped
         is_stream = kwargs.get('stream', False)
         # 元数据也按流读取，未知 Content-Length 的正文同样不能无限预缓冲。
         kwargs['stream'] = True
         cap = MAX_IMAGE_BODY if is_stream and stream_cap is None else MAX_METADATA_BODY
-        self.session.curl_options = {
-            **self.session.curl_options, CurlOpt.TIMEOUT_MS: max(1, math.ceil(total * 1000)),
+        original_options = self.session.curl_options
+        request_options = dict(original_options)
+        if download_lease is not None:
+            # 批量读取已到达的正文，减少高并发时的小缓冲 recv/回调轮转。
+            # 仅作用于本次下载；保留显式选项，不影响 SSE 和账号元数据。
+            request_options.setdefault(CurlOpt.BUFFERSIZE, 256 * 1024)
+        self.session.curl_options = image_ca_options({
+            **request_options, CurlOpt.TIMEOUT_MS: max(1, math.ceil(total * 1000)),
             CurlOpt.MAXFILESIZE_LARGE: cap,
-        }
+        }, self.session.verify if kwargs.get('verify') is None else kwargs['verify'])
         # 单账号一次只执行一个 HTTP 传输；记录数值摘要，不向回调上下文放入请求信息。
         dispatch_wait = {'count': 0, 'total_ms': 0., 'max_ms': 0.}
+        if download_lease is not None:
+            dispatch_wait['download_started'] = started
         self.session.acurl._transfer_wait = dispatch_wait
+        # 回调上下文没有业务 ContextVar，显式传固定阶段枚举供归因。
+        self.session.acurl._transfer_stage = current_stage.get()
+        self.session.acurl._transfer_is_sse = stream_cap is not None
         task = asyncio.create_task(self.session.request(method, url, **kwargs))
         headers_recorded = False
         try:
@@ -284,16 +397,20 @@ class AsyncImageSession:
                 if isinstance(value, (int, float)):
                     record(component, value)
             remaining_image_budget()
-            wrapped = AsyncImageResponse(self, response, started, deadline, cap, stream_cap is not None, dispatch_wait)
+            wrapped = AsyncImageResponse(self, response, started, deadline, cap, stream_cap is not None, dispatch_wait, download_lease)
             self.responses.add(wrapped)
             if not is_stream:
                 try:
                     body = bytearray()
-                    while True:
-                        try:
-                            body.extend(await wrapped._next())
-                        except StopAsyncIteration:
-                            break
+                    # 整段元数据共用请求剩余预算，避免每个碎片重复创建计时器。
+                    # _next 仍按字节/块数/2ms 让出，并检查取消、预算及正文上限。
+                    async with asyncio.timeout(remaining_image_budget()):
+                        while True:
+                            try:
+                                body.extend(await wrapped._next(budget_guarded=True))
+                            except StopAsyncIteration:
+                                break
+                    remaining_image_budget()
                     response.content = bytes(body)
                 finally:
                     await wrapped._close()
@@ -311,6 +428,7 @@ class AsyncImageSession:
                 raise ImageStreamHardTimeoutError('图片生成请求等待响应头超过硬上限') from exc
             raise
         finally:
+            self.session.curl_options = original_options
             if not headers_recorded:
                 record('http_headers', time.perf_counter() - started)
                 record('http_total', time.perf_counter() - started)

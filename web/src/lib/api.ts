@@ -206,6 +206,7 @@ export type SettingsConfig = {
   monitoring_refresh_interval_secs?: number | string;
   image_retention_days?: number | string;
   image_total_timeout_secs?: number | string;
+  image_download_concurrency?: number | string;
   image_download_timeout_secs?: number | string;
   image_download_retries?: number | string;
   image_sse_timeout_secs?: number | string;
@@ -344,9 +345,17 @@ export type AccountRefreshSnapshot = {
   refresh: AccountRefreshCounts; keepalive: AccountRefreshCounts;
 };
 
+export type ImageDownloadRate = {
+  active: number; waiting: number; limit: number; bytes_per_sec: number;
+  total_bytes: number; sampled_at: number | null; stale: boolean; rate_scope: string;
+};
+
 export type ImageLoopWork = {
+  download?: ImageDownloadRate;
   window_secs: number; bucket_secs: number; categories: string[];
   timeline: { at: number; lag_ms: number;
+    download?: { bytes: number; span_ms: number; peak_active: number; peak_waiting: number; bytes_per_sec: number };
+    slow_callbacks?: { at: number; stage: string; phase?: string; source: string; wall_ms: number; cpu_ms: number }[];
     curl_dispatch?: Partial<Record<"socket_events" | "timer_events" | "watchdog_events" | "coalesced_events" |
       "batches" | "yields" | "max_pending" | "max_wait_ms" | "timer_cancels" | "pressure_batches" | "wait_count" | "wait_total_ms" |
       "max_socket_wait_ms" | "max_timer_wait_ms" | "max_watchdog_wait_ms", number>>;
@@ -405,6 +414,9 @@ export type MonitoringSnapshot = {
   };
   system: {
     cpu_percent: number | null;
+    network?: { available: boolean; received_bytes_per_sec?: number | null; sent_bytes_per_sec?: number | null;
+      received_bytes?: number; sent_bytes?: number; receive_errors?: number; send_errors?: number;
+      receive_drops?: number; send_drops?: number; sample_seconds?: number; scope?: string };
     memory: { used_bytes: number; total_bytes: number; percent: number };
     disk: { used_bytes: number; total_bytes: number; free_bytes: number; percent: number };
     load_average: number[];

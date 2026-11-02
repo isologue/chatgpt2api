@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { fetchMonitoring, type MonitoringSnapshot } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+import { diagnosticPhaseLabel } from "@/lib/image-diagnostic-labels";
 import { RefreshFailuresDialog, type RefreshFailureSelection } from "./refresh-failures-dialog";
 
 function formatBytes(value: number) {
@@ -131,6 +132,10 @@ function MonitoringContent() {
   const accounts = data.accounts;
   const images = data.images;
   const refresh = data.account_refresh;
+  const download = data.image_loop_work?.download;
+  const network = data.system.network;
+  const formatRate = (value: number | null | undefined) => typeof value === "number" ? `${formatBytes(value)}/s` : "—";
+  const callbackStages: Record<string, string> = { curl_bootstrap: "上游初始化", curl_download: "图片下载", curl_stream: "生成流", curl_metadata: "元数据请求" };
   const refreshStatus = refresh ? ({ idle: "尚未开始", running: "刷新中", completed: "已完成",
     completed_with_errors: "已完成（有失败）", failed: "刷新中断" }[refresh.status]) : "暂无刷新监控";
   const refreshPhase = refresh ? ({ idle: "等待启动", preparing: "准备账号列表", refresh: "更新账号信息",
@@ -177,7 +182,7 @@ function MonitoringContent() {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <Metric label="选号与校验中" value={data.phases?.account_lookup?.active ?? 0} />
             <Metric label="上游调用中" value={data.phases?.upstream_generation?.active ?? 0} tone="text-sky-700" />
-            <Metric label="图片下载中" value={data.phases?.image_download?.active ?? 0} />
+            <Metric label="图片正文下载中" value={data.phases?.image_download_body?.active ?? 0} hint={`等待下载名额 ${data.phases?.image_download_wait?.active ?? 0}`} />
             <Metric label="图片保存中" value={data.phases?.image_save?.active ?? 0} />
             <Metric label="正在远程校验" value={data.account_verification?.active ?? 0} hint={`等待 ${data.account_verification?.waiting ?? 0}，后台待完成 ${data.account_verification?.background_pending ?? 0}`} />
             <Metric label="校验缓存命中率" value={`${(data.account_verification?.cache_hit_rate ?? 0).toFixed(1)}%`} hint="进程累计，信息校验/有效出图/上游安全拒绝确认" tone="text-emerald-700" />
@@ -211,6 +216,26 @@ function MonitoringContent() {
             <div className="mt-3 max-h-64 overflow-auto"><table className="w-full text-left"><thead><tr><th>采样时间</th><th>窗口峰值</th><th>峰值检出时间</th><th>最新延迟</th></tr></thead><tbody>
               {(data.phases?.image_io_loop_lag?.timeline ?? []).map((point) => <tr key={point.at} className="border-t border-stone-100"><td className="py-1">{formatTime(point.at)}</td><td>{formatDuration(point.max_ms)}</td><td>{formatTime(point.max_at)}</td><td>{formatDuration(point.last_ms)}</td></tr>)}
             </tbody></table></div>
+          </details>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric label="图片正文读取速率" value={download && !download.stale ? formatRate(download.bytes_per_sec) : "—"} hint="应用消费正文的速率，包含失败尝试" />
+            <Metric label="下载名额占用" value={download && !download.stale ? `${download.active} / ${download.limit}` : "—"} hint={`等待名额 ${download?.waiting ?? 0}，按入队顺序分配`} />
+            <Metric label="服务网络接收" value={formatRate(network?.received_bytes_per_sec)} hint="当前网络命名空间，包含其他服务流量" />
+            <Metric label="服务网络发送" value={formatRate(network?.sent_bytes_per_sec)} hint="不代表宿主机公网带宽上限" />
+          </div>
+          <details className="rounded-xl border border-stone-200 p-3 text-xs text-stone-600">
+            <summary className="cursor-pointer">下载吞吐与慢回调（近5分钟）</summary>
+            <p className="mt-2 leading-5">正文速率按实际采样时长计算。慢回调展示固定阶段、经过时间和线程 CPU 时间；二者差距较大时仍需结合线程调度和底层等待定位。每个窗口最多保留 8 条。</p>
+            <div className="mt-3 max-h-64 overflow-auto"><table className="w-full min-w-[650px] text-left">
+              <thead><tr><th>窗口时间</th><th>正文读取</th><th>下载中峰值</th><th>排队峰值</th><th>慢回调</th></tr></thead>
+              <tbody>{(data.image_loop_work?.timeline ?? []).slice().reverse().map((point) => <tr key={point.at} className="border-t border-stone-100">
+                <td className="py-2 whitespace-nowrap">{formatTime(point.at)}</td><td>{formatRate(point.download?.bytes_per_sec)}</td>
+                <td>{point.download?.peak_active ?? "—"}</td><td>{point.download?.peak_waiting ?? "—"}</td>
+                <td>{(point.slow_callbacks ?? []).map((item, index) => <div key={index} title={formatTime(item.at)}>
+                  {item.phase ? diagnosticPhaseLabel(item.phase) : callbackStages[item.stage] ?? "其他请求"}：{formatDuration(item.wall_ms)} / CPU {formatDuration(item.cpu_ms)}
+                </div>)}</td>
+              </tr>)}</tbody>
+            </table></div>
           </details>
           <details className="rounded-xl border border-stone-200 p-3 text-xs text-stone-600">
             <summary className="cursor-pointer">图片循环工作耗时（近5分钟，每5秒聚合）</summary>
@@ -316,7 +341,7 @@ function MonitoringContent() {
                 ["request_filter_queue", "审核通用池排队"],
                 ["account_read_lock_wait", "账号读取锁等待"], ["account_token_refresh", "选号时令牌续期"],
                 ["account_slot_wait", "单账号槽位等待"], ["account_foreground_verification", "前台校验"],
-                ["image_download_http", "图片下载 HTTP"], ["log_index_update", "日志批量索引更新"],
+                ["image_download_wait", "等待下载名额"], ["image_download_http", "图片下载 HTTP"], ["log_index_update", "日志批量索引更新"],
                 ["log_index_sync", "日志历史索引同步"], ["log_body_append", "日志正文追加"],
                 ["log_body_fsync", "日志正文落盘"], ["log_index_commit", "日志索引提交"],
                 ["log_transaction_wait", "日志写事务等待"], ["log_append_lock_wait", "日志追加锁等待"],

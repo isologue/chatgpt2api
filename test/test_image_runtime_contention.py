@@ -254,3 +254,29 @@ def test_buffered_stream_cleanup_is_still_bounded_by_total_budget(ending):
             response.astream_task.cancel()
             await asyncio.gather(response.astream_task, return_exceptions=True)
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('ending', ['eof', 'error'])
+def test_batched_stream_cleanup_remains_bounded_by_total_budget(ending):
+    from curl_cffi.requests.models import Response, STREAM_END
+    from curl_cffi.requests.exceptions import RequestException
+    async def scenario():
+        response = Response()
+        response.queue = asyncio.Queue()
+        response.curl = object()
+        response.queue.put_nowait(b'buffered')
+        response.queue.put_nowait(STREAM_END if ending == 'eof' else RequestException('failed'))
+        response.astream_task = asyncio.create_task(asyncio.sleep(60))
+        wrapper = AsyncImageResponse(None, response, time.perf_counter(), None, 1024, False)
+        metrics = ImageMetrics()
+        metrics.diagnostics.configure_budget(.03)
+        token = current_metrics.set(metrics)
+        try:
+            with pytest.raises(ImageDeadlineExceeded):
+                await asyncio.wait_for(wrapper._read_ready(65536), .5)
+            assert response.astream_task.done()
+        finally:
+            current_metrics.reset(token)
+            response.astream_task.cancel()
+            await asyncio.gather(response.astream_task, return_exceptions=True)
+    asyncio.run(scenario())

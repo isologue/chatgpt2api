@@ -48,6 +48,7 @@ export function ConfigCard() {
   const setImageSseTimeoutSecs = useSettingsStore((state) => state.setImageSseTimeoutSecs);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageTotalTimeoutSecs = useSettingsStore((state) => state.setImageTotalTimeoutSecs);
+  const setImageDownloadConcurrency = useSettingsStore((state) => state.setImageDownloadConcurrency);
   const setImageDownloadTimeoutSecs = useSettingsStore((state) => state.setImageDownloadTimeoutSecs);
   const setImageDownloadRetries = useSettingsStore((state) => state.setImageDownloadRetries);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
@@ -420,6 +421,16 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">从生成流结束后开始计时，任务检查、结果查询、等待和补查重试共用此上限；不会自动延长到 300 秒。获取下载地址后结束计时，图片下载单独计时。补查失败按「补查失败切号次数」重新选号生成，仍受请求总预算限制。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片下载并发</label>
+            <Input
+              type="number" min={1}
+              value={String(config?.image_download_concurrency ?? 64)}
+              onChange={(event) => setImageDownloadConcurrency(event.target.value)}
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">仅控制生成后的图片下载，默认 64，可按带宽调高，不限制同时生成数量。等待下载名额计入请求总预算，取得名额后开始单次下载计时。</p>
           </div>
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">

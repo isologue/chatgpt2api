@@ -97,3 +97,30 @@ def test_storage_rejects_empty_before_any_disk_write(tmp_path):
         with pytest.raises(ImageStorageError, match="empty"):
             service.save(b"", "http://example.test")
         make_path.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["body", "status", "validation"])
+def test_failed_download_closes_before_retry_backoff(failure, monkeypatch):
+    """退避让出执行权时，旧响应必须已关闭，不能占着全局下载名额。"""
+    from services import openai_backend_api as module
+    from services.config import config
+    monkeypatch.setitem(config.data, "image_download_retries", 1)
+    events = []
+    def broken_body(**kwargs):
+        yield b"partial"
+        raise RuntimeError("fixture interrupted")
+    bad = SimpleNamespace(status_code=503 if failure == "status" else 200,
+        headers={}, elapsed=None, text="fixture unavailable",
+        iter_content=broken_body if failure == "body" else lambda **kw: iter([b"invalid"]),
+        close=lambda: events.append("close_bad"))
+    good = SimpleNamespace(status_code=200, headers={}, elapsed=None,
+        iter_content=lambda **kw: iter([png_bytes()]), close=lambda: events.append("close_good"))
+    responses = iter([bad, good])
+    def wait(_seconds):
+        assert events == ["close_bad"]
+        events.append("backoff")
+    monkeypatch.setattr(module, "wait_with_image_budget", wait)
+    backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+    backend.session = SimpleNamespace(get=lambda *a, **kw: next(responses))
+    assert backend.download_image_bytes(["http://fixture.invalid/image"]) == [png_bytes()]
+    assert events == ["close_bad", "backoff", "close_good"]

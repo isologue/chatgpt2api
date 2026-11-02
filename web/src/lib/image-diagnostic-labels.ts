@@ -10,7 +10,7 @@ const phaseLabels: Record<string, string> = {
   conversation_prepare: "准备生成对话", generation_submit: "提交生成请求",
   upstream_generation: "上游图片生成", sse_stream: "读取上游生成流",
   result_poll: "轮询图片结果", result_query: "查询图片结果", result_resolve: "补查并解析图片结果",
-  retry_wait: "等待后续查询或重试", image_download: "下载图片",
+  retry_wait: "等待后续查询或重试", image_download_wait: "等待下载名额", image_download: "下载图片",
   image_download_http: "建立图片下载请求", image_download_body: "接收图片数据",
   image_validate: "校验图片完整性", image_save: "保存图片", log_confirmation: "确认日志写入",
   other: "其他处理", response_serialization: "组织返回结果", decision: "重试与切号决策",
@@ -61,7 +61,9 @@ export function diagnosticReasonLabel(step: Record<string, unknown>): string {
     if (step.phase === "image_download_transport") {
       const codes: Record<number, string> = { 18: "正文不完整", 23: "写入中断", 28: "传输超时", 35: "TLS 握手失败", 52: "空响应", 55: "发送失败", 56: "接收失败", 92: "HTTP/2 流异常" };
       const code = Number(data.curl_error_code) || 0;
-      return `响应头 ${ms("headers_ms")} · 正文 ${ms("body_ms")} · 已读 ${Number(data.bytes) || 0}/${Number(data.expected_bytes) || "未知"} 字节 · 均速 ${Math.round((Number(data.bytes_per_sec) || 0) / 1024)} KiB/s · 最长回调排队 ${ms("dispatch_max_wait_ms")} · 最长间隔 ${ms("max_gap_ms")} · ${endings[String(data.termination)] || "未知结束"}${code ? ` · curl ${code}（${codes[code] || "传输异常"}）` : ""}`;
+      const completion = typeof data.curl_completed_ms === "number"
+        ? ` · curl接收 ${Number(data.curl_received_bytes) || 0} 字节 / ${ms("curl_transfer_ms")} · 传输结束后读取 ${ms("completion_to_read_end_ms")}` : "";
+      return `响应头 ${ms("headers_ms")} · 正文 ${ms("body_ms")} · 已读 ${Number(data.bytes) || 0}/${Number(data.expected_bytes) || "未知"} 字节 · 均速 ${Math.round((Number(data.bytes_per_sec) || 0) / 1024)} KiB/s · 最长回调排队 ${ms("dispatch_max_wait_ms")} · 最长间隔 ${ms("max_gap_ms")} · ${endings[String(data.termination)] || "未知结束"}${code ? ` · curl ${code}（${codes[code] || "传输异常"}）` : ""}${completion}`;
     }
     return `响应头 ${ms("headers_ms")} · 首段 ${data.first_chunk_received ? ms("first_chunk_ms") : "未收到"} · 最后数据 ${ms("last_chunk_ms")} · 最长间隔 ${ms("max_gap_ms")} · 末段后等待 ${ms("idle_after_last_ms")} · ${Number(data.bytes) || 0}字节/${Number(data.chunks) || 0}段 · ${endings[String(data.termination)] || "未知结束"}`;
   }

@@ -485,6 +485,10 @@ class ConfigStore:
         )
 
     @property
+    def image_download_concurrency(self) -> int:
+        return _normalize_positive_int(self.data.get("image_download_concurrency"), 64, 1)
+
+    @property
     def image_response_workers(self) -> int:
         return min(128, _normalize_positive_int(self.data.get("image_response_workers"), 16, 1))
 
@@ -737,6 +741,7 @@ class ConfigStore:
         data["image_queue_size"] = self.image_queue_size
         data["image_account_verification"] = self.image_account_verification
         data["image_response_workers"] = self.image_response_workers
+        data["image_download_concurrency"] = self.image_download_concurrency
         data["image_account_selection_max_attempts"] = self.image_account_selection_max_attempts
         data["image_poll_timeout_account_switch_retries"] = self.image_poll_timeout_account_switch_retries
         data["image_text_reply_account_switch_retries"] = self.image_text_reply_account_switch_retries
@@ -821,6 +826,8 @@ class ConfigStore:
             next_data.get("image_poll_timeout_secs", self.image_poll_timeout_secs), 10, 1)
         next_data["image_total_timeout_secs"] = _normalize_positive_int(
             next_data.get("image_total_timeout_secs", self.image_total_timeout_secs), 240, 1)
+        next_data["image_download_concurrency"] = _normalize_positive_int(
+            next_data.get("image_download_concurrency", self.image_download_concurrency), 64, 1)
         next_data["image_download_timeout_secs"] = _normalize_positive_int(
             next_data.get("image_download_timeout_secs", self.image_download_timeout_secs), 30, 1)
         try:

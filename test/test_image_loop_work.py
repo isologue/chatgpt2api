@@ -52,6 +52,7 @@ def test_loop_work_flush_is_immutable_and_does_not_capture_request_values():
 
 
 def test_curl_completion_excludes_socket_work(monkeypatch):
+    monkeypatch.setattr('services.image_curl._native_socket_action', None)
     async def scenario():
         def socket(self, *args):
             time.sleep(.015)
@@ -164,4 +165,76 @@ def test_cancellation_stops_parsing_a_buffered_sse_chunk():
         finally:
             await cancellation
             current_metrics.reset(context)
+    asyncio.run(scenario())
+
+
+def test_download_rate_counts_partial_reads_and_publishes_immutable_samples(monkeypatch):
+    import services.image_loop_work as module
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(module.time, 'perf_counter', lambda: clock.now)
+    monkeypatch.setattr(module.time, 'time', lambda: clock.now + 10000)
+    recorder = LoopWorkRecorder()
+    recorder.download_state(2, 7, 64)
+    recorder.download_bytes(4096)
+    clock.now += .5
+    recorder.flush(force=True)
+    first = recorder.samples(clock.now)[-1]
+    assert first['download']['bytes_per_sec'] == 8192
+    assert first['download']['total_bytes'] == 4096
+    recorder.download_state(0, 0, 64)
+    recorder.download_bytes(2048)
+    clock.now += .5
+    recorder.flush(force=True)
+    second = recorder.samples(clock.now)[-1]
+    assert first['download']['active'] == 2
+    assert second['download']['total_bytes'] == 6144
+    assert second['download']['bytes'] == 2048
+    clock.now += .5
+    recorder.flush(force=True)
+    assert recorder.samples(clock.now)[-1]['download']['bytes_per_sec'] == 0
+
+
+def test_slow_callbacks_are_bounded_and_record_only_stage_and_numeric_timing():
+    recorder = LoopWorkRecorder()
+    for _ in range(100):
+        recorder.slow_callback('curl_download', 'socket', time.perf_counter(), .1, .01)
+    recorder.flush(force=True)
+    rows = recorder.samples(time.perf_counter())[-1]['slow_callbacks']
+    assert len(rows) == 8
+    assert set(rows[0]) == {'at', 'stage', 'source', 'wall_ms', 'cpu_ms'}
+    assert rows[0]['wall_ms'] == 100 and rows[0]['cpu_ms'] == 10
+
+
+def test_sse_callback_classification_uses_transfer_kind_before_body_read(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(AsyncCurl, 'socket_action', lambda *args: 0)
+        driver = ImageAsyncCurl()
+        driver._transfer_stage = 'generation_submit'
+        driver._transfer_is_sse = True
+        try:
+            driver.socket_action(-1, 0)
+            work = get_loop_work()
+            work.flush(force=True)
+            row = work.samples(time.perf_counter())[-1]['work']
+            assert row['curl_stream']['count'] == 1
+            assert 'curl_metadata' not in row
+        finally:
+            await driver.close()
+    asyncio.run(scenario())
+
+
+def test_response_read_updates_callback_phase_without_altering_transport_summary_stage():
+    from services.image_metrics import phase
+    async def scenario():
+        driver = SimpleNamespace(_transfer_stage='generation_submit')
+        async def content():
+            yield b'data: progress\n'
+        owner = SimpleNamespace(session=SimpleNamespace(_acurl=driver))
+        with phase('generation_submit'):
+            response = AsyncImageResponse(owner, SimpleNamespace(aiter_content=content),
+                time.perf_counter(), None, 1024, True)
+        with phase('sse_stream'):
+            assert await response._next() == b'data: progress\n'
+        assert driver._transfer_stage == 'sse_stream'
+        assert response.stage == 'generation_submit'
     asyncio.run(scenario())

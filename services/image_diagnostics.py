@@ -19,7 +19,7 @@ TRACE_PHASES = frozenset({
     'account_verification', 'access_token_refresh', 'reference_upload', 'upstream_bootstrap',
     'requirements_token', 'pow_solve', 'conversation_prepare', 'generation_submit',
     'upstream_generation', 'sse_stream', 'result_poll', 'result_query', 'result_resolve',
-    'retry_wait', 'image_download', 'image_download_http', 'image_download_body',
+    'retry_wait', 'image_download_wait', 'image_download', 'image_download_http', 'image_download_body',
     'image_validate', 'image_save', 'log_confirmation', 'response_serialization',
 })
 
@@ -205,7 +205,9 @@ class ImageDiagnostics:
         fields = {key: round(float(values[key]), 3) for key in (
             'headers_ms', 'first_chunk_ms', 'last_chunk_ms', 'max_gap_ms',
             'idle_after_last_ms', 'bytes', 'chunks', 'body_ms', 'bytes_per_sec',
-            'expected_bytes', 'dispatch_count', 'dispatch_wait_ms', 'dispatch_max_wait_ms') if key in values}
+            'expected_bytes', 'dispatch_count', 'dispatch_wait_ms', 'dispatch_max_wait_ms',
+            'curl_received_bytes', 'curl_transfer_ms', 'curl_first_byte_ms',
+            'curl_completed_ms', 'completion_to_read_end_ms', 'worker_total_ms', 'ipc_total_ms') if key in values}
         code = values.get('curl_error_code')
         if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
             fields['curl_error_code'] = int(code)

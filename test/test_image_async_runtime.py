@@ -172,7 +172,8 @@ def test_sse_summary_measures_chunks_gaps_and_eof():
 
 
 @pytest.mark.parametrize('path', ['/silent', '/headers'])
-def test_total_budget_interrupts_silent_body_and_headers(path):
+@pytest.mark.parametrize('stream', [True, False])
+def test_total_budget_interrupts_silent_body_and_headers(path, stream):
     async def scenario():
         executor = BoundedImageExecutor(1, 0)
         metrics = ImageMetrics()
@@ -182,7 +183,7 @@ def test_total_budget_interrupts_silent_body_and_headers(path):
             def work():
                 session = ImageBackendSession(trust_env=False)
                 try:
-                    response = session.get(url + path, stream=True, image_stream_timeout=2)
+                    response = session.get(url + path, stream=stream, image_stream_timeout=2)
                     try:
                         return list(response.iter_content())
                     finally:
@@ -201,7 +202,8 @@ def test_total_budget_interrupts_silent_body_and_headers(path):
     asyncio.run(scenario())
 
 
-def test_cancel_closes_silent_connection_and_releases_capacity():
+@pytest.mark.parametrize('stream', [True, False])
+def test_cancel_closes_silent_connection_and_releases_capacity(stream):
     async def scenario():
         executor = BoundedImageExecutor(1, 0)
         metrics = ImageMetrics()
@@ -211,7 +213,7 @@ def test_cancel_closes_silent_connection_and_releases_capacity():
             def work():
                 session = ImageBackendSession(trust_env=False)
                 try:
-                    response = session.get(url + '/silent', stream=True, image_stream_timeout=8)
+                    response = session.get(url + '/silent', stream=stream, image_stream_timeout=8)
                     try:
                         return list(response.iter_content())
                     finally:
@@ -383,7 +385,8 @@ def test_stream_hard_timeout_and_total_budget_are_separate(path):
     asyncio.run(scenario())
 
 
-def test_declared_and_chunked_body_limits(monkeypatch):
+@pytest.mark.parametrize('bulk', [False, True])
+def test_declared_and_chunked_body_limits(monkeypatch, bulk):
     from services import image_async_transport as transport
     monkeypatch.setattr(transport, 'MAX_IMAGE_BODY', 1024)
     async def scenario():
@@ -394,7 +397,7 @@ def test_declared_and_chunked_body_limits(monkeypatch):
                 try:
                     response = session.get(url + '/large', stream=True)
                     try:
-                        return b''.join(response.iter_content())
+                        return b''.join(response.read_image_chunks() if bulk else response.iter_content())
                     finally:
                         response.close()
                 finally:

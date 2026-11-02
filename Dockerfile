@@ -51,6 +51,8 @@ COPY api ./api
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
+# 保留 certifi 的全部信任根，使用哈希目录避免高并发 TLS 重复解析整份证书包。
+RUN .venv/bin/python scripts/build_image_ca.py
 COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80

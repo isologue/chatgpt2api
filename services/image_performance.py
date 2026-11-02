@@ -6,7 +6,7 @@ STAGES = frozenset({
     'account_lookup', 'reference_upload', 'upstream_bootstrap', 'requirements_token',
     'pow_solve', 'conversation_prepare', 'generation_submit', 'sse_stream',
     'result_poll', 'result_query', 'result_resolve', 'image_download',
-    'image_download_http', 'image_download_body', 'image_validate', 'image_save', 'other',
+    'image_download_wait', 'image_download_http', 'image_download_body', 'image_validate', 'image_save', 'other',
 })
 COMPONENTS = frozenset({
     'http_headers', 'http_body', 'http_total', 'curl_dns', 'curl_connect',

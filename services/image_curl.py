@@ -2,16 +2,40 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import sys
 import time
 from collections import OrderedDict
 from contextvars import Context
 
-from curl_cffi import AsyncCurl, CurlMOpt
+from curl_cffi import AsyncCurl, CurlInfo, CurlMOpt
 from curl_cffi.aio import (CURL_CSELECT_IN, CURL_CSELECT_OUT, CURL_POLL_IN,
     CURL_POLL_NONE, CURL_POLL_OUT, CURL_POLL_REMOVE, CURL_SOCKET_TIMEOUT, ffi, lib)
 from curl_cffi.requests import AsyncSession
 
 from services.image_loop_work import get_loop_work
+
+
+def _bind_socket_action():
+    """仅包装 Linux CPython 下已经加载的非阻塞 multi 驱动，不另载 curl。"""
+    if (sys.platform != 'linux' or sys.implementation.name != 'cpython'
+            or not getattr(sys, '_is_gil_enabled', lambda: True)()):
+        return None
+    try:
+        address = ffi.addressof(lib, 'curl_multi_socket_action')
+        signature = ffi.typeof(address)
+        # 依赖升级改变 ABI 时沿用原库，不能猜测 socket 或指针类型。
+        if (signature.result.cname != 'int' or
+                tuple(arg.cname for arg in signature.args) != ('void *', 'int', 'int', 'int *')):
+            return None
+        prototype = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+        return prototype(int(ffi.cast('uintptr_t', address)))
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+_native_socket_action = _bind_socket_action()
 
 
 @ffi.callback("int(void *, long, void *)", error=-1)
@@ -266,6 +290,28 @@ class ImageAsyncCurl(AsyncCurl):
             self._dispatcher.submit(self, sockfd, ev_bitmask,
                 source or ('timer' if sockfd == CURL_SOCKET_TIMEOUT else 'socket'))
 
+    def _record_download_completion(self, curl):
+        # 句柄重置前保留固定数值；不读取 URL、请求头或认证信息。
+        timing = getattr(self, '_transfer_wait', None)
+        if timing is None or 'download_started' not in timing:
+            return
+        timing['completed_at'] = time.perf_counter()
+        try:
+            timing['received_bytes'] = curl.getinfo(CurlInfo.SIZE_DOWNLOAD_T)
+            timing['transfer_ms'] = curl.getinfo(CurlInfo.TOTAL_TIME) * 1000
+            timing['first_byte_ms'] = curl.getinfo(CurlInfo.STARTTRANSFER_TIME) * 1000
+        except Exception:
+            # 可选诊断失败不能改变传输结果或阻止 future 收尾。
+            pass
+
+    def set_result(self, curl):
+        self._record_download_completion(curl)
+        return super().set_result(curl)
+
+    def set_exception(self, curl, exception):
+        self._record_download_completion(curl)
+        return super().set_exception(curl, exception)
+
     async def close(self):
         if self._closing:
             return
@@ -278,6 +324,7 @@ class ImageAsyncCurl(AsyncCurl):
             self._paused_sockets.clear()
 
     def _process_data(self, sockfd, ev_bitmask, source):
+        self._action_source = source
         started, cpu_started = time.perf_counter(), time.thread_time()
         wall_before, cpu_before = self._socket_wall, self._socket_cpu
         try:
@@ -293,14 +340,31 @@ class ImageAsyncCurl(AsyncCurl):
     def socket_action(self, sockfd, ev_bitmask):
         started, cpu_started = time.perf_counter(), time.thread_time()
         try:
-            return super().socket_action(sockfd, ev_bitmask)
+            if _native_socket_action is None:
+                return super().socket_action(sockfd, ev_bitmask)
+            # libcurl multi 处理非阻塞 socket，正文/socket/timer 回调仍在本线程。
+            # CFFI 在原生调用及每次 Python 回调间反复交接 GIL；竞争时微小工作
+            # 也会等待多个线程时间片。仅此调用保留 GIL，外层 2ms 批次照常让出。
+            # 不用于 DNS 查询、文件读写、同步 curl.perform 或任何阻塞操作。
+            running = ctypes.c_int()
+            code = _native_socket_action(int(ffi.cast('uintptr_t', self._curlm)),
+                sockfd, ev_bitmask, ctypes.byref(running))
+            self._check_error(code)
+            return running.value
         finally:
             self._last_action = time.monotonic()
             elapsed, cpu = time.perf_counter() - started, time.thread_time() - cpu_started
             self._socket_wall += elapsed
             self._socket_cpu += cpu
             self._loop_work.record('curl_socket', started, elapsed, cpu)
+            stage = getattr(self, '_transfer_stage', 'other')
+            category = ('curl_bootstrap' if stage == 'upstream_bootstrap' else
+                'curl_download' if stage in {'image_download', 'image_download_http', 'image_download_body'} else
+                'curl_stream' if getattr(self, '_transfer_is_sse', False) else 'curl_metadata')
+            self._loop_work.record(category, started, elapsed, cpu)
             if elapsed >= .05:
+                self._loop_work.slow_callback(category, getattr(self, '_action_source', 'timer'),
+                    started, elapsed, cpu, phase=stage)
                 from services.image_metrics import runtime_phases
                 # 固定数值快照；不采集 URL、认证、正文或调用参数。
                 runtime_phases.observe('image_curl_callback_slow', elapsed)

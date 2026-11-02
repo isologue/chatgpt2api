@@ -17,3 +17,7 @@ README.md
 .env
 .env.*
 data
+
+# 本地压测、剖析及临时依赖不进入镜像构建上下文
+output/
+.pytest_cache/
