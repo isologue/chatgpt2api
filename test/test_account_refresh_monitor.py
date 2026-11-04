@@ -316,6 +316,44 @@ def test_keepalive_failure_callback_provides_returned_reason(service, monkeypatc
     assert "invalid_grant" in failures[0]["error"]
 
 
+def test_manual_force_refresh_retries_terminal_rt_skips_missing_and_tracks_progress(service, monkeypatch):
+    monkeypatch.setitem(config.data, "image_account_verification", {"workers": 2})
+    service.verification.reconfigure()
+    accounts = {
+        "good": {"access_token": "good", "refresh_token": "rt-good", "last_token_refresh_at": "old"},
+        "bad": {"access_token": "bad", "refresh_token": "rt-bad", "last_token_refresh_at": "old"},
+        "missing": {"access_token": "missing", "last_token_refresh_at": None},
+    }
+    monkeypatch.setattr(service, "get_account", lambda token: accounts.get(token))
+    calls = []
+
+    def force_refresh(token, **kwargs):
+        calls.append((token, kwargs))
+        if token == "good":
+            accounts[token]["last_token_refresh_at"] = "new"
+        else:
+            accounts[token]["last_token_refresh_error"] = "invalid_grant"
+        return token
+
+    monkeypatch.setattr(service, "refresh_access_token", force_refresh)
+    progress_id = "manual-rt-refresh"
+    service.init_refresh_progress(progress_id, 3)
+
+    result = service.force_refresh_access_tokens(["good", "bad", "missing", "good"], progress_id=progress_id)
+    progress = service.get_refresh_progress(progress_id)
+
+    assert result["refreshed"] == 1
+    assert result["skipped"] == 1
+    assert len(result["errors"]) == 1
+    assert len(calls) == 2
+    assert all(call[1] == {
+        "force": True,
+        "event": "manual_refresh_token",
+        "retry_terminal": True,
+    } for call in calls)
+    assert progress["processed"] == 3
+
+
 def test_failures_api_auth_validation_pagination_and_stale_round(monkeypatch):
     import api.system as system
     monitor = AccountRefreshMonitor()

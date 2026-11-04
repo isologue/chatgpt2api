@@ -46,6 +46,7 @@ import {
 import {
   deleteAccounts,
   downloadSub2APIAccounts,
+  forceRefreshAccessTokens,
   fetchAccountsPage,
   fetchAccountTokens,
   type AccountSummary,
@@ -411,6 +412,50 @@ function AccountsPageContent() {
     }
   };
 
+  const handleForceRefreshAccessTokens = async (accessTokens: string[] | null) => {
+    const all = accessTokens === null;
+    if (!all && !accessTokens.length) { toast.error("请先选择要刷新的账号"); return; }
+    setIsRefreshing(true);
+    setProgress({
+      visible: true,
+      current: 0,
+      total: all ? total : accessTokens.length,
+      message: "正在使用 RT 强制刷新 AT...",
+      email: "",
+    });
+    try {
+      const { progress_id } = await forceRefreshAccessTokens(accessTokens ?? []);
+      let result: AccountRefreshResponse | null | undefined;
+      let lastSummaryRefresh = Date.now();
+      for (;;) {
+        if (!mountedRef.current) return;
+        const current = await fetchRefreshProgress(progress_id, false);
+        setProgress((prev) => ({ ...prev, current: current.processed, total: current.total }));
+        if (current.error) throw new Error(current.error);
+        if (current.done) { result = current.result; break; }
+        if (Date.now() - lastSummaryRefresh > 4000) {
+          await latestLoadAccountsRef.current(true);
+          lastSummaryRefresh = Date.now();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+      if (!result) throw new Error("RT 刷新结果为空");
+      await latestLoadAccountsRef.current(true);
+      const errors = result.errors ?? [];
+      const skipped = result.skipped ?? 0;
+      if (errors.length) {
+        toast.error(`RT 刷新完成：成功 ${result.refreshed} 个，失败 ${errors.length} 个，跳过 ${skipped} 个；${errors[0].error}`);
+      } else {
+        toast.success(`RT 刷新完成：成功 ${result.refreshed} 个，跳过 ${skipped} 个`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "手动 RT 刷新失败");
+    } finally {
+      setIsRefreshing(false);
+      setProgress((prev) => ({ ...prev, visible: false }));
+    }
+  };
+
   const handleReLogin = async (accessTokens: string[]) => {
     const targets = accessTokens.filter((token) => selectedAccountsRef.current.get(token)?.status === "异常");
     if (!targets.length) { toast.error("选中账号中没有异常账号"); return; }
@@ -545,6 +590,16 @@ function AccountsPageContent() {
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-amber-200 bg-white/80 px-4 text-amber-800 hover:bg-amber-50"
+            onClick={() => void handleForceRefreshAccessTokens(null)}
+            disabled={isLoading || isRefreshing || isDeleting || total === 0}
+            title="对所有有 RT 的账号强制请求一次令牌刷新；成功时服务端返回的新 RT 会自动保存"
+          >
+            {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            RT 刷新全部 AT
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
@@ -787,6 +842,16 @@ function AccountsPageContent() {
                 >
                   {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                   刷新选中账号信息和额度
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-amber-700 hover:bg-amber-50 hover:text-amber-800"
+                  onClick={() => void handleForceRefreshAccessTokens(selectedTokens)}
+                  disabled={selectedTokens.length === 0 || isRefreshing}
+                  title="对选中账号强制请求一次令牌刷新；成功时服务端返回的新 RT 会自动保存"
+                >
+                  {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  RT 刷新选中 AT
                 </Button>
                 <Button
                   variant="ghost"

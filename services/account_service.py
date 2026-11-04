@@ -1165,6 +1165,70 @@ class AccountService:
             "relogined": 0,
         }
 
+    def force_refresh_access_tokens(self, access_tokens: list[str], *, progress_id: str | None = None) -> dict[str, Any]:
+        access_tokens = list(dict.fromkeys(str(token or "").strip() for token in access_tokens if str(token or "").strip()))
+        eligible: list[tuple[str, dict]] = []
+        skipped = 0
+        errors: list[dict[str, str]] = []
+        for token in access_tokens:
+            account = self.get_account(token)
+            if not account or not str(account.get("refresh_token") or "").strip():
+                skipped += 1
+                if progress_id:
+                    self.update_refresh_progress(progress_id, token)
+                continue
+            eligible.append((token, dict(account)))
+
+        def refresh_one(token: str, before: dict) -> tuple[str, bool, str]:
+            try:
+                refreshed_token = self.refresh_access_token(
+                    token,
+                    force=True,
+                    event="manual_refresh_token",
+                    retry_terminal=True,
+                )
+                account = self.get_account(refreshed_token or token) or self.get_account(token)
+                if account and account.get("last_token_refresh_at") != before.get("last_token_refresh_at"):
+                    return token, True, ""
+                reason = str((account or {}).get("last_token_refresh_error") or "RT 刷新未成功完成")
+                return token, False, reason
+            except Exception as exc:
+                return token, False, str(exc) or type(exc).__name__
+
+        workers = max(1, int(config.image_account_verification["workers"]))
+        remaining = iter(eligible)
+        pending: dict[Future, str] = {}
+        refreshed = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="manual-rt-refresh") as executor:
+            while len(pending) < workers:
+                try:
+                    token, account = next(remaining)
+                except StopIteration:
+                    break
+                pending[executor.submit(refresh_one, token, account)] = token
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    token = pending.pop(future)
+                    try:
+                        _, success, reason = future.result()
+                    except Exception as exc:
+                        success, reason = False, str(exc) or type(exc).__name__
+                    if success:
+                        refreshed += 1
+                    else:
+                        errors.append({"token": anonymize_token(token), "error": reason})
+                    if progress_id:
+                        self.update_refresh_progress(progress_id, token)
+                    try:
+                        next_token, next_account = next(remaining)
+                    except StopIteration:
+                        continue
+                    pending[executor.submit(refresh_one, next_token, next_account)] = next_token
+
+        return {"refreshed": refreshed, "skipped": skipped, "errors": errors, "relogined": 0}
+
     def list_tokens(self) -> list[str]:
         with self._timed_account_lock("account_list_tokens_lock"):
             return list(self._accounts)

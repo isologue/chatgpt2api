@@ -617,6 +617,13 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
+export async function forceRefreshAccessTokens(accessTokens: string[]) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/refresh-access-token", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
 export async function fetchRefreshProgress(progressId: string, includeItems = true) {
   return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}?include_items=${includeItems}`);
 }

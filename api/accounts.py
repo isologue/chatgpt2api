@@ -377,6 +377,32 @@ def create_router() -> APIRouter:
 
         return {"progress_id": progress_id}
 
+    @router.post("/api/accounts/refresh-access-token")
+    async def force_refresh_access_tokens(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_tokens = _unique_tokens(body.access_tokens)
+        if not access_tokens:
+            access_tokens = account_service.list_tokens()
+        if not access_tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+
+        progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(access_tokens))
+
+        async def _do_refresh():
+            try:
+                result = await run_in_threadpool(
+                    account_service.force_refresh_access_tokens,
+                    access_tokens,
+                    progress_id=progress_id,
+                )
+                account_service.finish_refresh_progress(progress_id, result)
+            except Exception as exc:
+                account_service.finish_refresh_progress(progress_id, error=str(exc))
+
+        asyncio.create_task(_do_refresh())
+        return {"progress_id": progress_id}
+
     @router.get("/api/accounts/refresh/progress/{progress_id}")
     async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None), include_items: bool = True):
         require_admin(authorization)
