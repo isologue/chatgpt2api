@@ -91,6 +91,97 @@ class AccountExportTests(unittest.TestCase):
         self.assertEqual(items[0]["id_token"], complete_id_token)
         self.assertEqual(items[0]["refresh_token"], "rt_complete")
 
+    def test_build_sub2api_export_payload_matches_sample_shape_and_filters_selection(self) -> None:
+        access_token = make_jwt(
+            {
+                "exp": 1800000000,
+                "iat": 1700000000,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "chatgpt-account",
+                    "chatgpt_user_id": "chatgpt-user",
+                    "chatgpt_plan_type": "plus",
+                },
+                "https://api.openai.com/profile": {"email": "sub@example.com"},
+            }
+        )
+        id_token = make_jwt({"email": "sub@example.com"})
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {
+                        "access_token": access_token,
+                        "id_token": id_token,
+                        "refresh_token": "rt_sub",
+                        "session_token": "session_sub",
+                        "account_id": "stored-account",
+                        "email": "sub@example.com",
+                        "type": "Plus",
+                        "source_type": "codex",
+                    },
+                    {"access_token": "incomplete"},
+                    {
+                        "access_token": make_jwt({"exp": 1800000000}),
+                        "id_token": id_token,
+                        "refresh_token": "rt_unselected",
+                    },
+                ]
+            )
+        )
+
+        payload = service.build_sub2api_export_payload([access_token])
+
+        self.assertEqual(set(payload), {"exported_at", "proxies", "accounts"})
+        self.assertTrue(payload["exported_at"].endswith("Z"))
+        self.assertEqual(payload["proxies"], [])
+        self.assertEqual(len(payload["accounts"]), 1)
+        account = payload["accounts"][0]
+        self.assertEqual(
+            set(account),
+            {
+                "name", "platform", "type", "account_id", "chatgpt_account_id", "chatgpt_user_id",
+                "session_token", "credentials", "extra", "concurrency", "priority", "rate_multiplier",
+                "auto_pause_on_expired",
+            },
+        )
+        self.assertEqual(account["platform"], "openai")
+        self.assertEqual(account["type"], "oauth")
+        self.assertEqual(account["account_id"], "stored-account")
+        self.assertEqual(account["chatgpt_account_id"], "chatgpt-account")
+        self.assertEqual(account["chatgpt_user_id"], "chatgpt-user")
+        self.assertEqual(account["session_token"], "session_sub")
+        self.assertEqual(account["credentials"]["access_token"], access_token)
+        self.assertEqual(account["credentials"]["refresh_token"], "rt_sub")
+        self.assertEqual(account["credentials"]["id_token"], id_token)
+        self.assertEqual(account["credentials"]["session_token"], "session_sub")
+        self.assertEqual(
+            set(account["credentials"]),
+            {
+                "access_token", "id_token", "session_token", "chatgpt_account_id", "chatgpt_user_id",
+                "client_id", "email", "expires_at", "expires_in", "model_mapping", "organization_id",
+                "plan_type", "refresh_token",
+            },
+        )
+        self.assertEqual(account["credentials"]["organization_id"], "chatgpt-account")
+        self.assertEqual(account["extra"]["email"], "sub@example.com")
+        self.assertEqual(set(account["extra"]), {"email", "auth_provider", "source", "plan_type"})
+        self.assertEqual(account["extra"]["source"], "codex")
+        self.assertEqual(account["concurrency"], 10)
+        self.assertEqual(account["priority"], 1)
+        self.assertEqual(account["rate_multiplier"], 1)
+        self.assertTrue(account["auto_pause_on_expired"])
+
+    def test_build_sub2api_export_payload_skips_accounts_without_refresh_or_id_token(self) -> None:
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {"access_token": make_jwt({"exp": 1800000000}), "refresh_token": "rt_missing_id"},
+                    {"access_token": "only_access"},
+                ]
+            )
+        )
+
+        self.assertEqual(service.build_sub2api_export_payload()["accounts"], [])
+
     def test_add_account_items_preserves_export_fields_without_overwriting_plan_type(self) -> None:
         service = AccountService(MemoryStorage())
 

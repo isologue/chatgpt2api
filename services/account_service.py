@@ -2385,55 +2385,141 @@ class AccountService:
                 pass
         return result
 
-    def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
+    def _snapshot_export_accounts(self, access_tokens: list[str] | None = None) -> list[dict]:
         target_tokens = set(token for token in (access_tokens or []) if token)
         with self._timed_account_lock("account_build_export_items_lock"):
-            accounts = [
+            return [
                 dict(item)
                 for item in self._accounts.values()
                 if not target_tokens or str(item.get("access_token") or "") in target_tokens
             ]
 
+    def _build_export_item(self, account: dict) -> dict[str, str] | None:
+        access_token = str(account.get("access_token") or "").strip()
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        id_token = str(account.get("id_token") or "").strip()
+        if not access_token or not refresh_token or not id_token:
+            return None
+
+        access_payload = self._decode_jwt_payload(access_token)
+        id_payload = self._decode_jwt_payload(id_token)
+        auth_claim = access_payload.get("https://api.openai.com/auth")
+        auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+        profile_claim = access_payload.get("https://api.openai.com/profile")
+        profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
+
+        email = (
+            str(account.get("email") or "").strip()
+            or str(profile_claim.get("email") or "").strip()
+            or str(id_payload.get("email") or "").strip()
+        )
+        account_id = (
+            str(account.get("account_id") or "").strip()
+            or str(auth_claim.get("chatgpt_account_id") or "").strip()
+            or str(account.get("user_id") or "").strip()
+        )
+        item = {
+            "type": str(account.get("export_type") or "codex"),
+            "email": email,
+            "account_id": account_id,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "expired": self._timestamp_to_iso(access_payload.get("exp")),
+            "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
+        }
+        password = str(account.get("password") or "").strip()
+        if password:
+            item["password"] = password
+        return item
+
+    def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
+        accounts = self._snapshot_export_accounts(access_tokens)
         items: list[dict[str, str]] = []
         for account in accounts:
-            access_token = str(account.get("access_token") or "").strip()
-            refresh_token = str(account.get("refresh_token") or "").strip()
-            id_token = str(account.get("id_token") or "").strip()
-            if not access_token or not refresh_token or not id_token:
+            if (item := self._build_export_item(account)) is not None:
+                items.append(item)
+        return items
+
+    def build_sub2api_export_payload(self, access_tokens: list[str] | None = None) -> dict[str, Any]:
+        accounts: list[dict[str, Any]] = []
+        for account in self._snapshot_export_accounts(access_tokens):
+            item = self._build_export_item(account)
+            if item is None:
                 continue
 
-            access_payload = self._decode_jwt_payload(access_token)
-            id_payload = self._decode_jwt_payload(id_token)
+            access_payload = self._decode_jwt_payload(item["access_token"])
             auth_claim = access_payload.get("https://api.openai.com/auth")
             auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
-            profile_claim = access_payload.get("https://api.openai.com/profile")
-            profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
-
-            email = (
-                str(account.get("email") or "").strip()
-                or str(profile_claim.get("email") or "").strip()
-                or str(id_payload.get("email") or "").strip()
-            )
-            account_id = (
-                str(account.get("account_id") or "").strip()
-                or str(auth_claim.get("chatgpt_account_id") or "").strip()
-                or str(account.get("user_id") or "").strip()
-            )
-            item = {
-                "type": str(account.get("export_type") or "codex"),
+            try:
+                expires_at = int(access_payload.get("exp") or 0)
+            except (TypeError, ValueError, OverflowError):
+                expires_at = 0
+            account_id = item["account_id"]
+            email = item["email"]
+            session_token = str(account.get("session_token") or "").strip()
+            chatgpt_account_id = str(
+                account.get("chatgpt_account_id") or auth_claim.get("chatgpt_account_id") or account_id
+            ).strip()
+            chatgpt_user_id = str(
+                account.get("chatgpt_user_id") or auth_claim.get("chatgpt_user_id") or account.get("user_id") or ""
+            ).strip()
+            plan_type = str(account.get("plan_type") or account.get("type") or "").strip()
+            extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+            credentials = {
+                "access_token": item["access_token"],
+                "id_token": item["id_token"],
+                "session_token": session_token,
+                "chatgpt_account_id": chatgpt_account_id,
+                "chatgpt_user_id": chatgpt_user_id,
+                "client_id": str(account.get("client_id") or self._OAUTH_CLIENT_ID),
                 "email": email,
-                "account_id": account_id,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "id_token": id_token,
-                "expired": self._timestamp_to_iso(access_payload.get("exp")),
-                "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
+                "expires_at": expires_at,
+                "expires_in": max(0, expires_at - int(time.time())) if expires_at else 0,
+                "model_mapping": account.get("model_mapping") if isinstance(account.get("model_mapping"), dict) else {},
+                "organization_id": str(account.get("organization_id") or chatgpt_account_id),
+                "plan_type": plan_type,
+                "refresh_token": item["refresh_token"],
             }
-            password = str(account.get("password") or "").strip()
-            if password:
-                item["password"] = password
-            items.append(item)
-        return items
+            try:
+                concurrency = max(1, int(account.get("concurrency") or 10))
+            except (TypeError, ValueError, OverflowError):
+                concurrency = 10
+            try:
+                priority = int(account.get("priority") or 1)
+            except (TypeError, ValueError, OverflowError):
+                priority = 1
+            try:
+                rate_multiplier = float(account.get("rate_multiplier") or 1)
+            except (TypeError, ValueError, OverflowError):
+                rate_multiplier = 1
+
+            accounts.append({
+                "name": str(account.get("name") or email or account_id),
+                "platform": "openai",
+                "type": "oauth",
+                "account_id": str(account.get("account_id") or chatgpt_account_id),
+                "chatgpt_account_id": chatgpt_account_id,
+                "chatgpt_user_id": chatgpt_user_id,
+                "session_token": session_token,
+                "credentials": credentials,
+                "extra": {
+                    "email": email,
+                    "auth_provider": str(extra.get("auth_provider") or "platform"),
+                    "source": str(extra.get("source") or account.get("source") or account.get("source_type") or "import"),
+                    "plan_type": plan_type,
+                },
+                "concurrency": concurrency,
+                "priority": priority,
+                "rate_multiplier": rate_multiplier,
+                "auto_pause_on_expired": bool(account.get("auto_pause_on_expired", True)),
+            })
+
+        return {
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "proxies": [],
+            "accounts": accounts,
+        }
 
     def get_stats(self) -> dict:
         with self._timed_account_lock("account_get_stats_lock"):

@@ -45,6 +45,7 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  downloadSub2APIAccounts,
   fetchAccountsPage,
   fetchAccountTokens,
   type AccountSummary,
@@ -256,6 +257,7 @@ function AccountsPageContent() {
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isExportingSub, setIsExportingSub] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
   const [progress, setProgress] = useState<{
@@ -444,6 +446,17 @@ function AccountsPageContent() {
     try { downloadTokens((await fetchAccountTokens()).tokens); }
     catch (error) { toast.error(error instanceof Error ? error.message : "导出失败"); }
   };
+  const handleExportSub = async (accessTokens: string[]) => {
+    setIsExportingSub(true);
+    try {
+      await downloadSub2APIAccounts(accessTokens);
+      toast.success("Sub 格式账号文件已生成");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Sub 格式导出失败");
+    } finally {
+      setIsExportingSub(false);
+    }
+  };
 
   const openEditDialog = (account: Account) => {
     setEditingAccount(account);
@@ -550,6 +563,15 @@ function AccountsPageContent() {
           >
             <Download className="size-4" />
             导出全部 Token
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleExportSub([])}
+            disabled={total === 0 || isExportingSub}
+          >
+            {isExportingSub ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+            导出全部 Sub
           </Button>
         </div>
       </section>
@@ -793,6 +815,15 @@ function AccountsPageContent() {
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   删除所选
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-sky-700 hover:bg-sky-50 hover:text-sky-800"
+                  onClick={() => void handleExportSub(selectedTokens)}
+                  disabled={selectedTokens.length === 0 || isExportingSub}
+                >
+                  {isExportingSub ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+                  导出选中 Sub
                 </Button>
                 {selectedIds.length > 0 ? (
                   <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600">

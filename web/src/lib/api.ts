@@ -545,6 +545,21 @@ export async function fetchAccountTokens(status = "all") {
   return httpRequest<{ tokens: string[] }>(`/api/accounts/tokens?status=${encodeURIComponent(status)}`);
 }
 
+export async function downloadSub2APIAccounts(accessTokens: string[] = []) {
+  const response = await request.post("/api/accounts/export", {
+    access_tokens: accessTokens,
+    format: "sub",
+  }, { responseType: "blob" });
+  const url = URL.createObjectURL(response.data as Blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `sub2api-tokens-${Date.now()}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export async function fetchModels() {
   return httpRequest<ModelListResponse>("/v1/models");
 }

@@ -61,7 +61,7 @@ class AccountRefreshRequest(BaseModel):
 
 class AccountExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
-    format: Literal["json", "zip"] = "json"
+    format: Literal["json", "zip", "sub"] = "json"
 
 
 class AccountUpdateRequest(BaseModel):
@@ -422,6 +422,20 @@ def create_router() -> APIRouter:
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         access_tokens = _unique_tokens(body.access_tokens)
+        if body.format == "sub":
+            payload = account_service.build_sub2api_export_payload(access_tokens)
+            if not payload["accounts"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "没有可导出的完整账号，需要同时有 access_token、refresh_token 和 id_token"},
+                )
+            timestamp = _download_timestamp()
+            return Response(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="sub2api-tokens-{timestamp}.json"'},
+            )
+
         items = account_service.build_export_items(access_tokens)
         if not items:
             raise HTTPException(
